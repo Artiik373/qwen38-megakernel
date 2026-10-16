@@ -1,421 +1,164 @@
-# Qwen3.8-27B megakernel (RTX 30/40/50 series)
+# qwen38-megakernel
 
-A specialised CUDA inference engine for Qwen3.8-27B `Q4_K_M` and unsloth's `UD-Q4_K_XL` (llama.cpp arch `qwen35`:
-48 Gated-DeltaNet + 16 gated-attention layers, one MTP block) on RTX 30, 40 and 50-series GPUs
-with 24 GB+ (sm_86, sm_89, sm_120; tuned and benchmarked on an RTX 3090), with an OpenAI-compatible server that open-jet uses in place of `llama-server`
-(`llama_backend: auto`, see [docs/runtimes/llama-cpp.md](../docs/runtimes/llama-cpp.md)).
+A standalone, OpenAI-compatible server for **Qwen3.8-27B on one 24 GB NVIDIA GPU**, with image input. It contains three
+parts:
 
-## Quick guide
+- **The engine** is a CUDA megakernel tuned on an RTX 3090. Each speculative decode cycle is one persistent kernel: the
+  model's own MTP head drafts up to 7 tokens, and all 8 rows are verified at once with int8 tensor-core GEMMs. Prompts
+  go through a separate batched tensor-core prefill. Weights stay in their GGUF k-quant encoding. It runs unsloth's
+  `Q4_K_M` and `UD-Q4_K_XL` files unmodified.
+- **The server** (`server/mk_server.py`) provides `/v1/chat/completions` (streaming, tools, `reasoning_content`),
+  `/v1/models`, `/health` and `/props`. Follow-up turns and edits reuse the cached prefix through DeltaNet checkpoints.
+- **The vision encoder** turns OpenAI `image_url` parts into model input. It runs **on the CPU** (fp32 AVX2 / FMA), so
+  images cost no VRAM and the full context stays available.
 
-1. Run `openjet setup` and choose "Qwen3.8 27B Q4_K_M MTP". It downloads the model and builds the
-   megakernel (by hand: [Build / run](#build--run)).
-2. Run `openjet`. It serves the model through the megakernel.
+It runs on Linux and WSL2. A native Windows build is in progress.
 
-Which model file runs on it (details in [The GGUF](#the-gguf)):
+## Numbers
 
-| Model file | Runs on |
-|---|---|
-| unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads | megakernel |
-| unsloth's Qwen3.8-27B `UD-Q4_K_XL` | megakernel |
-| a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis | megakernel, semi compatible |
-| any other quant (other unsloth `UD-*`, bartowski, GSQ-RCO, ...) | llama.cpp |
+These are from one RTX 3090 (24 GB) with unsloth's UD-Q4_K_XL, 120k context, one request at a time, greedy unless noted.
+They were measured on 2026-10-15 with the text engine, before image input was added. Text output has been bit-identical
+since then, but decode speed has not been re-measured.
 
-## How it works
-
-Decoding runs an entire speculative cycle in one persistent cooperative kernel launch:
-
-```
-main model over T = 1 + n_draft tokens  ->  lm_head + verification on device (greedy, or exact
-speculative sampling)  ->  MTP catch-up rows for the accepted tokens  ->  n_draft MTP draft steps
-```
-
-The ~340 phases of a cycle (projections, DeltaNet core, attention, FFN, lm_head, MTP) are separated
-by a software grid barrier; the host only reads back the accepted tokens. Prompts go through
-batched tensor-core kernels instead (see Prefill).
-
-## Results
-
-RTX 3090, against `llama-server` with open-jet's flags (`--spec-type draft-mtp --spec-draft-n-max 2
--fa on -ctk q8_0 -ctv q8_0`). Back-to-back on an otherwise idle GPU; numbers vary with prompt
-predictability (draft acceptance) and other GPU load.
-
-**Reasoning mode as open-jet runs it** (thinking on, xhigh effort, temperature 1.0, top_p 0.95,
-top_k 20; 5 coding prompts x 2 seeds, up to 1024 tokens each):
-
-| | llama.cpp | megakernel | |
+| | llama.cpp (tuned, 4 MTP drafts, q8_0 KV) | this, q8_0 KV | this, preset D' |
 |---|---|---|---|
-| decode through the HTTP servers (`/v1/chat/completions`) | 50.9 tok/s | **78.0 tok/s** | **1.53x** |
-| decode, CLI (`bench/think_bench.py`, `-d 4`) | 50.7 tok/s | 77.4 tok/s | 1.53x |
+| greedy decode, short prompts | 82.7 tok/s | **151.3** | 150.2 |
+| sampled, thinking on | 65.8 tok/s | **134.9** | 134.1 |
+| decode at 38k context | 62.3 tok/s | **114.3** | 101.7 |
+| decode at 101.6k context | 53.4 tok/s | **105.4** | 96.8 |
+| read a 101.6k-token prompt | 101.0 s | **77.7 s** | 82.2 s |
+| first token, short prompt | 124 ms | **68 ms** | 70 ms |
+| edit an earlier message in an 11.7k chat | 329 ms | **75 ms** | 79 ms |
+| VRAM, whole card | 22.8 GB | 21.3 GB | **20.3 GB** |
+| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,727 s | 230 right, **1,739 s** | 230 right, 1,775 s |
 
-**Greedy decode, 4 chat prompts x 512 tokens** (`bench/code_bench.py`):
+The llama.cpp column is the best of three earlier sessions on the same machine with the same client.
 
-| prompt | llama.cpp | megakernel `-d 3` | megakernel `-d 4` |
-|---|---|---|---|
-| Python function (code) | 72.5 | 126.3 | **139.7** (1.93x) |
-| hash map explanation | 64.1 | 107.4 | 106.5 |
-| short story | 52.8 | 66.8 | 70.7 |
-| Flask to FastAPI plan | 63.2 | 102.6 | 109.8 |
-| **mean** | 63.1 | 100.8 | **106.7** (1.69x) |
+**Exactness:**
+- Greedy token ids are identical at draft depths 0, 4 and 7, so speculation does not change the output.
+- A reused prefix (an edit or a follow-up turn) answers bit for bit like a fresh prefill.
+- Against llama.cpp's own next-token distributions (KL divergence, nats), the q8_0 KV cache scores 0.0012. For scale,
+  llama.cpp batched scores 0.0017 against its own token-by-token run.
 
-Without speculation: llama.cpp 40.4 tok/s, megakernel 42.9 (`-d 0`): the decode itself is close to
-the memory-bandwidth limit for both; the lead comes from verifying 4-5 drafted tokens per pass at
-almost no extra cost.
+**Preset D'** stores K at 6 bits and V at 5 bits, and keeps 8 bits for the recent window and the MTP layer.
+- KL against llama.cpp: 0.00119 vs q8's 0.00119 on short prompts, 0.00236 vs 0.00219 at 32k, and 0.00161 vs 0.00163 at
+  64k. A plain 4-bit cache scores 0.00547 on the short prompts.
+- It uses about 1.1 GB less VRAM at 120k, which is what lets the model's full **262,144-token context** fit on 24 GB.
+  At that size, reading 261k tokens from scratch takes 334 s, decode at that depth runs at 63 tok/s, a follow-up turn
+  takes 1.3 s, and the card holds 23.4 GB.
 
-**A source file in the prompt, then a coding task** (greedy, 256 tokens; prompt = batched prefill of
-the whole prompt incl. the first token):
+**Images** (Ryzen 9 5900XT):
+- A 196 / 300 / 1024-token image encodes in 0.51 / 0.78 / 3.56 s back to back (llama.cpp's libmtmd: 0.80 / 1.29 /
+  6.07 s). The first new image after the CPU has been idle takes ~1.2-1.5 s for 300 tokens while the cores ramp up.
+- On six image prompts, the mean KL against llama.cpp is 0.0006-0.0061 (text-only: 0.0012).
+- The encoder's rows are within 4e-6 to 4e-5 (relative) of an fp64 forward of the vision tower.
 
-| context | decode llama.cpp | decode megakernel | prompt llama.cpp | prompt megakernel |
-|---|---|---|---|---|
-| 1.8K | 57.4 | 84.8 | 1050 | 1595 |
-| 3.6K | 56.3 | 95.3 | 1124 | 1595 |
-| 7.8K | 54.8 | 85.8 | 1140 | 1533 |
-| 15.9K | 55.7 | 86.5 | 1126 | 1466 |
-| 29.5K | 52.3 | 72.7 | 1062 | 1236 |
+The full tables, charts, raw data and the gates behind each change are in the fork's
+[perf docs](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf/perf). The engine's internals are covered
+in [docs/ENGINE.md](docs/ENGINE.md).
 
-(tok/s; measured before the sequence-token draft vocabulary and double-buffered attention below,
-which add 1-8% to the megakernel's decode here.)
+## Requirements
 
-**Pasting a file into the next turn of a conversation** (prompt processing time):
+- **GPU:** NVIDIA Ampere or newer (sm_86 tested; the kernels use sm_80+ features) with 24 GB of VRAM.
+- **CUDA:** 13.2 is what we build with; older 12.x versions are untested.
+- **OS:** Linux or WSL2.
+- **RAM:** about 25 GB free to compile the served configuration (ptxas). The lean build needs ~12 GB.
+- **llama.cpp b10246**, built at `../llama.cpp`. The engine uses its tokenizer (libllama), and the vision library and
+  reference tools use libmtmd.
+- **Python** 3.10+ with jinja2.
+- **CPU for the fast image encoder:** x86-64 with AVX2 + FMA (Zen 2+, Haswell+). Other CPUs fall back to libmtmd.
 
-| new tokens | llama.cpp (prompt cache) | megakernel |
-|---|---|---|
-| 2.7K | 2.41 s | 1.68 s |
-| 12K | 10.45 s | 8.10 s |
-
-With the q8_0 KV cache (chosen automatically for contexts above ~80K tokens, e.g. open-jet's 100K)
-decode is ~1-2% and prefill 2-7% slower than with fp16.
-
-**Correctness.** The output is not byte-identical to llama.cpp's: the arithmetic is ordered and
-rounded differently, so where two tokens are close the other one can win, and a generation then
-continues differently. Measured against llama.cpp's own next-token distributions (same GGUF,
-13,299 positions of code and prose from this repo, each after a 1024-token prompt; reference:
-llama.cpp generating token by token with its q8_0 KV cache, as open-jet runs it):
-
-| against llama.cpp generating token by token | top token agrees | KL divergence (mean, nats) | perplexity (reference 2.4263) |
-|---|---|---|---|
-| llama.cpp, batched instead | 98.68% | 0.0019 | 2.4283 |
-| llama.cpp, fp16 KV cache instead | 99.17% | 0.0007 | 2.4284 |
-| megakernel (prefill kernels, then the decode kernel), q8_0 KV | 99.08% | 0.0009 | 2.4274 |
-| megakernel, fp16 KV | 99.11% | 0.0008 | 2.4273 |
-| megakernel, prefill kernels only, q8_0 KV | 99.01% | 0.0009 | 2.4275 |
-
-The megakernel is as close to llama.cpp as llama.cpp's own configurations are to each other, and
-its log-loss differs by +0.0005 +- 0.0004 (not significant). Most top-token disagreements are
-near-ties (median lead of llama.cpp's token 0.03-0.04 nats); in 2-3 of ~120 it led by more than
-0.5 nats, as it does in llama.cpp against itself (4 of 176).
-
-At a 30K context (one sequence, 1,999 positions scored after a 28,000-token prompt, same
-reference setup) the megakernel agrees on 99.65% of top tokens with KL 0.0007 (q8_0 KV; fp16:
-99.55%, 0.0007), llama.cpp batched on 99.35% with KL 0.0009; log-loss against the reference is
-+0.0018 +- 0.001 (fp16 KV +0.0027), llama.cpp batched +0.0017. At 96K (open-jet's setting; 1,999
-positions after a 94,000-token prompt, q8_0 KV) the megakernel agrees on 99.60% with KL 0.0008 and
-log-loss +0.0012 +- 0.001, llama.cpp batched on 99.45% with KL 0.0014 and +0.0015 +- 0.002. Each
-long-context figure is from a single sequence of this repo's code. To reproduce:
+## Build
 
 ```sh
-make tools/llama_ref
-tools/llama_ref -m model.gguf -f code.txt -f prose.txt --score-from 1024 -b 1 --ref-out llama.ref
-tools/llama_ref -m model.gguf --kld llama.ref                            # llama.cpp batched: the noise floor
-./qwen38_mk -m model.gguf --kld llama.ref --score-path mixed --kv q8     # the megakernel
+git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout b10246
+cmake -S ../llama.cpp -B ../llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
+cmake --build ../llama.cpp/build -j
+make -j2        # qwen38_mk (CLI), libqwen38mk.so (server), tools/, libqwen38vision.so: 20-30 min
+pip install -r requirements.txt
 ```
 
-`llama_ref` teacher-forces 2048-token chunks of the text (`--chunk`) and stores, per scored
-position, the 256 most likely tokens (`logit_stats.h`); `--kld` compares an engine with such a file
-(`--ref-out` also writes its own). `--score-path` selects the megakernel's batched prefill kernels
-(`prefill`, the default), the decode kernel (`decode`), or the prefill kernels for the unscored
-prompt and the decode kernel for the scored positions (`mixed`, what a generation runs).
+- A plain `make` builds the configuration we serve: wide verify and up to 7 drafts
+  (`MKFLAGS=-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1`).
+- `make MKFLAGS=` builds the lean engine. It compiles in a few minutes and takes at most 4 drafts (run it with
+  `MK_DRAFT=4`).
+- `make` targets the installed GPU's architecture; override it with `ARCH=sm_89` or similar.
+- `ptxas.log` lists registers and spills per function.
+- The vision library is built when `../llama.cpp/build/bin/libmtmd.so` exists (llama.cpp's default). `make vision`
+  builds it explicitly.
 
-Speculative verification is exact: greedy output is the main model's greedy choice, and with
-sampling the token distribution is the same as without drafts (2000-sample test per position).
-Verifying 1 vs 4 tokens per pass rounds slightly differently, so on near-ties the output can differ
-between `-d` settings.
-
-**unsloth UD-Q4_K_XL** (`Qwen3.8-27B-UD-Q4_K_XL.gguf`, 17.6 GB: Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS per
-tensor plus a few Q3_K, IQ3_S and IQ4_NL; 17.7 GB on the GPU vs 16.7 GB for the Q4_K_M). The same
-check against llama.cpp b10246 generating token by token with its q8_0 KV cache (13 sequences of
-this repo's code and docs, 13,299 positions after a 1024-token prompt each):
-
-| against llama.cpp generating token by token | top token agrees | KL divergence (mean, nats) | perplexity (reference 2.8099) |
-|---|---|---|---|
-| llama.cpp, batched instead | 98.49% | 0.0017 | 2.8116 |
-| megakernel (prefill kernels, then the decode kernel), q8_0 KV | 98.78% | 0.0012 | 2.8083 |
-| megakernel, prefill kernels only, q8_0 KV | 98.68% | 0.0012 | 2.8077 |
-
-On the same text the Q4_K_M gives 98.73% / 0.0013 with and without the UD support (identical to the
-last digit; llama.cpp batched 98.49% / 0.0018). Decode, `bench/bench.py` (greedy, 4 chat prompts x
-512 tokens, mean of 2 runs; RTX 3090 at 480 W, driver 610.62, CUDA 13.2, WSL2):
-
-| | llama.cpp (MTP 2) | megakernel `-d 4` |
-|---|---|---|
-| Q4_K_M | 72.3 tok/s | 117.0 tok/s (1.62x) |
-| UD-Q4_K_XL | 73.2 tok/s | 103.8 tok/s (1.42x) |
-
-UD-Q4_K_XL puts its extra bits where the megakernel spends its time (FFN gate / up average 5.1 bits
-per weight against Q4_K's 4.5, and the MTP block is Q6_K throughout), so a cycle reads 6% more weight
-bytes; its MTP drafts are also accepted a little less often. Per phase (`MK_PROFILE=1`) its GEMVs
-stream within ~2% of the Q4_K_M's bandwidth, except the Q6_K MTP gate / up at T = 1.
-
-## Build / run
-
-Requires CUDA 12+ (12.8+ for RTX 50 series; built with 13.2), an sm_86, sm_89 or sm_120 GPU with 24 GB, and the repo's llama.cpp build (only
-`libllama`, for tokenization, loaded vocab-only). `openjet setup` builds `libqwen38mk.so` automatically
-(this source ships in the open-jet wheel); building by hand:
+Models (unsloth's files, used unmodified):
 
 ```sh
-cd megakernel
-make        # qwen38_mk (CLI), libqwen38mk.so (server library), tools/vocab_freq; ~2 min
-./qwen38_mk -m ../models/Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 \
-            -d 4 --draft-vocab draft_vocab_32k.bin --think --temp 1.0 --top-p 0.95 --top-k 20
+hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.gguf --local-dir ~/models
 ```
 
-CLI flags: `-d` drafts per cycle (0-4; with 4 the depth drops to 3 for a cycle after a rejected
-draft), `-c` KV capacity, `--kv f16|q8|auto` (KV cache format), `--think [xhigh|medium|low]`
-(reasoning mode; the chat template's default effort is xhigh), `--temp` / `--top-p` / `--top-k` /
-`--min-p` / `--seed` (sampling; default greedy), `--raw` (no chat template), `--ids`,
-`--prompt-ids f` (prompt as token ids), `--turn2 text` / `--turn2-file f` (a second user turn
-appended to the conversation), `--score ids.txt` (teacher-forced agreement), `--kld ref` (KL
-divergence, perplexity and agreement against a reference file, see Correctness), `MK_PROFILE=1`
-(per-phase timing, including a "min-composed" estimate that filters out time-slicing by other GPU
-users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill through the decode
-megakernel instead), `MK_PF_CAP=n` (prefill chunk tokens), `MK_ATTN_PV16=0` / `MK_ATTN_SPLIT=0` (prefill
-attention with fp32-accumulated P V / without the tail split; with both, bit-identical to `MK_ATTN=1`, the
-original prefill attention kernel), `MK_ATTN_S8=0` (q8 cache: Q K^T on fp16 tensor cores instead of int8;
-`=2`: one Q scale per row instead of per 32 dims), `MK_DATTN=0` (q8 cache: the previous, unpipelined
-decode attention; same output), `MK_MTP_Q4=0` (the MTP block in its stored types, see The GGUF).
+Use the BF16 mmproj. The encoder widens any file to fp32, so a Q8_0 mmproj is no faster and is less accurate.
 
-### The GGUF
-
-The kernels take the weight type as a template argument and dispatch on each matrix's type at run
-time (`gemv_pairs_any`, `resid_any`, `ffn_gu`, prefill `gemm`), so every projection of the trunk and
-the MTP block can be any of:
-
-| type | how the kernels read it |
-|---|---|
-| Q4_K, Q5_K | as stored |
-| Q6_K, Q8_0 | re-laid-out at load (values unchanged) |
-| IQ4_XS | re-laid-out at load into Q4_K-shaped 144-byte blocks, 4-bit indices mapped to int8 weights with `__byte_perm` |
-| Q3_K, IQ3_S | re-laid-out at load (values + scales streams, 114 / 112 B per 256 weights); the GEMV and the prefill GEMM
-feed exactly the integers and scales of the Q6_K re-encode they replace (`MK_REENC3=1`): bit-identical results at
-~0.54x the bytes |
-| IQ4_NL | re-encoded at load as Q8_0, exactly |
-
-`token_embd` must be Q4_K and `output` Q6_K; `ssm_alpha` / `ssm_beta` are dequantized to F32 at load
-(they are folded into fp32 rows with the norm weight). The exact re-encodes keep every weight's
-value (both formats store a small integer times the same fp16 `d` and an integer sub-block scale),
-and the loader checks each re-encoded or re-laid-out row bit for bit against ggml's dequantization of the
-original.
-A file with any other type is refused, naming the first tensor that does not match, and open-jet
-starts `llama-server`. Which files that covers is in the [quick guide](#quick-guide).
-
-The MTP draft block (`blk.64.*`, `nextn.eh_proj`) is the one lossy exception: its matrices stored wider than
-Q4_K (Q5_K, Q6_K, Q8_0: all of them in UD-Q4_K_XL, `eh_proj` / `attn_v` / `ffn_down` in Q4_K_M) are re-quantized
-to Q4_K at load (`ggml_quantize_chunk`, 1-3 s), so every MTP pass streams ~0.1 GB less (UD: -107 MiB of VRAM,
-greedy bench +1.5%). Only the drafts change: they are verified by the unchanged main model, so greedy output
-and the sampled output distribution stay exact; acceptance moved by under a point. `MK_MTP_Q4=0` keeps the
-stored types (`MK_MTP_Q4=ab` loads both and the policy key `mtpq=0|1` switches between them, for A/B tests).
-
-Gate and up projections of different types (25 of the 65 layers of UD-Q4_K_XL) are read in two
-passes over the shared activations in decode (`rows16`: one `__noinline__` function per weight type,
-so each type gets its own register allocation) and as two GEMMs plus a `silu(gate) * up` kernel in
-prefill; same-type Q4_K, Q5_K and IQ4_XS pairs keep the fused GEMM. unsloth's Q4_K_M runs the code it
-ran before (identical output and speed). A plain `llama-quantize ... Q4_K_M` stores `ssm_out`,
-`ssm_alpha`, `ssm_beta` and `nextn.eh_proj` as Q4_K: alpha / beta are dequantized and the other two
-now run in their stored Q4_K (they used to be re-quantized to Q5_K / Q8_0).
-
-To build a file with unsloth's mix from the BF16 GGUF (unsloth's imatrix optional):
+## Run
 
 ```sh
-llama-quantize --imatrix imatrix_unsloth.gguf \
-    --tensor-type ssm_out=q5_k --tensor-type ssm_alpha=f32 --tensor-type ssm_beta=f32 \
-    --tensor-type nextn.eh_proj=q8_0 \
-    Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K_M
+scripts/serve.sh                  # http://127.0.0.1:8080, 120k context, q8_0 KV, 7 drafts, images on
+scripts/serve.sh 8080 64000       # port, context
+MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048 scripts/serve.sh 8080 262144   # preset D', the full context
 ```
 
-Benchmarks: `bench/think_bench.py` (reasoning mode, both engines), `bench/code_bench.py` (greedy
-decode, context sweep, second turn), `bench/bench.py` (decode on the 4 chat prompts; `--model` for
-another GGUF); `bench/*_bench.cu` are GEMV / GEMM microbenchmarks.
-
-## Server
-
-`server/mk_server.py` serves the engine (through `libqwen38mk.so`, the C API in `capi.cpp`) with an
-OpenAI-compatible `/v1/chat/completions`, streaming or not, plus `/health` and `/v1/models`.
-open-jet starts it itself; standalone:
+The settings (model path, host, drafts, prefill chunk, exact reuse, KV preset) are listed at the top of
+[scripts/serve.sh](scripts/serve.sh). Model load takes ~9 s from an ext4 disk. Under WSL2, keep the GGUF on the Linux
+filesystem: files on `/mnt/c` load several times slower.
 
 ```sh
-python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c 100000
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Write quicksort in C."}], "max_tokens": 512}'
+
+# an image (base64 data: URL)
+IMG=$(base64 -w0 photo.jpg)
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [{"type": "text", "text": "What is in this picture?"},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$IMG"'"}}]}]}'
 ```
 
-- Prompts are rendered with the chat template stored in the GGUF (jinja2): `chat_template_kwargs`
-  `enable_thinking` / `preserve_thinking` / `reasoning_effort`, OpenAI `tools`. Reasoning is streamed
-  as `reasoning_content`, Qwen's XML tool calls are returned as structured `tool_calls`.
-- Successive requests of a conversation only prefill what is new: the prompt is matched against the
-  engine's sequence (prompts + emitted tokens), and when the re-rendered history diverges after the
-  end of the previous prompt (e.g. a reformatted tool call) the engine rewinds to a checkpoint
-  saved there. Anything else starts over (batched prefill, ~1500 tok/s).
-- Sampling: temperature, top_p, top_k (<= 32), min_p, seed, presence_penalty / frequency_penalty (-2..2, vLLM's
-  semantics: the tokens generated in this response); repetition_penalty is ignored (with a warning). One request at
-  a time.
-- KV cache: fp16, or q8_0 when fp16 does not fit the requested context (`--kv auto|f16|q8`).
-- Images: see [Images](#images-vision).
+What the API supports:
+- **Sampling:** temperature, top_p, top_k (<= 32), min_p, seed, and presence / frequency penalty. There is no
+  repetition penalty.
+- **Chat template:** the one stored in the GGUF, with `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...)
+  and OpenAI `tools`.
+- **Images:** base64 `data:` URLs only. There is no video or audio.
+- **Requests:** one at a time.
 
-## Images (vision)
+[docs/ENGINE.md](docs/ENGINE.md#server) has the details.
 
-With `--mmproj <mmproj GGUF>` (projector `qwen3vl_merger`, e.g. unsloth's `mmproj-BF16.gguf`) the server accepts
-OpenAI `image_url` parts (base64 `data:` URLs) and `/props` reports `modalities.vision`. The vision tower runs on the
-CPU (no GPU memory: the 120k-context VRAM is unchanged); the engine takes its output rows in the batched prefill.
+## Checking a build
 
-```sh
-make vision        # libqwen38vision.so (+ tools/mkv_cli, tools/vision_ref); `make` builds it when llama.cpp has libmtmd
-python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj mmproj-BF16.gguf -c 120000 --kv q8 -d 7
-```
-
-open-jet passes `--mmproj` when `OPENJET_MEGAKERNEL_MMPROJ` names the file (and the library is built).
-
-- **Prompt, as llama-server builds it:** a message with images is flattened llama-server's way (text parts joined by
-  newlines, none next to an image), each image becomes `<|vision_start|>`, its rows, `<|vision_end|>`, and decoding /
-  preprocessing (stb_image; smart resize to multiples of 32 px within 8 .. 4096 tokens, the padded bilinear resize,
-  normalisation) are llama.cpp's bit for bit: same token counts and pixels as `llama-server --mmproj`
-  (`--image-min-tokens` / `--image-max-tokens` set the limits; fewer tokens encode faster).
-- **Engine** (`MKImage`, `MKEngine::prefill(tokens, cks, ck_exact, images)`, `mk_prefill_img`): an image's positions
-  take its fp32 rows instead of token embeddings (`pk_embed_img`; the MTP block takes them too, as llama.cpp does) and
-  llama.cpp's Qwen-VL M-RoPE positions (IMROPE: t / row / column per frequency, the text after an image continuing at
-  `+ max(nx, ny)`): rows of the RoPE table are rewritten for the image spans (gathered from the plain table), so no
-  attention kernel changes and a text-only prompt runs exactly what it ran before (KLD logs byte-identical).
-  Checkpoints, rewinds and exact reuse work across images; a rewind into an image re-feeds it.
-- **Server reuse:** an image's placeholder tokens are all alike, so the reused prefix also ends at the first image
-  that is not the same file (content hash) at the same place; decoded / encoded images are cached (`--image-cache`).
-- **Encoder** (`vision/mk_vision.h`, `--vision-backend auto|cpu|mtmd`): `cpu` = `vision/vit_cpu.cpp`, the tower in fp32
-  with AVX2 / FMA kernels (packed 6x16 FMA GEMM micro-kernel, attention on the same kernel with an online softmax,
-  exact tanh-GELU, weights widened from the file's type, a pool of pinned workers that take tasks dynamically;
-  x86-64 with AVX2 + FMA: Zen 2-5, Haswell+; results independent of the thread count); `mtmd` = llama.cpp's libmtmd
-  encoder (any CPU); `auto` = `cpu` where it runs.
-
-Accuracy against an fp64 forward of the checkpoint (`vision/vit_ref.py`, 5 images of 196 .. 1024 tokens): relative
-L2 error of the rows, lowest row cosine:
-
-| encoder | rel. error | min row cosine |
-|---|---|---|
-| vit_cpu, BF16 mmproj | 4e-6 .. 4e-5 | 1.000000 |
-| libmtmd, BF16 mmproj (BF16 GEMM inputs, fp16 K / V, table GELU) | 4e-3 .. 2.7e-2 | 0.903 |
-| libmtmd, Q8_0 mmproj | 1.3e-2 .. 8.4e-2 | 0.889 |
-
-At the output (megakernel, q8 KV, teacher-forced on llama.cpp's distributions given the fp64 rows; `tools/vision_ref`,
-`qwen38_mk --kld --kld-images`): mean KL with the fp64 rows 0.0006 .. 0.0016 (the text-only level, 0.0012), with
-vit_cpu's rows the same, with libmtmd's BF16 rows up to 2.5x that, with Q8_0 rows up to 7x. The BF16 mmproj is the
-one to use: vit_cpu widens either file to fp32, so a Q8_0 file is no faster, only less accurate.
-
-Encode time, Ryzen 9 5900XT (Zen 3, 16 cores / 32 threads), BF16 mmproj, steady state:
-
-| image | tokens | vit_cpu | libmtmd |
-|---|---|---|---|
-| 448 x 448 | 196 | 0.51 s | 0.80 s |
-| 640 x 480 | 300 | 0.78 s | 1.29 s |
-| 1024 x 1024 | 1024 | 3.56 s | 6.07 s |
-
-The first encode after the server's load costs ~0.5 s more (the weights streamed in again); the server absorbs it with
-a warm-up encode at startup.
-
-## How it gets its speed
-
-- **Weights stay in their GGUF k-quant encoding** (Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS), read once per
-  cycle regardless of T. Q6_K, Q8_0 and IQ4_XS are re-laid-out at load time (values unchanged) so every
-  lane does aligned 16/8-byte loads; Q6_K blocks carry their scales and `d` in one 8-byte word; IQ4_XS
-  indices become int8 weights through two `__byte_perm` table lookups per 4 bytes (llama.cpp's
-  `get_int_from_table_16`).
-- **dp4a GEMV with shared activations**: activations are int8 (per-16/32 scales, as llama.cpp's
-  q8_1), each warp streams 2-4 weight rows at once and reuses every shared-memory activation
-  load across them, so T = 4 costs almost the same memory time as T = 1. Weight loads bypass L1
-  and are marked L2 evict-first.
-- **No launches, few round trips**: activations are re-quantised by the producing phase
-  (including the next RMS norm's weight), so consumers only async-copy (`cp.async`) them.
-- **Gated-DeltaNet rollback by lazy replay**: the recurrent state is committed only through the
-  surely-accepted token; accepted drafts are replayed from a small (k, v, g, beta) ring at the
-  start of the next cycle, so rejected drafts cost no state snapshots or extra state traffic.
-- **Attention**: split-K flash decoding with tensor-core MMAs (Q.K^T and P.V in fp16 with fp32
-  accumulation, online softmax) over 32-position K/V tiles; the chunk boundaries depend on the
-  context length only, so greedy output does not depend on the draft depth. With the q8 cache
-  (`attn_core_q8`) each block runs a three-deep software pipeline with one barrier per tile
-  (S of tile j, softmax of tile j - 1 and P V of tile j - 2 on specialised warps), the raw q8 K and V
-  tiles stream through cp.async rings and both MMA operands are converted from int8 in registers.
-  Same arithmetic as the simple loop (bit-identical output), ~2x faster at 100K context: 650-750 GB/s
-  of KV per call; decode +18.7% at 101.6K depth, +7.3% at 38K (`bench/dattn_bench.cu`). Chunks of a
-  single tile (context <= 640) keep the simple loop, which has no pipeline to fill; q4 `MK_KV` cache
-  slots run the pipelined kernel too (`attn_core_q8m`, q4 fragments with the simple loop's values).
-- **MTP drafting on device**, with the draft lm_head restricted to the 32,768 most frequent
-  tokens (`draft_vocab_32k.bin`, built by `tools/vocab_freq` from local code + docs; covers
-  ~99.4% of tokens), plus the tokens of the current sequence that are missing from it, added on the
-  fly (identifiers of pasted code: +3-8% decode speed with code in context). Verification always
-  uses the full vocabulary, so this affects only the acceptance rate, never the output.
-- **Sampling** keeps the 32 best logits of each verified row; a draft is accepted with probability
-  p(draft) and a rejected one is resampled from the rest of the distribution, which keeps the
-  sampled distribution exact.
-- **L2 warm-up**: before each barrier, blocks prefetch (evict-last) what their next latency-bound
-  phase reads first (DeltaNet state, conv weights, norm weights, RoPE rows, first K/V tile).
-
-## Prefill
-
-A prompt (all but its last token) is processed in chunks of up to 2048 tokens by ordinary kernel
-launches (`prefill.cuh`), which leave exactly the state the megakernel expects (trunk and MTP K/V
-caches, committed DeltaNet state, conv ring, hidden-state history); the last prompt token then goes
-through the megakernel, which produces the first token and the first MTP drafts. The same path
-appends to a running conversation (`MKEngine::prefill` on a non-empty sequence, e.g. the next user
-turn): it starts at the committed DeltaNet position and also re-feeds the last emitted token and any
-accepted drafts not yet folded into the recurrent state; the output is token-identical to
-processing the whole conversation as one fresh prompt.
-
-- **GEMMs on fp16 tensor cores straight from the k-quants** (`prefill_gemm.cuh`, ~85% of prefill
-  time): 128 x 128 tiles, weights stay in their GGUF blocks and are dequantised to fp16 in
-  registers (exact small integers via the `0x6400` trick, then one fp16 scale and min per
-  sub-block); activations are fp16 with the elements of each 16-group permuted so that a 4-byte
-  weight word is directly an MMA A fragment. Products accumulate in fp16 over k = 128, then in fp32.
-  ~100-108 TFLOPS on all four quant types (`bench/mmq_bench.cu`). FFN gate and up share one GEMM
-  whose epilogue writes `silu(gate) * up` as the down projection's fp16 input.
-- **DeltaNet in chunked (WY) form on tensor cores**: per 32-token chunk, `A = tril(beta K K^T)`
-  with the gate decays, `T = (I + A)^-1` (one warp, forward substitution), then
-  `U = T beta V - T beta gamma (K S)`, `O = gamma Q S + P U` and `S <- gamma_last S + K^T (decay U)`.
-  Value columns are independent, so a block owns (head, 64 columns) and each warp keeps its 128 x 8
-  slice of the state in fp32 MMA accumulators, turning it (and K S, U) into fp16 MMA operands
-  in registers with `movmatrix`; gates are carried as log g, so tiny or zero gates are exact.
-  ~2% of prefill time; 3.5e-4 relative error against a float64 reference of the recurrence.
-- **Attention**: causal flash attention over the KV cache on tensor cores (`prefill_attn.cuh`). A block
-  takes 16 query positions of one KV head (6 q heads x 16 rows); two warps per q head split S by key
-  positions and P V by head-dim halves, so 12 warps keep 64 fp32 accumulators each and K / V of the
-  next phase load during the MMAs. P V accumulates in fp16 per 32-position tile, then in fp32. The
-  q-tiles of the last, partial wave are split along the keys and merged. ~64 TFLOPS on a 3090 at
-  30K-100K context (`bench/attn_bench.cu`), 1.9-2.4x the previous kernel; prefill of a 101K-token
-  prompt went from 128 s to 90 s. With the q8 cache (default), Q K^T runs on int8 tensor cores
-  straight from the cache (`pk_attn8`): Q is quantized per 32 dims like the cache, each 32-dim block's
-  int32 partial is scaled by q scale x k scale, the raw q8 K / V tiles stream through a cp.async ring
-  and V is converted for the next tile while the current one computes (~84 TFLOPS-equivalent at 100K,
-  1.4x; attention of a 101K-token prompt 38 s -> 26 s, no measurable KLD change).
-
-## Limitations
-
-- Specialised to this model's shapes (27B) and the weight types under [The GGUF](#the-gguf)
-  (benchmarked: unsloth's Q4_K_M and UD-Q4_K_XL); the loader rejects any other model or type. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
-  GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
-- Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order), and presence / frequency
-  penalties on the generated tokens (applied first; greedy too; exact under speculative verification: a verify
-  row also counts the drafts before it); no repetition penalty.
-- Text and images (no video or audio; images as base64 `data:` URLs; Qwen-VL projectors only); one sequence: a
-  conversation is reused while it grows (or diverges after a checkpoint); editing an earlier part, e.g. context
-  compaction, re-prefills it. No slot save / restore (open-jet's low-memory shell swap falls back to re-prompting).
+- **Server tests:** `python -m pytest -q tests` runs without a GPU, against fake engines.
+- **Depth independence:** the same prompt at `-d 0`, `-d 4` and `-d 7` must give identical ids:
+  `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_32k.bin --ids`
+- **Accuracy against llama.cpp:** `tools/llama_ref` writes a reference file, and `./qwen38_mk -m <gguf> --kld <ref>
+  --score-path mixed --kv q8` scores the engine against it ([docs/ENGINE.md](docs/ENGINE.md#results), "Correctness").
+- **Images:** `tools/mkv_cli` encodes images and writes their rows. `tools/vision_ref` writes llama.cpp's reference
+  for an image prompt plus the rows it fed, and `qwen38_mk --kld <ref> --kld-images <rows>` scores it.
+- **Speed:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_32k.bin --model <gguf>` (4 chat
+  prompts). `bench/*.cu` are kernel microbenchmarks.
 
 ## Files
 
-- `qwen38_mk.cu` / `qwen38_mk.h` - loader, repacking, the megakernel and the `MKEngine` API
-- `prefill.cuh` / `prefill_gemm.cuh` - batched prefill kernels and their quantised fp16 GEMM
-- `capi.cpp` - C API (engine + libllama tokenizer) for `libqwen38mk.so`
-- `server/mk_server.py` - OpenAI-compatible HTTP server
-- `main.cu` - CLI (tokenization via libllama)
-- `gguf.h` - minimal mmap GGUF reader
-- `draft_vocab_32k.bin` - MTP draft-head token subset (int32 ids)
-- `tools/vocab_freq.cpp` - builds a draft vocabulary from a list of text files
-- `tools/llama_ref.cpp` / `logit_stats.h` - llama.cpp's next-token distributions and the comparison
-  with them (KL divergence, perplexity, top-token agreement)
-- `vision/mk_vision.{h,cpp}` - the CPU vision encoder's C API (`libqwen38vision.so`): image decoding, backends
-- `vision/vit_cpu.{h,cpp}` - the vision tower in fp32 with AVX2 / FMA kernels (the `cpu` backend)
-- `vision/mkv_cli.cpp` - encodes images from the command line (grid, time, rows)
-- `vision/vit_check.cpp` - test: vit_cpu against libmtmd (pixels, rows, times); `vision/vit_ref.py` - the fp64 reference
-- `tools/vision_ref.cpp` - llama.cpp's distributions for an image prompt + the image rows it fed (`--kld-images`)
-- `bench/` - benchmarks (see Build / run)
+- `qwen38_mk.cu`, `qwen38_mk.h`, `prefill*.cuh`, `wv*.cuh`, `loader.cuh`, `gguf.h`: the engine
+- `capi.cpp`: the C API of `libqwen38mk.so`
+- `main.cu`: the `qwen38_mk` CLI
+- `server/mk_server.py`: the HTTP server
+- `scripts/serve.sh`: the launcher
+- `vision/`: the CPU image encoder (`libqwen38vision.so`) and its tests
+- `tools/`: llama.cpp reference tools and the draft-vocabulary builder
+- `bench/`: benchmarks
+- `tests/`: server tests
+- `draft_vocab_32k.bin`: the MTP draft head's token subset
+
+## Origin and license
+
+This repository is the `megakernel/` directory of [open-jet](https://github.com/L-Forster/open-jet) by L-Forster, split
+out with its history. It adds the engine work from our open-jet fork
+([branch `qwen38-perf`](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf)). Parts of it went upstream as
+open-jet PRs #19 and #20, and #23 is open. The engine sources here are identical to that branch's `megakernel/`
+directory at 62c8d7a (2026-10-16).
+
+Licensed under the GNU AGPL v3, like open-jet ([LICENSE](LICENSE)).
