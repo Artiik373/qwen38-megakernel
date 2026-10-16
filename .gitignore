@@ -1,4 +1,4 @@
-# build outputs (build/: variant builds of scripts/mk_ninja.py-style tooling)
+# build outputs (build/: out-of-tree variant builds)
 build/
 *.o
 qwen38_mk

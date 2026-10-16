@@ -222,7 +222,7 @@ scripts\serve.bat                 :: http://127.0.0.1:8080, 120k context, q8_0 K
 This repository is the `megakernel/` directory of [open-jet](https://github.com/L-Forster/open-jet) by L-Forster, split
 out with its history. It adds the engine work from our open-jet fork
 ([branch `qwen38-perf`](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf)). Parts of it went upstream as
-open-jet PRs #19 and #20, and #23 is open. The engine sources here are identical to that branch's `megakernel/`
-directory at 62c8d7a (2026-10-16).
+open-jet PRs #19 and #20, and #23 is open. This repository started from that branch's `megakernel/` directory at 62c8d7a
+(2026-10-16), and development of the engine continues here.
 
 Licensed under the GNU AGPL v3, like open-jet ([LICENSE](LICENSE)).
