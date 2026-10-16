@@ -4,7 +4,7 @@ NVCC ?= /usr/local/cuda/bin/nvcc
 ARCH ?= $(or $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '. '),86)
 ARCH := sm_$(patsubst sm_%,%,$(ARCH))
 # engine configuration: wide tensor-core verify, up to 7 drafts (-d 7), fragment-ordered Q6_K = the served build.
-# ptxas peaks at ~25 GB of RAM with it; `make MKFLAGS=` builds the lean engine (~12 GB, up to 4 drafts: -d 4).
+# ptxas peaks at ~27 GB of RAM with it; `make MKFLAGS=` builds the lean engine (~12 GB, up to 4 drafts: -d 4).
 MKFLAGS ?= -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1
 NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC $(MKFLAGS)
 

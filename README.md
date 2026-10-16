@@ -62,7 +62,7 @@ in [docs/ENGINE.md](docs/ENGINE.md).
 - **GPU:** NVIDIA Ampere or newer (sm_86 tested; the kernels use sm_80+ features) with 24 GB of VRAM.
 - **CUDA:** 13.2 is what we build with; older 12.x versions are untested.
 - **OS:** Linux or WSL2.
-- **RAM:** about 25 GB free to compile the served configuration (ptxas). The lean build needs ~12 GB.
+- **RAM:** about 27 GB free to compile the served configuration (ptxas). The lean build needs ~12 GB.
 - **llama.cpp b10246**, built at `../llama.cpp`. The engine uses its tokenizer (libllama), and the vision library and
   reference tools use libmtmd.
 - **Python** 3.10+ with jinja2.
@@ -74,7 +74,7 @@ in [docs/ENGINE.md](docs/ENGINE.md).
 git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout b10246
 cmake -S ../llama.cpp -B ../llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
 cmake --build ../llama.cpp/build -j
-make -j2        # qwen38_mk (CLI), libqwen38mk.so (server), tools/, libqwen38vision.so: 20-30 min
+make -j2        # qwen38_mk (CLI), libqwen38mk.so (server), tools/, libqwen38vision.so: ~20 min
 pip install -r requirements.txt
 ```
 
