@@ -1,0 +1,49 @@
+@echo off
+REM Serve Qwen3.8-27B through the megakernel's OpenAI-compatible server (native Windows). Usage: scripts\serve.bat [port] [ctx]
+REM Defaults as scripts/serve.sh: port 8080, 120,000 tokens of context, q8_0 KV cache, 7 MTP drafts, exact reuse on, images
+REM on when the mmproj file and qwen38vision.dll exist. Settings (environment):
+REM   MK_MODEL            the GGUF (default %USERPROFILE%\models\Qwen3.8-27B-UD-Q4_K_XL.gguf)
+REM   MK_MMPROJ           the vision projector (default: mmproj-BF16.gguf next to the model; MK_MMPROJ=off turns images off)
+REM   MK_IMAGE_MAX_TOKENS tokens per image (default: the mmproj's, 4096)
+REM   MK_HOST             listen address (default 127.0.0.1; 0.0.0.0 for other machines on the LAN)
+REM   MK_DRAFT            MTP drafts per cycle (default 7; a build.ps1 -MkFlags "" build takes at most 4)
+REM   MK_EXACT_REUSE=0    turn exact reuse off (see scripts/serve.sh)
+REM   MK_PF_CAP           prefill chunk tokens (default 2048; 1024 above 96k context)
+REM   MK_KV, MK_KV_WIN    low-bit KV cache, preset D': set MK_KV=K*=6,V*=5,*16=8 and MK_KV_WIN=2048
+REM   MK_PYTHON           Python with jinja2 (default python)
+setlocal
+set "HERE=%~dp0.."
+set "PORT=%~1"
+if "%PORT%"=="" set PORT=8080
+set "CTX=%~2"
+if "%CTX%"=="" set CTX=120000
+if not defined MK_MODEL set "MK_MODEL=%USERPROFILE%\models\Qwen3.8-27B-UD-Q4_K_XL.gguf"
+if not defined MK_PYTHON set "MK_PYTHON=python"
+if not defined MK_HOST set "MK_HOST=127.0.0.1"
+if not defined MK_DRAFT set "MK_DRAFT=7"
+if not exist "%HERE%\qwen38mk.dll" (
+    echo missing %HERE%\qwen38mk.dll: run build.ps1 ^(see README^)
+    exit /b 1
+)
+if not exist "%MK_MODEL%" (
+    echo missing model %MK_MODEL% ^(set MK_MODEL^)
+    exit /b 1
+)
+if %CTX% GTR 96000 if not defined MK_PF_CAP set "MK_PF_CAP=1024"
+set "XR=--exact-reuse"
+set "XS=on"
+if "%MK_EXACT_REUSE%"=="0" (
+    set "XR="
+    set "XS=off"
+)
+if not defined MK_MMPROJ for %%M in ("%MK_MODEL%") do set "MK_MMPROJ=%%~dpMmmproj-BF16.gguf"
+set "VS=off"
+set "VA="
+if /i not "%MK_MMPROJ%"=="off" if exist "%MK_MMPROJ%" if exist "%HERE%\qwen38vision.dll" (
+    set "VS=on the CPU"
+    set VA=--mmproj "%MK_MMPROJ%"
+)
+if defined VA if defined MK_IMAGE_MAX_TOKENS set VA=%VA% --image-max-tokens %MK_IMAGE_MAX_TOKENS%
+if not defined MK_PF_CAP (set "PFC=2048") else (set "PFC=%MK_PF_CAP%")
+echo megakernel: %MK_MODEL%, ctx %CTX%, KV q8_0 %MK_KV%, %MK_DRAFT% MTP drafts, prefill chunk %PFC%, exact reuse %XS%, images %VS%, http://%MK_HOST%:%PORT%
+"%MK_PYTHON%" "%HERE%\server\mk_server.py" -m "%MK_MODEL%" --host %MK_HOST% --port %PORT% -c %CTX% --kv q8 -d %MK_DRAFT% %XR% %VA%

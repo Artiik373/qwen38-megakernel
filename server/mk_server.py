@@ -37,6 +37,8 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOPK_MAX = 32
+# the engine and encoder libraries next to the repo root: qwen38mk.dll / qwen38vision.dll on Windows
+LIB_MK, LIB_VISION = ("qwen38mk.dll", "qwen38vision.dll") if os.name == "nt" else ("libqwen38mk.so", "libqwen38vision.so")
 
 
 def log(*a):
@@ -827,7 +829,7 @@ def main():
     ap.add_argument("-c", "--ctx", type=int, default=32768)
     ap.add_argument("-d", "--draft", type=int, default=4)
     ap.add_argument("--draft-vocab", default=os.path.join(os.path.dirname(HERE), "draft_vocab_32k.bin"))
-    ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), "libqwen38mk.so"))
+    ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), LIB_MK))
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
                     help="KV cache format (auto: q8_0 only when the fp16 cache does not fit)")
     ap.add_argument("--ck-every", type=int, default=4096,
@@ -838,7 +840,7 @@ def main():
                          "instead of appending to decoded rows (costs prompt time when a long reply is reused)")
     ap.add_argument("--mmproj", default=None,
                     help="vision projector GGUF (e.g. mmproj-*.gguf): image_url inputs, encoded on the CPU (no VRAM)")
-    ap.add_argument("--vision-lib", default=os.path.join(os.path.dirname(HERE), "libqwen38vision.so"))
+    ap.add_argument("--vision-lib", default=os.path.join(os.path.dirname(HERE), LIB_VISION))
     ap.add_argument("--vision-threads", type=int, default=0, help="CPU threads of the image encoder (0: all)")
     ap.add_argument("--vision-backend", choices=["auto", "cpu", "mtmd"], default="auto",
                     help="image encoder: cpu (AVX2 / FMA fp32 kernels), mtmd (llama.cpp's), auto (cpu if the CPU has AVX2 + FMA)")

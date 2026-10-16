@@ -3,8 +3,14 @@
 #include "vit_cpu.h"
 
 #include <immintrin.h>
+#ifdef _WIN32
+#include <malloc.h>
+
+#include "win32.h"
+#else
 #include <pthread.h>
 #include <sched.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +32,12 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#ifdef _WIN32
+// 64-bit file offsets (the CRT's off_t is 32-bit); after every include, so no header sees these
+#define off_t long long
+#define fseeko _fseeki64
+#endif
+
 namespace mkv {
 namespace {
 
@@ -46,6 +58,19 @@ struct Buf {
         std::swap(n, o.n);
         return *this;
     }
+#ifdef _WIN32
+    ~Buf() { _aligned_free(p); }
+    float * get(size_t m) {
+        if (m > n) {
+            _aligned_free(p);
+            n = 0;
+            p = static_cast<float *>(_aligned_malloc(std::max<size_t>(m, 16) * sizeof(float), 64));
+            if (!p) throw std::bad_alloc();
+            n = m;
+        }
+        return p;
+    }
+#else
     ~Buf() { free(p); }
     float * get(size_t m) {
         if (m > n) {
@@ -57,12 +82,21 @@ struct Buf {
         }
         return p;
     }
+#endif
 };
 
 // ---------------------------------------------------------------------------------------------------------------
 // Thread pool: one worker per physical core, pinned; run(n, f) hands out tasks 0 .. n - 1 dynamically (an atomic
 // counter), so a core that is busy with something else delays only its own task, not a fixed share of the work.
 
+#ifdef _WIN32
+std::vector<int> cpu_order() { return mkv_win::cpu_order(); }
+
+int physical_cores() {
+    const int n = mkv_win::physical_cores();
+    return n > 0 ? n : (int) std::max(1u, std::thread::hardware_concurrency());
+}
+#else
 std::vector<int> cpu_order() {
     // the first SMT sibling of each core, then the second siblings (Linux sysfs topology)
     std::vector<int> first, second;
@@ -95,6 +129,7 @@ int physical_cores() {
     }
     return cores.empty() ? (int) std::max(1u, std::thread::hardware_concurrency()) : (int) cores.size();
 }
+#endif
 
 // The caller of run() works too: n - 1 workers, pinned to the CPUs after the first one in cpu_order(), which stays free
 // for the (unpinned) caller, so that the n threads never outnumber the CPUs (a spinning worker on the caller's CPU
@@ -105,12 +140,16 @@ class Pool {
         const std::vector<int> order = pin ? cpu_order() : std::vector<int>{};
         for (int i = 1; i < n; i++) {
             th_.emplace_back([this] { loop(); });
+#ifdef _WIN32
+            if (!order.empty()) mkv_win::pin_thread(th_.back().native_handle(), order[i % order.size()]); // (best effort)
+#else
             if (!order.empty()) {
                 cpu_set_t cs;
                 CPU_ZERO(&cs);
                 CPU_SET(order[i % order.size()], &cs);
                 pthread_setaffinity_np(th_.back().native_handle(), sizeof(cs), &cs); // (best effort)
             }
+#endif
         }
     }
     ~Pool() {
@@ -502,7 +541,11 @@ struct GG {
 } // namespace
 
 Vit::Vit(const std::string & mmproj, const Params & prm) {
+#ifdef _WIN32
+    if (!mkv_win::avx2_fma()) throw std::runtime_error("vit: needs AVX2 + FMA");
+#else
     if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma")) throw std::runtime_error("vit: needs AVX2 + FMA");
+#endif
     const int nt = prm.n_threads > 0 ? prm.n_threads : physical_cores();
     p_.reset(new Impl(nt, prm.pin));
     Impl & I = *p_;

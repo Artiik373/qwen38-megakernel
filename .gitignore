@@ -23,3 +23,11 @@ draft_vocab_48k.bin
 # python
 __pycache__/
 .pytest_cache/
+# Windows build outputs (build.ps1)
+build_win/
+*.dll
+*.exe
+*.lib
+*.exp
+*.obj
+*.pdb

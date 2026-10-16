@@ -39,13 +39,19 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include "compat_win32.h"
+#else
 #include <unistd.h>
+#endif
 
 #include "ggml.h"
 #include "gguf.h"
 #include "qwen38_mk.h"
 
+#ifndef _WIN32
 extern char ** environ; // (state files: the MK_* settings in the key)
+#endif
 
 // MK_SPEC_LOG=1: the draft head keeps its top logits, and with MK_SPEC_LOG_FILE=<path> every decode
 // cycle appends a JSON line (drafts + their MTP top logits, verify rows, outcome). Analysis only.
@@ -8150,6 +8156,10 @@ struct MKEngine::Impl {
     static unsigned long long self_hash() {
         static unsigned long long h = 0;
         if (h) return h;
+#ifdef _WIN32
+        char mp[PATH_MAX];
+        std::string path = mk_win_module_path(reinterpret_cast<const void *>(&self_hash), mp, sizeof mp) ? mp : "(module)";
+#else
         const uintptr_t a = reinterpret_cast<uintptr_t>(&self_hash);
         std::string path = "/proc/self/exe";
         if (FILE * m = fopen("/proc/self/maps", "r")) {
@@ -8166,6 +8176,7 @@ struct MKEngine::Impl {
             }
             fclose(m);
         }
+#endif
         h = file_hash(path);
         if (!h) throw std::runtime_error("state files: cannot read " + path + " to identify the build");
         return h;
@@ -8185,7 +8196,11 @@ struct MKEngine::Impl {
         const size_t edge = std::min<size_t>(file.size, (size_t) 4 << 20);
         unsigned long long mh = wd_hash(file.base, edge);
         mh = wd_hash(file.base + file.size - edge, edge, mh);
+#ifdef _WIN32
+        k << " model " << rp << " " << (long long) st.st_size << " " << (long long) st.st_mtime << ".0"
+#else
         k << " model " << rp << " " << (long long) st.st_size << " " << (long long) st.st_mtim.tv_sec << "." << (long long) st.st_mtim.tv_nsec
+#endif
           << " " << hex64(mh);
         k << " ctx " << ctx << " kvq8 " << hb.kvq8 << " kvb";
         for (int w = 0; w < 2; w++)
@@ -8267,6 +8282,9 @@ struct MKEngine::Impl {
                 ok = fwrite(buf.get(), 1, n, f) == n;
             }
         ok = (fclose(f) == 0) && ok;
+#ifdef _WIN32
+        if (ok) remove(path.c_str()); // (rename does not replace an existing file on Windows)
+#endif
         if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
             unlink(tmp.c_str());
             fprintf(stderr, "[mk] state file: writing %s failed (not saved)\n", path.c_str());

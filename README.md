@@ -12,7 +12,8 @@ parts:
 - **The vision encoder** turns OpenAI `image_url` parts into model input. It runs **on the CPU** (fp32 AVX2 / FMA), so
   images cost no VRAM and the full context stays available.
 
-It runs on Linux and WSL2. A native Windows build is in progress.
+It runs on Linux, WSL2 and native Windows. The Windows build gives the same output as the Linux build, bit for bit,
+at the same speed ([Windows](#windows)).
 
 ## Numbers
 
@@ -61,7 +62,7 @@ in [docs/ENGINE.md](docs/ENGINE.md).
 
 - **GPU:** NVIDIA Ampere or newer (sm_86 tested; the kernels use sm_80+ features) with 24 GB of VRAM.
 - **CUDA:** 13.2 is what we build with; older 12.x versions are untested.
-- **OS:** Linux or WSL2.
+- **OS:** Linux, WSL2, or Windows 10 / 11 x64 ([Windows](#windows) has its own build steps).
 - **RAM:** about 27 GB free to compile the served configuration (ptxas). The lean build needs ~12 GB.
 - **llama.cpp b10246**, built at `../llama.cpp`. The engine uses its tokenizer (libllama), and the vision library and
   reference tools use libmtmd.
@@ -128,6 +129,67 @@ What the API supports:
 
 [docs/ENGINE.md](docs/ENGINE.md#server) has the details.
 
+## Windows
+
+The same sources build natively with MSVC and nvcc. On an RTX 3090 we compared the Windows build with the Linux build
+of the same source, on the same model file:
+
+| check | Windows vs Linux |
+|---|---|
+| greedy token ids, `-d 7` and `-d 0` | identical |
+| `--kld` report against llama.cpp (13,299 positions) | identical |
+| server replies: text, thinking, an image, an image follow-up turn | identical |
+| ptxas registers and spills, every function | identical |
+| decode at 38k context | 173.0 vs 173.1 tok/s |
+| prefill of a 38k-token prompt | 22.3 vs 22.5 s |
+| decode, chat prompts 2-4 (512 tokens, `-d 7`) | within 1.5% |
+| image encode, 196 / 300 / 1024 tokens | 0.59 / 0.81 / 3.56 s vs 0.50 / 0.80 / 3.95 s |
+
+The first chat prompt after the model load decoded faster on Windows: 220 vs 132-145 tok/s, with the same tokens. The
+likely cause is that the GPU's clocks ramp up faster there. The Windows encoder's image rows differ from the Linux encoder's at fp32 rounding level (relative 2e-6 to 1.3e-5). That
+is smaller than either's error against an fp64 forward of the tower, and the image replies above were identical.
+
+Requirements:
+- **Driver:** an NVIDIA driver that supports CUDA 13.2.
+- **Compiler:** Visual Studio 2022 Build Tools with the C++ x64 tools (MSVC v143). CUDA 13.2 does not accept VS 2026's
+  compiler.
+- **CUDA 13.2:** the installer, or NVIDIA's redistributable archives (`cuda_nvcc`, `cuda_cudart`, `cuda_cccl`,
+  `cuda_crt`, `libnvvm`; `cuda_cuobjdump` for the checks) unpacked into one folder. The engine links the CUDA runtime
+  statically, so at run time only the driver is needed.
+- **Tools:** CMake and Ninja for llama.cpp, and Python 3.10+.
+- **RAM:** about 27 GB free for the engine compile. Don't run WSL2 jobs at the same time: the Linux VM's memory comes
+  out of the same pool.
+
+Build, in PowerShell, from an "x64 Native Tools" prompt for VS 2022 (or after `vcvars64.bat`), with llama.cpp next to
+this repository:
+
+```powershell
+git clone https://github.com/ggml-org/llama.cpp ..\llama.cpp; git -C ..\llama.cpp checkout b10246
+cmake -S ..\llama.cpp -B ..\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=OFF -DLLAMA_CURL=OFF
+cmake --build ..\llama.cpp\build --target llama mtmd
+.\build.ps1 -Cuda "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"   # ~20 min (the default is $env:CUDA_PATH)
+python -m venv .venv; .venv\Scripts\pip install -r requirements.txt
+```
+
+- **llama.cpp:** a CPU-only build is enough here. The engine uses only its tokenizer and, for images, libmtmd.
+- **What `build.ps1` builds:** `qwen38mk.dll` (server engine), `qwen38_mk.exe` (CLI), `qwen38vision.dll` and
+  `tools\*.exe`. It uses the Makefile's nvcc flags and `MKFLAGS` (`-MkFlags ""` for the lean engine), writes
+  `ptxas.log`, and copies llama.cpp's DLLs next to the outputs.
+- **Partial builds:** `-Targets engine|vision|tools` builds one part. An engine object that is newer than the sources
+  and was built with the same flags is reused.
+
+Run (cmd):
+
+```bat
+set MK_MODEL=D:\models\Qwen3.8-27B-UD-Q4_K_XL.gguf
+set MK_PYTHON=%CD%\.venv\Scripts\python.exe
+scripts\serve.bat                 :: http://127.0.0.1:8080, 120k context, q8_0 KV, 7 drafts
+```
+
+`scripts\serve.bat` takes the same settings as `scripts/serve.sh`, for example `MK_KV` / `MK_KV_WIN` for preset D', or
+`MK_HOST=0.0.0.0` for the LAN. Images are on when `mmproj-BF16.gguf` sits next to the model or `MK_MMPROJ` names it;
+`MK_MMPROJ=off` turns them off. From an NVMe disk the server is ready in ~7 s.
+
 ## Checking a build
 
 - **Server tests:** `python -m pytest -q tests` runs without a GPU, against fake engines.
@@ -146,7 +208,9 @@ What the API supports:
 - `capi.cpp`: the C API of `libqwen38mk.so`
 - `main.cu`: the `qwen38_mk` CLI
 - `server/mk_server.py`: the HTTP server
-- `scripts/serve.sh`: the launcher
+- `scripts/serve.sh`, `scripts/serve.bat`: the launchers (Linux / WSL2, Windows)
+- `build.ps1`, `compat_win32.h` / `.cpp`, `vision/win32.h` / `.cpp`: the Windows build and its POSIX / Win32 shims
+  (compiled only on Windows)
 - `vision/`: the CPU image encoder (`libqwen38vision.so`) and its tests
 - `tools/`: llama.cpp reference tools and the draft-vocabulary builder
 - `bench/`: benchmarks

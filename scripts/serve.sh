@@ -4,8 +4,8 @@
 # file and libqwen38vision.so exist. Settings (environment):
 #   MK_MODEL            the GGUF (default ~/models/Qwen3.8-27B-UD-Q4_K_XL.gguf; Q4_K_M runs on the same engine). Keep it
 #                       on a Linux filesystem under WSL2: /mnt/c or /mnt/g paths load several times slower.
-#   MK_MMPROJ           the vision projector (default ~/models/mmproj-BF16.gguf, unsloth's file name, or
-#                       ~/models/mmproj-Qwen3.8-27B-BF16.gguf; MK_MMPROJ= turns images off)
+#   MK_MMPROJ           the vision projector (default: mmproj-BF16.gguf, unsloth's file name, next to the model or in
+#                       ~/models, else ~/models/mmproj-Qwen3.8-27B-BF16.gguf; MK_MMPROJ= turns images off)
 #   MK_IMAGE_MAX_TOKENS tokens per image (default: the mmproj's, 4096); fewer tokens encode faster
 #   MK_HOST             listen address (default 127.0.0.1; 0.0.0.0 for other machines on the LAN)
 #   MK_DRAFT            MTP drafts per cycle (default 7; a `make MKFLAGS=` build takes at most 4)
@@ -28,7 +28,8 @@ if [ "$CTX" -gt 96000 ]; then export MK_PF_CAP="${MK_PF_CAP:-1024}"; fi
 XR=(--exact-reuse) XS=on
 [ "${MK_EXACT_REUSE:-1}" = 0 ] && XR=() XS=off
 if [ -n "${MK_MMPROJ+x}" ]; then MMPROJ="$MK_MMPROJ"
-else MMPROJ=$(ls "$HOME/models/mmproj-BF16.gguf" "$HOME/models/mmproj-Qwen3.8-27B-BF16.gguf" 2>/dev/null | head -n1 || true)
+else MMPROJ=$(ls "$(dirname "$MODEL")/mmproj-BF16.gguf" "$HOME/models/mmproj-BF16.gguf" "$HOME/models/mmproj-Qwen3.8-27B-BF16.gguf" \
+                    2>/dev/null | head -n1 || true)
 fi
 VA=() VS=off
 if [ -n "$MMPROJ" ] && [ -f "$MMPROJ" ] && [ -f "$HERE/libqwen38vision.so" ]; then

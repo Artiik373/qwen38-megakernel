@@ -10,10 +10,14 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include "compat_win32.h"
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace gguf {
 

@@ -22,6 +22,9 @@
 #ifndef MKV_NO_VIT
 #include "vit_cpu.h"
 #endif
+#ifdef _WIN32
+#include "win32.h"
+#endif
 
 // image decoding: the stb_image that llama.cpp vendors and libmtmd decodes with (mtmd_helper_bitmap_init_from_buf:
 // stbi_load_from_memory, 3 channels), compiled here as private static functions
@@ -42,7 +45,9 @@ double now_ms() {
 }
 
 bool cpu_has_avx2_fma() {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_WIN32) && defined(_M_X64)
+    return mkv_win::avx2_fma();
+#elif defined(__x86_64__) || defined(_M_X64)
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #else
     return false;

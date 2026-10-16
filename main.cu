@@ -4,12 +4,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include "compat_win32.h"
+#else
 #include <fcntl.h>
+#endif
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <vector>
 
 #include "llama.h"
