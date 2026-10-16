@@ -1,4 +1,5 @@
-# build outputs
+# build outputs (build/: variant builds of scripts/mk_ninja.py-style tooling)
+build/
 *.o
 qwen38_mk
 libqwen38mk.so
