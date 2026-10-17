@@ -9,7 +9,7 @@ param(
     [string] $Llama = (Join-Path $PSScriptRoot "..\llama.cpp"),
     [string] $Cuda = $env:CUDA_PATH,
     [string] $Arch = "",
-    [string] $MkFlags = "-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1",
+    [string] $MkFlags = "-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1",
     [ValidateSet("all", "engine", "vision", "tools")] [string[]] $Targets = @("all")
 )
 $ErrorActionPreference = "Stop"

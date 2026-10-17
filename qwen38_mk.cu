@@ -119,6 +119,15 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_GSYNC
 #define MK_GSYNC 0
 #endif
+// MK_K5 (k5, LEAD 4, compile-time; 0 = default = the code without it): the dn_proj -> dn_core grid barrier becomes a split
+// barrier (k5_arrive after dn_proj, k5_wait inside dn_core) and the 48 heads go to the first 48 blocks to finish dn_proj,
+// which load the head's state and replay its accepted drafts (inputs of earlier launches) before the wait. Bitwise exact.
+#ifndef MK_K5
+#define MK_K5 0
+#endif
+#if MK_K5 && MK_GSYNC != 0
+#error "MK_K5 needs MK_GSYNC=0 (its split barrier is form 0's arrival / poll on the same counter)"
+#endif
 // MK_K2_TB (stockfix K2): tokens per batch of resid_wv's last-arrival combine (their partial loads issued together; 8 beat 4
 // by 0.5-0.8 us per call at 38k, no new spills)
 #ifndef MK_K2_TB
@@ -541,6 +550,47 @@ __device__ __forceinline__ void gsync(unsigned & epoch, int tag) {
     }
     __syncthreads();
 }
+
+#if MK_K5
+// K5 split grid barrier (MK_GSYNC 0's counter and epoch accounting, gsync cut in two halves).
+// k5_arrive: every block, right after its producer items; release-adds one arrival (atom: the returned count is the
+// block's arrival rank in this generation) and advances epoch as gsync does. The first NVH blocks to arrive take the
+// delta-net heads 0 .. NVH - 1 (s_k5h, -1: none), s_k5e = the count that completes the generation. Every block then calls
+// k5_wait before its next arrival anywhere: the count is cumulative, so a block one generation ahead could otherwise
+// complete this generation's count while a producer has not arrived. MK_PROFILE: the arrival is stamped as in gsync and
+// the LAST arriver stamps the release word (the phase boundary) right after its atom returns.
+__shared__ int s_k5h;
+__shared__ unsigned s_k5e;
+__device__ __forceinline__ void k5_arrive(unsigned & epoch, int tag) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned k = epoch / gridDim.x + 1; // this barrier's index (as gsync's)
+        if (cB.prof && k < 1024) cB.prof[4096 + k * 128 + blockIdx.x] = gtimer();
+        unsigned old;
+        asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(cB.bar) : "memory");
+        const unsigned rank = old - epoch; // arrivals of this generation before this one
+        epoch += gridDim.x;
+        s_k5h = rank < (unsigned) NVH ? (int) rank : -1;
+        s_k5e = epoch;
+        if (cB.prof) {
+            if (blockIdx.x == 0) s_bar_k = k;
+            if (rank == gridDim.x - 1 && k < 2048) cB.prof[k] = (gtimer() << 8) | (unsigned long long) tag;
+        }
+    }
+    __syncthreads();
+}
+// k5_wait: thread 0 acquire-polls the count until the generation is complete, then the block (as gsync's wait half)
+__device__ __forceinline__ void k5_wait() {
+    if (threadIdx.x == 0) {
+        const unsigned e = s_k5e;
+        unsigned v;
+        do {
+            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.bar) : "memory");
+        } while (v < e);
+    }
+    __syncthreads();
+}
+#endif
 
 // profiling: timestamp the end of a phase's activation fill (block 0)
 __device__ __forceinline__ void mark_fill() {
@@ -1665,8 +1715,16 @@ __host__ __device__ __forceinline__ int dn_sidx(int col, int row) {
 template <int T>
 __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, int n_commit, uint8_t * /*sm*/) {
     uint8_t * const sm = smem;
+#if MK_K5
+    const int h = s_k5h; // the head this block took at its dn_proj arrival (k5_arrive)
+    if (h < 0) {
+        k5_wait();
+        return;
+    }
+#else
     const int h = blockIdx.x;
     if (h >= NVH) return;
+#endif
     const int kh = h % NKH;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     // thread owns state column `col`, rows [32 r, 32 r + 32)  (S stored as [col][row])
@@ -1696,6 +1754,74 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB;
     const float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
 
+#if MK_K5
+    // ---- K5 Pre (before the dn_proj barrier completes): the replayed events' inputs come from earlier launches (kvgb
+    // ring), so load them and run the replay now; the events' arithmetic and order are those of the single loop below ----
+    if (tid >= 448 && tid < 448 + np) {
+        const int e = tid - 448;
+        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
+        s_gb[2 * e] = __ldcg(slot + KVGB_G + h);
+        s_gb[2 * e + 1] = __ldcg(slot + KVGB_B + h);
+    }
+    for (int i = tid; i < np * 128; i += NT) { // replayed k / v
+        const int e = i >> 7, c = i & 127;
+        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
+        s_k[e * QS + (c >> 5) * 36 + (c & 31)] = __ldcg(slot + kh * 128 + c);
+        s_v[e * 128 + c] = __ldcg(slot + KVGB_V + h * 128 + c);
+    }
+    __syncthreads();
+    for (int e = 0; e < np; e++) { // (the commit event np + n_commit - 1 is never a replayed one)
+        const float g = s_gb[2 * e], beta = s_gb[2 * e + 1];
+        const float4 * kq = reinterpret_cast<const float4 *>(s_k + e * QS + r * 36);
+        float kv = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const float4 k4 = kq[i];
+            kv += S[i].x * k4.x + S[i].y * k4.y + S[i].z * k4.z + S[i].w * k4.w;
+        }
+        kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+        kv += __shfl_xor_sync(0xffffffffu, kv, 2);
+        const float dlt = (s_v[e * 128 + col] - g * kv) * beta;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const float4 k4 = kq[i];
+            S[i].x = g * S[i].x + k4.x * dlt;
+            S[i].y = g * S[i].y + k4.y * dlt;
+            S[i].z = g * S[i].z + k4.z * dlt;
+            S[i].w = g * S[i].w + k4.w * dlt;
+        }
+    }
+    k5_wait(); // every block's dn_proj outputs (conv rows n .. n + T - 1, z, alpha / beta partials) are visible from here
+
+    // ---- K5 Post: the new tokens' inputs ----
+    if (tid < 384) {
+        const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? 2048 + kh * 128 + (tid - 128) : 4096 + h * 128 + (tid - 256));
+        const float4 w = *reinterpret_cast<const float4 *>(W.conv + ch * 4);
+        float raw[T + 3];
+#pragma unroll
+        for (int j = 0; j < T + 3; j++) {
+            const int p = n - 3 + j;
+            raw[j] = p >= 0 ? __ldcg(conv + (p % CONV_RING) * QKV + ch) : 0.f;
+        }
+#pragma unroll
+        for (int t = 0; t < T; t++)
+            s_raw[t * 384 + tid] = silu(w.x * raw[t] + w.y * raw[t + 1] + w.z * raw[t + 2] + w.w * raw[t + 3]);
+    } else if (tid < 384 + T) {
+        const int t = tid - 384;
+        float al = 0.f, be = 0.f;
+#pragma unroll
+        for (int c = 0; c < AB_SPLIT; c++) {
+            al += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH + h);
+            be += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH + NVH + h);
+        }
+        float sp = al + W.dt[h];
+        sp = sp > 20.0f ? sp : logf(1.0f + expf(sp));
+        s_gb[2 * (np + t)] = expf(sp * W.A[h]);
+        s_gb[2 * (np + t) + 1] = 1.0f / (1.0f + expf(-be));
+    }
+    for (int i = tid; i < T * 128; i += NT) s_z[i] = __ldcg(cB.z + (i >> 7) * VD + h * 128 + (i & 127));
+    __syncthreads();
+#else
     // ---- prologue: every input of every event, one round of loads ----
     if (tid < 384) {
         const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? 2048 + kh * 128 + (tid - 128) : 4096 + h * 128 + (tid - 256));
@@ -1735,6 +1861,7 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     }
     for (int i = tid; i < T * 128; i += NT) s_z[i] = __ldcg(cB.z + (i >> 7) * VD + h * 128 + (i & 127));
     __syncthreads();
+#endif
 
     // l2-normalise q and k of the new tokens (warp 2t: q of token t, warp 2t+1: k), copy v
     if (warp < 2 * T) {
@@ -1761,6 +1888,46 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
         }
     }
 
+#if MK_K5
+    // ---- gated delta rule over the new tokens' events (the replayed ones ran before the wait) ----
+    for (int e = np; e < np + T; e++) {
+        const float g = s_gb[2 * e], beta = s_gb[2 * e + 1];
+        const float4 * kq = reinterpret_cast<const float4 *>(s_k + e * QS + r * 36);
+        float kv = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const float4 k4 = kq[i];
+            kv += S[i].x * k4.x + S[i].y * k4.y + S[i].z * k4.z + S[i].w * k4.w;
+        }
+        kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+        kv += __shfl_xor_sync(0xffffffffu, kv, 2);
+        const float dlt = (s_v[e * 128 + col] - g * kv) * beta;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const float4 k4 = kq[i];
+            S[i].x = g * S[i].x + k4.x * dlt;
+            S[i].y = g * S[i].y + k4.y * dlt;
+            S[i].z = g * S[i].z + k4.z * dlt;
+            S[i].w = g * S[i].w + k4.w * dlt;
+        }
+        {
+            const float4 * qq = reinterpret_cast<const float4 *>(s_q + e * QS + r * 36);
+            float o = 0.f;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float4 q4 = qq[i];
+                o += S[i].x * q4.x + S[i].y * q4.y + S[i].z * q4.z + S[i].w * q4.w;
+            }
+            o += __shfl_xor_sync(0xffffffffu, o, 1);
+            o += __shfl_xor_sync(0xffffffffu, o, 2);
+            if (r == 0) s_o[(e - np) * 128 + col] = o;
+        }
+        if (e == np + n_commit - 1) {
+#pragma unroll
+            for (int i = 0; i < 8; i++) Sg[SGS * i] = S[i];
+        }
+    }
+#else
     // ---- gated delta rule over all events; inputs are in shared memory, no barriers needed ----
     for (int e = 0; e < np + T; e++) {
         const float g = s_gb[2 * e], beta = s_gb[2 * e + 1];
@@ -1799,6 +1966,7 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
             for (int i = 0; i < 8; i++) Sg[SGS * i] = S[i];
         }
     }
+#endif
     __syncthreads();
 
     // gated rms-norm + quantise: warp w -> token w / 4, 32-element block w % 4 of this head
@@ -4404,7 +4572,11 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             if constexpr (WIDE) dn_proj_wv<T>(W, dl, n, dn_c);
             else if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(W, dl, n, dn_c);
             else dn_proj<T>(W, dl, n, dn_c, sm);
+#if MK_K5
+            k5_arrive(epoch, PH_DN_PROJ); // split barrier: dn_core waits after its replay (k5_wait)
+#else
             gsync(epoch, PH_DN_PROJ);
+#endif
             dn_core<T>(W, dl, n, dn_c, n_commit, sm);
             gsync(epoch, PH_DN_CORE);
             if (W.sout.fm) resid_out_wv<T>(W.sout, W.post_norm);
@@ -4432,7 +4604,11 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_RESID_O);
         } else {
             dn_proj<T>(W, dl, n, dn_c, sm);
+#if MK_K5
+            k5_arrive(epoch, PH_DN_PROJ); // split barrier: dn_core waits after its replay (k5_wait)
+#else
             gsync(epoch, PH_DN_PROJ);
+#endif
             dn_core<T>(W, dl, n, dn_c, n_commit, sm);
             gsync(epoch, PH_DN_CORE);
             resid_any<T, 6>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
@@ -6754,6 +6930,9 @@ struct MKEngine::Impl {
         if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
         fprintf(stderr, "[mk] stock2: K6 %d (split %d, ld %d), K7 state layout %d, K8 %d (nt %d)\n", hb.k6, MK_K6_S, MK_K6_LD, MK_K7, k8,
                 k8_nt);
+#if MK_K5
+        fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order (MK_K5=1)\n");
+#endif
         {
             const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
             size_t free_b = 0, total_b = 0;

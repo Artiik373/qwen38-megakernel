@@ -80,7 +80,7 @@ pip install -r requirements.txt
 ```
 
 - A plain `make` builds the configuration we serve: wide verify and up to 7 drafts
-  (`MKFLAGS=-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1`).
+  (`MKFLAGS=-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1`).
 - `make MKFLAGS=` builds the lean engine. It compiles in a few minutes and takes at most 4 drafts (run it with
   `MK_DRAFT=4`).
 - `make` targets the installed GPU's architecture; override it with `ARCH=sm_89` or similar.
