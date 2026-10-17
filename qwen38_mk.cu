@@ -6038,7 +6038,12 @@ struct MKEngine::Impl {
                 fflush(stderr);
                 _exit(3);
             }
+#ifdef _WIN32
+            // (sleep_for(100 us) is Sleep(1) there: until the next timer tick, 15.6 ms unless the timer resolution was raised)
+            if (el > wd_spin_s) mk_win_sleep_us(el > 2.0 ? 2000 : 100);
+#else
             if (el > wd_spin_s) std::this_thread::sleep_for(std::chrono::microseconds(el > 2.0 ? 2000 : 100));
+#endif
         }
     }
 
@@ -7299,8 +7304,9 @@ struct MKEngine::Impl {
             cudaStreamSynchronize(pf_s2);
             cudaStreamDestroy(pf_s2);
         }
-        for (cudaEvent_t e : {pf_e0, pf_e1})
+        for (cudaEvent_t e : {pf_e0, pf_e1, pf_cev[0], pf_cev[1]})
             if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : pf_gev) cudaEventDestroy(e);
         for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
         cudaStreamSynchronize(0);
         if (embd_host) cudaFreeHost(embd_host);
@@ -7551,6 +7557,12 @@ struct MKEngine::Impl {
     // ---------------- batched prefill (prefill.cuh) ----------------
     PBufs hp{};
     bool pf_ready = false;
+    // C5: the host enqueues prefill chunk k + 1 before it waits for chunk k (pf_cev); MK_PF_SYNC=1: the token upload of every
+    // chunk is synchronous and the host waits for each chunk's trunk before its MTP part (the GPU idles for the host's wake-up
+    // and launches at both points). MK_PF_GAPS=1: report the GPU's idle time at those points per prefill run.
+    bool pf_sync = false, pf_gaps = false;
+    cudaEvent_t pf_cev[2] = {};
+    std::vector<cudaEvent_t> pf_gev; // MK_PF_GAPS: timing events, 4 per chunk (start, trunk end, MTP part start, end)
 
     void pf_init() {
         if (pf_ready) return;
@@ -7665,6 +7677,9 @@ struct MKEngine::Impl {
             CK(cudaEventCreateWithFlags(&pf_e0, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&pf_e1, cudaEventDisableTiming));
         }
+        if (const char * e = getenv("MK_PF_SYNC")) pf_sync = atoi(e) != 0;
+        if (const char * e = getenv("MK_PF_GAPS")) pf_gaps = atoi(e) != 0;
+        for (cudaEvent_t & e : pf_cev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         mem_mark("prefill kernel attributes");
         pf_ready = true;
     }
@@ -8066,23 +8081,42 @@ struct MKEngine::Impl {
         ck_scr_guard(); // the scratch may still be the source of an end save's copy
         ck_guard_state();
         const int N = (int) toks.size(), cap = hp.cap;
+        // C5: chunk c's GPU work is enqueued before the host waits for chunk c - 1 (its pf_cev event), so the GPU does not
+        // idle while the host wakes up and launches; the scoring paths (pred / sink) read results back per chunk
+        const bool ahead = !pf_sync && !pred && !sink;
+        const int nch = (N + cap - 1) / cap;
+        if (pf_gaps) // 4 timing events per chunk: start, trunk end, MTP part start, end
+            while (pf_gev.size() < (size_t) 4 * nch) {
+                cudaEvent_t e;
+                CK(cudaEventCreate(&e));
+                pf_gev.push_back(e);
+            }
+        auto gap_mark = [&](int c, int k) {
+            if (pf_gaps) CK(cudaEventRecord(pf_gev[4 * c + k], 0));
+        };
         for (int c0 = 0; c0 < N; c0 += cap) {
 #if MK_KV_EMU
             kv_demote_to(n0 + c0 - hb.kvemu_win); // recent-window emulation: rows older than the window before this chunk
 #endif
-            const int T = std::min(cap, N - c0), n = n0 + c0;
+            const int T = std::min(cap, N - c0), n = n0 + c0, ci = c0 / cap;
             int sn = 0, sp[STG_MAX], ss[STG_MAX]; // this chunk's checkpoints (n < P <= n + T) and their slots
             if (snaps && !pred && !sink)
                 for (const Snap & q : *snaps)
                     if (q.pos > n && q.pos <= n + T && sn < stg_n) sp[sn] = q.pos, ss[sn++] = q.slot;
-            CK(cudaMemcpy(hp.tok, toks.data() + c0, T * sizeof(int), cudaMemcpyHostToDevice));
             const bool img = erow && std::any_of(erow + c0, erow + c0 + T, [](int r) { return r >= 0; });
-            if (img) CK(cudaMemcpy(hp.erow, erow + c0, T * sizeof(int), cudaMemcpyHostToDevice));
+            if (ahead) { // stream-ordered behind the previous chunk (pageable source: staged at the call, no device wait)
+                CK(cudaMemcpyAsync(hp.tok, toks.data() + c0, T * sizeof(int), cudaMemcpyHostToDevice, 0));
+                if (img) CK(cudaMemcpyAsync(hp.erow, erow + c0, T * sizeof(int), cudaMemcpyHostToDevice, 0));
+            } else {
+                CK(cudaMemcpy(hp.tok, toks.data() + c0, T * sizeof(int), cudaMemcpyHostToDevice));
+                if (img) CK(cudaMemcpy(hp.erow, erow + c0, T * sizeof(int), cudaMemcpyHostToDevice));
+            }
             ck_issue_restore(); // a due checkpoint restore streams in from here on (waited for per layer group below)
             ring_snap_guard();  // (MK_EXACT: a previous chunk's ring row copies, before this chunk's preps)
             const bool rsnap = sn > 0 && ring_bytes_ck > 0; // MK_EXACT + MK_KV_WIN: the checkpoints keep the rings
             for (int j = 0; j < sn; j++) ck[ss[j]].ring_ok = false;
             if (rsnap) ring_snap_begin(sn, ss);
+            gap_mark(ci, 0); // (after the token upload: MK_PF_SYNC's idle is before it)
             if (img) pf_time("embed", [&] { pk_embed_img<<<T, 256>>>(T); });
             else pf_time("embed", [&] { pk_embed<<<T, 256>>>(T); });
             int dl = 0;
@@ -8176,7 +8210,9 @@ struct MKEngine::Impl {
             }
             wd_T = T;
             wd_mode = MODE_PREFILL;
-            wait_device("a prefill chunk", std::max(wd_limit, 120.0));
+            gap_mark(ci, 1);
+            if (!ahead) wait_device("a prefill chunk", std::max(wd_limit, 120.0));
+            gap_mark(ci, 2);
             if (pred || sink) {
                 pf_norm_quant(hp.x, hw.onorm, T);
                 std::vector<float> rows;
@@ -8227,6 +8263,11 @@ struct MKEngine::Impl {
                 if (rsnap) ring_snap_rows(N_ATT_SLOTS - 1, n, sn, sp, ss);
             });
             CK(cudaMemcpyAsync(hp.h, hp.h + (size_t) T * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
+            gap_mark(ci, 3);
+            if (ahead) { // (the watchdog still covers every chunk, one behind)
+                CK(cudaEventRecord(pf_cev[ci & 1], 0));
+                if (ci > 0) wait_event(pf_cev[(ci - 1) & 1], "a prefill chunk", std::max(wd_limit, 120.0));
+            }
         }
         if (snaps && !pred && !sink)
             for (const Snap & q : *snaps) { // (its last piece was copied before the last chunk's MTP part)
@@ -8236,6 +8277,22 @@ struct MKEngine::Impl {
         CK(cudaGetLastError());
         wait_device("the prefill tail", std::max(wd_limit, 120.0));
         if (memlog && pf_runs_seen++ == 0) mem_mark("first prefill run");
+        if (pf_gaps && !pred && !sink) { // GPU idle at the host's points: before a chunk's first kernel, before its MTP part
+            double g0 = 0, g1 = 0, wall = 0;
+            float ms;
+            for (int c = 0; c < nch; c++) {
+                if (c > 0) {
+                    CK(cudaEventElapsedTime(&ms, pf_gev[4 * (c - 1) + 3], pf_gev[4 * c]));
+                    g0 += ms;
+                }
+                CK(cudaEventElapsedTime(&ms, pf_gev[4 * c + 1], pf_gev[4 * c + 2]));
+                g1 += ms;
+            }
+            CK(cudaEventElapsedTime(&ms, pf_gev[0], pf_gev[4 * (nch - 1) + 3]));
+            wall = ms;
+            fprintf(stderr, "[mk] prefill gaps (%s): %d chunks, %.1f ms on the GPU; idle before chunks %.2f ms, before MTP parts %.2f ms\n",
+                    ahead ? "ahead" : "MK_PF_SYNC", nch, wall, g0, g1);
+        }
         pf_report();
     }
 

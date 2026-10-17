@@ -43,6 +43,8 @@ void * mk_win_mmap_ro(int fd, size_t len, long long off);
 int mk_win_munmap(void * p);
 // the path of the module (DLL or EXE) that contains addr; false if unknown
 bool mk_win_module_path(const void * addr, char * out, size_t cap);
+// sleep about us microseconds (a high-resolution waitable timer; std::this_thread::sleep_for rounds up to the timer tick)
+void mk_win_sleep_us(unsigned us);
 
 inline void * mmap(void *, size_t len, int, int, int fd, long long off) { return mk_win_mmap_ro(fd, len, off); }
 inline int munmap(void * p, size_t) { return mk_win_munmap(p); }
