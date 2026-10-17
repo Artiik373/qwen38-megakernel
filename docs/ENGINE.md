@@ -251,7 +251,8 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
   engine's sequence (prompts + emitted tokens), and when the re-rendered history diverges after the
   end of the previous prompt (e.g. a reformatted tool call) the engine rewinds to a checkpoint
   saved there. Anything else starts over (batched prefill, ~1500 tok/s).
-- Sampling: temperature, top_p, top_k (<= 32), min_p, seed, presence_penalty / frequency_penalty (-2..2, vLLM's
+- Sampling: temperature, top_p, top_k (1..32; absent or <= 0 means 32, the engine's maximum; above 32 is clamped with
+  a one-time warning), min_p, seed, presence_penalty / frequency_penalty (-2..2, vLLM's
   semantics: the tokens generated in this response); repetition_penalty is ignored (with a warning). One request at
   a time.
 - KV cache: fp16, or q8_0 when fp16 does not fit the requested context (`--kv auto|f16|q8`).

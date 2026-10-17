@@ -7,11 +7,12 @@ llama-server's API that open-jet uses).
 POST /v1/chat/completions (streaming or not): the request is rendered with the chat template stored
 in the GGUF (enable_thinking / preserve_thinking / reasoning_effort via chat_template_kwargs, tools
 via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured
-`tool_calls`.  Sampling: temperature, top_p, top_k (<= 32), min_p, seed.  Successive requests of a
-conversation reuse the processed tokens: the new prompt is matched against the sequence so far and
-only the rest is prefilled. When the new prompt diverges inside what the engine already processed, it
-rewinds to the last DeltaNet checkpoint at or before the divergence (saved during earlier prefills: at each
-generation prompt, each message start and every --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
+`tool_calls`.  Sampling: temperature, top_p, top_k (1..32; absent or <= 0: 32, the engine's maximum),
+min_p, seed.  Successive requests of a conversation reuse the processed tokens: the new prompt is
+matched against the sequence so far and only the rest is prefilled. When the new prompt diverges inside
+what the engine already processed, it rewinds to the last DeltaNet checkpoint at or before the
+divergence (saved during earlier prefills: at each generation prompt, each message start and every
+--ck-every tokens; a pool of MK_CK_SLOTS, default 8).
 GET /health, GET /v1/models.  One request at a time.
 """
 import argparse
@@ -625,13 +626,17 @@ class Server:
         return r
 
     def sampling(self, body):
+        """top_k: absent or <= 0 ("off" for llama.cpp / OpenAI-style clients) -> TOPK_MAX, the engine's maximum;
+        above TOPK_MAX -> TOPK_MAX with a one-time warning"""
         temp = float(body.get("temperature", 0.8) if body.get("temperature") is not None else 0.8)
         top_p = float(body.get("top_p", 0.95) if body.get("top_p") is not None else 0.95)
-        top_k = int(body.get("top_k", 40) if body.get("top_k") is not None else 40)
+        top_k = int(body["top_k"]) if body.get("top_k") is not None else TOPK_MAX
         min_p = float(body.get("min_p", 0.05) if body.get("min_p") is not None else 0.05)
         seed = body.get("seed")
         seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)
-        if top_k <= 0 or top_k > TOPK_MAX:
+        if top_k <= 0:
+            top_k = TOPK_MAX
+        elif top_k > TOPK_MAX:
             self.warn_once("top_k", f"top_k {top_k} -> {TOPK_MAX} (the megakernel samples from at most {TOPK_MAX} candidates)")
             top_k = TOPK_MAX
         # presence / frequency penalty, vLLM's semantics: tokens generated in this response so far (not the prompt)

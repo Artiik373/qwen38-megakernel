@@ -120,8 +120,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 ```
 
 What the API supports:
-- **Sampling:** temperature, top_p, top_k (<= 32), min_p, seed, and presence / frequency penalty. There is no
-  repetition penalty.
+- **Sampling:** temperature, top_p, top_k (1..32; absent or <= 0 means 32), min_p, seed, and presence / frequency
+  penalty. There is no repetition penalty.
 - **Chat template:** the one stored in the GGUF, with `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...)
   and OpenAI `tools`.
 - **Images:** base64 `data:` URLs only. There is no video or audio.

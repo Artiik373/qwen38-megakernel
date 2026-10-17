@@ -158,6 +158,43 @@ class MegakernelPromptReuseTests(unittest.TestCase):
         self.assertEqual(srv.eng.calls[-2][0], "reset")
 
 
+class _FakeSamplingEngine:
+    """records what Server.sampling passes to the engine"""
+
+    def __init__(self):
+        self.sampling = self.penalty = None
+
+    def set_penalty(self, presence, frequency):
+        self.penalty = (presence, frequency)
+
+    def set_sampling(self, temp, top_p, top_k, min_p, seed):
+        self.sampling = (temp, top_p, top_k, min_p, seed)
+
+
+class MegakernelSamplingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mk = _load_mk_server()
+
+    def _top_k(self, body):
+        """(the top_k the engine gets, the warnings given) for a sampled request with these fields"""
+        srv = object.__new__(self.mk.Server)
+        srv.eng, srv.warned = _FakeSamplingEngine(), set()
+        srv.sampling({"temperature": 0.7, "seed": 1, **body})
+        return srv.eng.sampling[2], srv.warned
+
+    def test_top_k_absent_or_off_is_the_engine_maximum_without_a_warning(self) -> None:
+        for body in ({}, {"top_k": None}, {"top_k": 0}, {"top_k": -1}):
+            self.assertEqual(self._top_k(body), (self.mk.TOPK_MAX, set()), body)
+
+    def test_top_k_in_range_is_kept(self) -> None:
+        self.assertEqual(self._top_k({"top_k": 20}), (20, set()))
+        self.assertEqual(self._top_k({"top_k": self.mk.TOPK_MAX}), (self.mk.TOPK_MAX, set()))
+
+    def test_top_k_above_the_maximum_is_clamped_with_a_warning(self) -> None:
+        self.assertEqual(self._top_k({"top_k": 64}), (self.mk.TOPK_MAX, {"top_k"}))
+
+
 class _FakeVisionEngine(_FakeEngine):
     """_FakeEngine with mk_prefill_img's images argument and a character tokenizer"""
 
