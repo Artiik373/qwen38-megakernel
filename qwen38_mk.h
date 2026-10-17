@@ -121,6 +121,11 @@ class MKEngine {
                       const std::vector<MKImage> & images);
     static int n_vocab();
     static int n_embd(); // width of an MKImage row
+    // Keep-warm load (capi.cpp, MK_KEEP_WARM_S): launches one kernel of blocks x threads on `stream` (a cudaStream_t)
+    // that touches no engine memory and ends when the word at stop (device pointer of host-mapped memory) becomes
+    // non-zero, or after ms milliseconds; spin 1 = every thread busy-loops, 0 = one thread polls with __nanosleep.
+    // Returns the launch's cudaError_t (0: launched).
+    static int warm_launch(void * stream, const unsigned * stop, double ms, int blocks, int threads, int spin);
     void bench_phases();
     int n_draft() const { return n_draft_; }
     MKStats stats;

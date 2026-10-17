@@ -13,7 +13,8 @@ matched against the sequence so far and only the rest is prefilled. When the new
 what the engine already processed, it rewinds to the last DeltaNet checkpoint at or before the
 divergence (saved during earlier prefills: at each generation prompt, each message start and every
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
-GET /health, GET /v1/models.  One request at a time.
+GET /health, GET /v1/models.  One request at a time.  After each request the engine keeps the GPU's
+clocks up for MK_KEEP_WARM_S seconds (default 300, 0 = off), so a reply after a pause starts at full speed.
 """
 import argparse
 import base64
@@ -102,6 +103,10 @@ class Engine:
         if hasattr(L, "mk_exact"):
             L.mk_exact.restype, L.mk_exact.argtypes = ctypes.c_int, [vp]
             self.exact = L.mk_exact(self.h) == 1
+        # keep-warm (MK_KEEP_WARM_S; libraries before it: none)
+        self._warm = hasattr(L, "mk_keep_warm")
+        if self._warm:
+            L.mk_keep_warm.restype, L.mk_keep_warm.argtypes = ctypes.c_double, [vp, ctypes.c_int]
 
     def _err(self, what):
         return RuntimeError(f"{what}: {self.L.mk_last_error().decode()}")
@@ -133,6 +138,11 @@ class Engine:
 
     def is_eog(self, tok):
         return bool(self.L.mk_is_eog(self.h, tok))
+
+    def keep_warm(self, on=True):
+        """on: keep the GPU's clocks up for MK_KEEP_WARM_S seconds from now (the engine stops the load before its next
+        GPU work); off: stop now. Returns the window in seconds (0: off)."""
+        return self.L.mk_keep_warm(self.h, 1 if on else 0) if self._warm else 0.0
 
     def set_sampling(self, temp, top_p, top_k, min_p, seed):
         if self.L.mk_set_sampling(self.h, temp, top_p, top_k, min_p, seed) < 0:
@@ -503,6 +513,7 @@ class Server:
         vis = (f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.backend}, {self.vision.n_threads} threads)"
                if self.vision else "")
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts{vis}")
+        self.eng.keep_warm()  # (MK_KEEP_WARM_S: the first reply starts at full clocks too)
 
     def warm_up(self):
         """Runs one prefill and one decode cycle before the server listens.
@@ -764,6 +775,8 @@ def make_handler(srv):
                         self._json(500, {"error": {"message": str(e), "type": "server_error"}})
                     except Exception:
                         pass
+                finally:
+                    srv.eng.keep_warm()  # (MK_KEEP_WARM_S: the window restarts after every request)
 
         def _complete(self, body):
             parts = {"reasoning": [], "content": []}
@@ -866,6 +879,8 @@ def main():
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        srv.eng.keep_warm(False)
 
 
 if __name__ == "__main__":

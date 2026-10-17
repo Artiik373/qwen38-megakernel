@@ -1,22 +1,188 @@
 // C API over MKEngine plus libllama's tokenizer (vocab only), for the HTTP server (server/mk_server.py).
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <cuda_runtime.h>
 
 #include "llama.h"
 #include "qwen38_mk.h"
 
 namespace {
+// ---- keep-warm (MK_KEEP_WARM_S) ----
+// A few seconds without GPU work and the driver drops the clocks (P8); a reply that starts there runs its first ~2 s at
+// ramping clocks (a 255-token reply: ~125 instead of ~200 tok/s). mk_keep_warm(h, 1), which the server calls once ready
+// and after every request, keeps a light load on the GPU for MK_KEEP_WARM_S seconds (default 300; 0 = off), then lets
+// the card idle. The driver's power settings stay as they are. Every C API call that runs GPU work stops the load
+// first: the kernel polls a host-mapped stop word and ends within microseconds, so it never runs next to an engine
+// launch (mk_cycle is a cooperative launch over every SM; a missed stop could only delay it, each warm kernel ends by
+// itself), and it touches no engine memory. Programs that never call mk_keep_warm (the CLI, benchmarks, tests) never
+// warm. MK_KEEP_WARM_LOAD = "blocks,threads,on_ms,off_ms,spin" (measurements): kernels of on_ms each (far below WDDM's
+// 2 s timeout) with off_ms without a kernel between them; spin 1 = every thread busy-loops, 0 = one polling thread.
+// Measured on an RTX 3090: the driver keys the P-state to utilization, so only a continuous load holds P2 (a 50% duty
+// cycle sits at P5 with 810 MHz memory, 20% stays at P8), and at P2 it runs full boost whatever the load: the default
+// (one polling thread) draws ~165 W against ~30 W idle, one block spinning ~166 W, every SM ~268 W.
+struct WarmLoad {
+    int blocks = 1, threads = 32, spin = 0;
+    double on_ms = 50.0, off_ms = 0.0;
+};
+
+// "blocks,threads,on_ms,off_ms,spin" (missing fields keep their defaults); false on a malformed or out-of-range spec
+bool parse_load(const char * s, WarmLoad & w) {
+    WarmLoad v;
+    if (s && *s) {
+        int spin = v.spin;
+        const int n = sscanf(s, "%d,%d,%lf,%lf,%d", &v.blocks, &v.threads, &v.on_ms, &v.off_ms, &spin);
+        v.spin = spin;
+        if (n < 1 || v.blocks < 1 || v.blocks > 1024 || v.threads < 1 || v.threads > 1024 || !(v.on_ms > 0.0) ||
+            v.on_ms > 1000.0 || !(v.off_ms >= 0.0) || v.off_ms > 10000.0 || (v.spin != 0 && v.spin != 1))
+            return false;
+    }
+    w = v;
+    return true;
+}
+
+class Warmer {
+    using Clock = std::chrono::steady_clock;
+
+  public:
+    Warmer(double seconds, const WarmLoad & load) : seconds_(seconds), load_(load) {}
+    ~Warmer() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            quit_ = true;
+            armed_ = false;
+            if (inflight_) *stop_h_ = 1;
+        }
+        cv_.notify_all();
+        if (th_.joinable()) th_.join();
+        if (ev_) cudaEventDestroy(ev_);
+        if (st_) cudaStreamDestroy(st_);
+        if (stop_h_) cudaFreeHost((void *) stop_h_);
+    }
+    double seconds() const { return seconds_; }
+    const WarmLoad & load() const { return load_; }
+
+    // (re)starts the window: the load runs until seconds() from now, or until pause()
+    void arm() {
+        std::lock_guard<std::mutex> lk(m_);
+        if (failed_ || (!th_.joinable() && !start())) return;
+        armed_ = true;
+        until_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds_));
+        cv_.notify_all();
+    }
+
+    // stops the load; returns once no warm kernel runs (the wait in microseconds)
+    double pause() {
+        std::unique_lock<std::mutex> lk(m_);
+        armed_ = false;
+        if (!inflight_) return 0.0;
+        *stop_h_ = 1;
+        const cudaEvent_t ev = ev_;
+        lk.unlock();
+        // spin on the event (the warm thread itself waits with a blocking sync): no OS wake-up latency here. A query
+        // that finds the kernel running is not an engine error: clear it, unless an error was already pending.
+        const auto t0 = Clock::now();
+        const cudaError_t before = cudaPeekAtLastError();
+        while (cudaEventQuery(ev) == cudaErrorNotReady) {
+        }
+        if (before == cudaSuccess) cudaGetLastError();
+        return std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+    }
+
+  private:
+    // CUDA resources and the thread, on the first arm (under m_); on a failure the warmer stays off
+    bool start() {
+        const cudaError_t before = cudaPeekAtLastError();
+        int dev = 0;
+        void * p = nullptr;
+        cudaError_t e = cudaGetDevice(&dev);
+        if (e == cudaSuccess) e = cudaHostAlloc(&p, sizeof(unsigned), cudaHostAllocMapped);
+        if (e == cudaSuccess) {
+            stop_h_ = static_cast<volatile unsigned *>(p);
+            *stop_h_ = 0;
+            e = cudaHostGetDevicePointer(reinterpret_cast<void **>(&stop_d_), p, 0);
+        }
+        if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking);
+        if (e == cudaSuccess) e = cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming | cudaEventBlockingSync);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[mk] keep-warm: off (%s)\n", cudaGetErrorString(e));
+            if (before == cudaSuccess) cudaGetLastError(); // (not an engine error)
+            failed_ = true;
+            return false;
+        }
+        th_ = std::thread([this, dev] { run(dev); });
+        return true;
+    }
+
+    void run(int dev) {
+        cudaSetDevice(dev);
+        std::unique_lock<std::mutex> lk(m_);
+        for (;;) {
+            cv_.wait(lk, [&] { return quit_ || armed_; });
+            if (quit_) return;
+            const auto now = Clock::now();
+            if (now >= until_) { // the window is over: idle until the next arm
+                armed_ = false;
+                continue;
+            }
+            const double left = std::chrono::duration<double, std::milli>(until_ - now).count();
+            *stop_h_ = 0;
+            int e = MKEngine::warm_launch(st_, stop_d_, std::min(load_.on_ms, left), load_.blocks, load_.threads, load_.spin);
+            if (e == 0) e = (int) cudaEventRecord(ev_, st_);
+            if (e != 0) {
+                fprintf(stderr, "[mk] keep-warm: off (%s)\n", cudaGetErrorString((cudaError_t) e));
+                failed_ = true;
+                armed_ = false;
+                return;
+            }
+            inflight_ = true; // (launched and recorded under m_: pause() either sees this or stops the next launch)
+            lk.unlock();
+            cudaEventSynchronize(ev_);
+            lk.lock();
+            inflight_ = false;
+            if (load_.off_ms > 0.0)
+                cv_.wait_for(lk, std::chrono::duration<double, std::milli>(load_.off_ms), [&] { return quit_ || !armed_; });
+        }
+    }
+
+    const double seconds_;
+    const WarmLoad load_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::thread th_;
+    bool quit_ = false, armed_ = false, inflight_ = false, failed_ = false;
+    Clock::time_point until_{};
+    volatile unsigned * stop_h_ = nullptr; // host-mapped stop word (stop_d_: its device address)
+    unsigned * stop_d_ = nullptr;
+    cudaStream_t st_ = nullptr;
+    cudaEvent_t ev_ = nullptr;
+};
+
 struct Handle {
     MKEngine * eng = nullptr;
     llama_model * lm = nullptr;
     const llama_vocab * vocab = nullptr;
+    Warmer * warm = nullptr; // MK_KEEP_WARM_S > 0
     std::string err;
 };
 thread_local std::string g_err;
+
+// the engine of hp, after stopping the keep-warm load: every call that runs GPU work gets the engine through here
+MKEngine * gpu_engine(void * hp) {
+    auto * h = static_cast<Handle *>(hp);
+    if (h->warm) h->warm->pause();
+    return h->eng;
+}
 
 // Runs an engine call; an exception becomes -1 with mk_last_error(). A CUDA failure (MKCudaError: the engine
 // threw instead of exiting) leaves the sequence state undefined, so the engine is reset: the next prompt is
@@ -24,7 +190,7 @@ thread_local std::string g_err;
 template <class F> int guarded(void * hp, F f) {
     auto * h = static_cast<Handle *>(hp);
     try {
-        return f(h->eng);
+        return f(gpu_engine(hp));
     } catch (const MKCudaError & e) {
         g_err = e.what();
         try {
@@ -54,6 +220,20 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
         if (!h->lm) throw std::runtime_error("failed to load the vocabulary");
         h->vocab = llama_model_get_vocab(h->lm);
         h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode);
+        // keep-warm (MK_KEEP_WARM_S seconds, default 300; 0 = off): armed by mk_keep_warm only
+        const char * ks = getenv("MK_KEEP_WARM_S");
+        const double sec = ks && *ks ? atof(ks) : 300.0;
+        WarmLoad load;
+        if (!parse_load(getenv("MK_KEEP_WARM_LOAD"), load))
+            fprintf(stderr, "[mk] keep-warm: MK_KEEP_WARM_LOAD '%s' ignored (blocks,threads,on_ms,off_ms,spin)\n",
+                    getenv("MK_KEEP_WARM_LOAD"));
+        if (sec > 0.0) {
+            h->warm = new Warmer(sec, load);
+            fprintf(stderr, "[mk] keep-warm: %g s after each request (MK_KEEP_WARM_S; 0 = off), %d x %d threads, %g ms on / %g ms off%s\n",
+                    sec, load.blocks, load.threads, load.on_ms, load.off_ms, load.spin ? ", spinning" : "");
+        } else {
+            fprintf(stderr, "[mk] keep-warm: off (MK_KEEP_WARM_S=%s)\n", ks);
+        }
         return h;
     } catch (const std::exception & e) {
         g_err = e.what();
@@ -63,7 +243,8 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
 
 void mk_free(void * hp) {
     auto * h = static_cast<Handle *>(hp);
-    delete h->eng; // (the destructor does not throw)
+    delete h->warm; // (stops its thread before the engine goes)
+    delete h->eng;  // (the destructor does not throw)
     llama_model_free(h->lm);
     delete h;
 }
@@ -105,7 +286,7 @@ int mk_set_sampling(void * hp, float temp, float top_p, int top_k, float min_p, 
 // presence / frequency penalty (MKEngine::set_penalty); returns 0, or -1
 int mk_set_penalty(void * hp, float presence, float frequency) {
     try {
-        static_cast<Handle *>(hp)->eng->set_penalty(presence, frequency);
+        gpu_engine(hp)->set_penalty(presence, frequency); // (the first non-zero penalty allocates its counts)
         return 0;
     } catch (const std::exception & e) {
         g_err = e.what();
@@ -177,7 +358,7 @@ void mk_reset(void * hp) {
 
 int mk_truncate(void * hp, int len) {
     try {
-        static_cast<Handle *>(hp)->eng->truncate(len);
+        gpu_engine(hp)->truncate(len);
         return 0;
     } catch (const std::exception & e) {
         g_err = e.what();
@@ -221,6 +402,37 @@ int mk_state_digest(void * hp, unsigned long long * out, int cap) {
         return (int) v.size();
     });
 }
+
+// keep-warm (MK_KEEP_WARM_S): on 1 (re)starts the window now (the server: once ready and after every request), 0 stops
+// the load now. Returns the window in seconds (0: off).
+double mk_keep_warm(void * hp, int on) {
+    auto * h = static_cast<Handle *>(hp);
+    if (!h->warm) return 0.0;
+    if (on) h->warm->arm();
+    else h->warm->pause();
+    return h->warm->seconds();
+}
+
+// measurement helpers: a keep-warm load without an engine (window in seconds, load as MK_KEEP_WARM_LOAD; null: the
+// default); mk_warm_set(w, 1) starts the window, mk_warm_set(w, 0) stops the load and returns the microseconds it
+// waited for the running kernel to end (what a request waits)
+void * mk_warm_new(double seconds, const char * load) {
+    WarmLoad w;
+    if (!(seconds > 0.0) || !parse_load(load, w)) {
+        g_err = "mk_warm_new: seconds must be > 0 and load 'blocks,threads,on_ms,off_ms,spin'";
+        return nullptr;
+    }
+    return new Warmer(seconds, w);
+}
+double mk_warm_set(void * w, int on) {
+    auto * x = static_cast<Warmer *>(w);
+    if (on) {
+        x->arm();
+        return 0.0;
+    }
+    return x->pause();
+}
+void mk_warm_free(void * w) { delete static_cast<Warmer *>(w); }
 
 void mk_stats(void * hp, long * cycles, long * drafted, long * accepted) {
     const auto & s = static_cast<Handle *>(hp)->eng->stats;

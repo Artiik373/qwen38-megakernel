@@ -5018,6 +5018,29 @@ __global__ void st_warm(unsigned long long ns) {
     } while (t - t0 < ns);
 }
 
+// keep-warm load (MKEngine::warm_launch; the server's idle windows, capi.cpp): keeps the GPU's clocks up while touching
+// no engine memory. Ends once the host-mapped word *stop is non-zero (thread 0 of each block polls it) or after ns
+// nanoseconds. spin 1: every thread busy-loops on the timer; 0: thread 0 alone waits, __nanosleep between polls.
+__global__ void kw_warm(const unsigned * stop, unsigned long long ns, int spin) {
+    __shared__ volatile int s_stop;
+    if (threadIdx.x == 0) s_stop = 0;
+    __syncthreads();
+    if (!spin && threadIdx.x) return;
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    for (unsigned i = 0;; i++) {
+        if (threadIdx.x == 0 && (!spin || (i & 31) == 0)) {
+            unsigned v;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(stop) : "memory");
+            if (v) s_stop = 1;
+        }
+        if (s_stop) break;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 >= ns) break;
+        if (!spin) __nanosleep(1000);
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // host side: loading / repacking
 // ------------------------------------------------------------------------------------------
@@ -8969,6 +8992,11 @@ std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
 
 int MKEngine::n_vocab() { return VOCAB; }
 int MKEngine::n_embd() { return D; }
+int MKEngine::warm_launch(void * stream, const unsigned * stop, double ms, int blocks, int threads, int spin) {
+    if (blocks < 1 || threads < 1 || threads > 1024 || !(ms > 0.0)) return (int) cudaErrorInvalidValue;
+    kw_warm<<<blocks, threads, 0, (cudaStream_t) stream>>>(stop, (unsigned long long) (ms * 1e6), spin);
+    return (int) cudaGetLastError();
+}
 
 void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int first, const LogitSink & sink) {
     score_logits(tokens, mk_from, first, sink, {});

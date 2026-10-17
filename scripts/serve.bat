@@ -10,6 +10,7 @@ REM   MK_DRAFT            MTP drafts per cycle (default 7; a build.ps1 -MkFlags 
 REM   MK_EXACT_REUSE=0    turn exact reuse off (see scripts/serve.sh)
 REM   MK_PF_CAP           prefill chunk tokens (default 2048; 1024 above 96k context)
 REM   MK_KV, MK_KV_WIN    low-bit KV cache, preset D': set MK_KV=K*=6,V*=5,*16=8 and MK_KV_WIN=2048
+REM   MK_KEEP_WARM_S      seconds the engine keeps the GPU's clocks up after each request (default 300, 0 = off)
 REM   MK_PYTHON           Python with jinja2 (default python)
 setlocal
 set "HERE=%~dp0.."
