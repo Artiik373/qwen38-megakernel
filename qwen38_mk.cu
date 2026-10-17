@@ -58,6 +58,10 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_SPEC_LOG
 #define MK_SPEC_LOG 0
 #endif
+// MK_TEST_NAN=1 (tests only): env MK_TEST_NAN_AT=N writes NaN K scales into the first attention layer before decode launch N
+#ifndef MK_TEST_NAN
+#define MK_TEST_NAN 0
+#endif
 // MK_KV_EMU=1 (accuracy experiments): MK_KV_EMU_SPEC rounds chosen K / V cache slots to a lower-bit grid (kv_store_emu)
 // while keeping the q8 layout, so lower-bit KV formats can be scored per layer before the kernels support them.
 #ifndef MK_KV_EMU
@@ -5255,6 +5259,9 @@ struct MKEngine::Impl {
     size_t emb_cap = 0;           // (floats)
     volatile int * err_host = nullptr; // cB.err's host side
     bool err_mtp_warned = false;
+#if MK_TEST_NAN
+    int test_nan_at = getenv("MK_TEST_NAN_AT") ? atoi(getenv("MK_TEST_NAN_AT")) : 0, test_nan_n = 0;
+#endif
     void launch_failed() {
         const int bad = err_host[0], mtp = err_host[1];
         err_host[0] = err_host[1] = 0;
@@ -7144,6 +7151,13 @@ struct MKEngine::Impl {
         ck_wait_restore(); // (cheap no-ops unless a checkpoint copy is pending on ck_st)
         ck_guard_state();
         ring_snap_guard();
+#if MK_TEST_NAN
+        if (mode == MODE_DECODE && test_nan_at > 0 && ++test_nan_n == test_nan_at) {
+            __half * ks = hb.kvs[0][0] ? hb.kvs[0][0] : hb.ksc;
+            if (ks) CK(cudaMemset(ks, 0xff, (size_t) NKV * hb.ctx * (HD / 32) * sizeof(__half)));
+            fprintf(stderr, "[mk] MK_TEST_NAN: NaN K scales before decode launch %d\n", test_nan_n);
+        }
+#endif
         CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
