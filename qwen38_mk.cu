@@ -378,6 +378,7 @@ struct Bufs {
     // (NOT bitwise), 2 deal the phase's items across the blocks (item i -> block i % G) instead of in contiguous runs, 4 split
     // each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT; takes precedence over 1)
     int k6;
+    int * err; // mapped host words, set only on failure: [0] no finite main logit / invalid token, [1] MTP catch-up out of range
 };
 
 __constant__ ModelW cW;
@@ -4046,6 +4047,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             if (lane == 0) {
                 s_tok[warp] = best;
                 if (LSE) m[LM_BEST] = v;
+                if (!draft && !(v > -INFINITY)) cB.err[0] = 1;
             }
         }
     } else if (warp < TL) {
@@ -4067,6 +4069,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
         if (lane == 0) {
             s_tok[warp] = (draft && cW.draft_ids) ? cW.draft_ids[ix] : ix;
             if (LSE) m[LM_BEST] = PEN ? b : b * m[0];
+            if (!draft && !(b > -INFINITY)) cB.err[0] = 1;
         }
     }
     if (tid == 0) *cB.cnt = 0;
@@ -4312,7 +4315,7 @@ __device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const 
 #include "wv.cuh"
 #endif
 
-__device__ void main_control(int mode, int last, int T, const int * tgt, bool pen) {
+__device__ void main_control(int mode, int last, int T, const int * tgt, bool pen, bool mtp) {
     Ctl * c = cB.ctl;
     const int n = c->n;
     int a, bonus = -1;
@@ -4338,8 +4341,11 @@ __device__ void main_control(int mode, int last, int T, const int * tgt, bool pe
             c->n_out = 0;
         }
     }
+    for (int i = 0; i < c->n_out; i++)
+        if (c->out[i] < 0) cB.err[0] = 1;
     const int m = c->mtp_valid;
     const int P = bonus >= 0 ? n + a + 1 : n + T - 1;
+    if (mtp && (m < n || P - m >= MAXT + 3)) cB.err[1] = 1; // the loop below only knows tokens >= n and holds MAXT + 3 rows
     int R = 0;
     for (int p = m; p <= P && R < MAXT + 3; p++, R++) {
         c->mtp_pos[R] = p;
@@ -4473,7 +4479,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         if (sampling) // lm_head left the candidates at SM_CAND and the drafts' q' at SM_DQ
             sample_targets(P, Tr, tl, tg, reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
         for (int i = 0; i < tl; i++) cB.ctl->tgt[i] = tg[i];
-        main_control(P.mode, P.last, Tr, P.score ? s_tok + T - 1 : tg, pen);
+        main_control(P.mode, P.last, Tr, P.score ? s_tok + T - 1 : tg, pen, !P.score);
         __threadfence();
     }
     gsync(epoch, PH_LMHEAD);
@@ -5247,6 +5253,17 @@ struct MKEngine::Impl {
     std::vector<float2> rope_base;
     float * emb_host = nullptr;   // the prefill's image rows: pinned, mapped (cP.emb = its device alias)
     size_t emb_cap = 0;           // (floats)
+    volatile int * err_host = nullptr; // cB.err's host side
+    bool err_mtp_warned = false;
+    void launch_failed() {
+        const int bad = err_host[0], mtp = err_host[1];
+        err_host[0] = err_host[1] = 0;
+        if (mtp && !err_mtp_warned) {
+            err_mtp_warned = true;
+            fprintf(stderr, "[mk] warning: MTP catch-up out of range near position %d (drafts only, output unaffected)\n", hctl.n);
+        }
+        if (bad) throw MKCudaError("no finite logit in the output head (NaN / inf model state); the engine was reset");
+    }
     // Rewrites hb.rope's rows from the first position where `spans` and `rope_spans` differ (none: no copy). Text rows are
     // rope_base rows shifted by the images before them, image rows per-frequency gathers; pageable host-to-device copies
     // on the legacy stream, ordered after every kernel that read the old rows.
@@ -6889,6 +6906,13 @@ struct MKEngine::Impl {
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
         mem_mark("logits, sampling, ctl");
         if (const char * spec = getenv("MK_KV_EMU_SPEC")) kv_emu_parse(spec);
+        {
+            int * eh = nullptr;
+            CK(cudaHostAlloc(reinterpret_cast<void **>(&eh), 2 * sizeof(int), cudaHostAllocMapped));
+            eh[0] = eh[1] = 0;
+            err_host = eh;
+            CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&hb.err), eh, 0));
+        }
         CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
 
         CK(cudaFuncSetAttribute(mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
@@ -7016,6 +7040,8 @@ struct MKEngine::Impl {
         for (int i = 1; i < T; i++) fprintf(slog, "%s%d", i > 1 ? "," : "", drafts[i]);
         fprintf(slog, "],\"tg\":[");
         for (int i = 0; i < T; i++) fprintf(slog, "%s%d", i ? "," : "", c.tgt[i]);
+        fprintf(slog, "],\"o\":[");
+        for (int i = 0; i < c.n_out; i++) fprintf(slog, "%s%d", i ? "," : "", c.out[i]);
         fprintf(slog, "],\"q\":[");
         for (int i = 0; i + 1 < T; i++) {
             const float2 * q = slog_q.data() + (size_t) i * (TOPK_MAX + 1);
@@ -7035,7 +7061,16 @@ struct MKEngine::Impl {
             fprintf(slog, "]");
         }
         fprintf(slog, "}\n");
+        fflush(slog);
         slog_drafts(); // the drafts this launch produced, verified by the next cycle
+    }
+    // after a prefill: the whole sequence (its last id is the first output token) and where the fed part began
+    void slog_prompt(int n0) {
+        if (!slog) return;
+        fprintf(slog, "{\"prompt\":%zu,\"n0\":%d,\"ids\":[", seq.size(), n0);
+        for (size_t i = 0; i < seq.size(); i++) fprintf(slog, "%s%d", i ? "," : "", seq[i]);
+        fprintf(slog, "]}\n");
+        fflush(slog);
     }
 #endif
 
@@ -7061,6 +7096,7 @@ struct MKEngine::Impl {
         cudaStreamSynchronize(0);
         if (embd_host) cudaFreeHost(embd_host);
         if (emb_host) cudaFreeHost(emb_host);
+        if (err_host) cudaFreeHost(const_cast<int *>(err_host));
     }
 
     // emb_host holding at least `floats` (grown: pinned, mapped; cP.emb follows it)
@@ -7114,6 +7150,7 @@ struct MKEngine::Impl {
         wd_T = T;
         wd_mode = mode;
         wait_device(mode == MODE_DECODE ? "a decode launch" : "a prefill launch", wd_limit);
+        if (err_host[0] | err_host[1]) launch_failed();
         launches_seen++;
         if (memlog && launches_seen == 1) mem_mark("first mk_cycle launch");
         if (profiling && mode == MODE_DECODE) {
@@ -7292,6 +7329,7 @@ struct MKEngine::Impl {
                 }
                 fprintf(stderr, "[mk-bench] %-8s T=%d: %.1f us/launch (1 layer + barrier + launch overhead)\n", names[which], T, best * 1000);
             }
+        err_host[0] = err_host[1] = 0; // (bench launches run on synthetic state)
     }
 
     // ---------------- batched prefill (prefill.cuh) ----------------
@@ -8664,6 +8702,9 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         if (si >= 0) p_->ck_save_end(si);
     }
     seq.push_back(c.out[0]);
+#if MK_SPEC_LOG
+    p_->slog_prompt(n0);
+#endif
     return c.out[0];
 }
 
