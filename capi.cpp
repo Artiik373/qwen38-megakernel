@@ -21,7 +21,7 @@ namespace {
 // ---- keep-warm (MK_KEEP_WARM_S) ----
 // A few seconds without GPU work and the driver drops the clocks (P8); a reply that starts there runs its first ~2 s at
 // ramping clocks (a 255-token reply: ~125 instead of ~200 tok/s). mk_keep_warm(h, 1), which the server calls once ready
-// and after every request, keeps a light load on the GPU for MK_KEEP_WARM_S seconds (default 300; 0 = off), then lets
+// and after every request, keeps a light load on the GPU for MK_KEEP_WARM_S seconds (default 120; 0 = off), then lets
 // the card idle. The driver's power settings stay as they are. Every C API call that runs GPU work stops the load
 // first: the kernel polls a host-mapped stop word and ends within microseconds, so it never runs next to an engine
 // launch (mk_cycle is a cooperative launch over every SM; a missed stop could only delay it, each warm kernel ends by
@@ -220,9 +220,9 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
         if (!h->lm) throw std::runtime_error("failed to load the vocabulary");
         h->vocab = llama_model_get_vocab(h->lm);
         h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode);
-        // keep-warm (MK_KEEP_WARM_S seconds, default 300; 0 = off): armed by mk_keep_warm only
+        // keep-warm (MK_KEEP_WARM_S seconds, default 120; 0 = off): armed by mk_keep_warm only
         const char * ks = getenv("MK_KEEP_WARM_S");
-        const double sec = ks && *ks ? atof(ks) : 300.0;
+        const double sec = ks && *ks ? atof(ks) : 120.0;
         WarmLoad load;
         if (!parse_load(getenv("MK_KEEP_WARM_LOAD"), load))
             fprintf(stderr, "[mk] keep-warm: MK_KEEP_WARM_LOAD '%s' ignored (blocks,threads,on_ms,off_ms,spin)\n",

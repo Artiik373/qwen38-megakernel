@@ -14,7 +14,7 @@ what the engine already processed, it rewinds to the last DeltaNet checkpoint at
 divergence (saved during earlier prefills: at each generation prompt, each message start and every
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
 GET /health, GET /v1/models.  One request at a time.  After each request the engine keeps the GPU's
-clocks up for MK_KEEP_WARM_S seconds (default 300, 0 = off), so a reply after a pause starts at full speed.
+clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
 """
 import argparse
 import base64

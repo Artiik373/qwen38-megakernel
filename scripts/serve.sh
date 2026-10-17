@@ -15,7 +15,7 @@
 #   MK_KV, MK_KV_WIN    low-bit KV cache (opt-in), preset D': MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048 (6-bit K, 5-bit V,
 #                       8-bit MTP layer and recent window: 1.1 GB less VRAM at 120k, ~162k context in the same VRAM,
 #                       up to 262,144 tokens on 24 GB; near-lossless, see README)
-#   MK_KEEP_WARM_S      seconds the engine keeps the GPU's clocks up after each request (default 300, 0 = off)
+#   MK_KEEP_WARM_S      seconds the engine keeps the GPU's clocks up after each request (default 120, 0 = off)
 #   MK_PYTHON           Python with jinja2 (default python3)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

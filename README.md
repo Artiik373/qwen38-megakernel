@@ -108,7 +108,7 @@ The settings (model path, host, drafts, prefill chunk, exact reuse, KV preset) a
 [scripts/serve.sh](scripts/serve.sh). Model load takes ~9 s from an ext4 disk. Under WSL2, keep the GGUF on the Linux
 filesystem: files on `/mnt/c` load several times slower.
 
-After each request the engine keeps the GPU's clocks up for `MK_KEEP_WARM_S` seconds (default 300, `0` = off) with a
+After each request the engine keeps the GPU's clocks up for `MK_KEEP_WARM_S` seconds (default 120, `0` = off) with a
 one-thread kernel, so a reply after a pause starts at full speed; the driver's power settings are left alone. It costs
 power while it runs: an RTX 3090 draws ~165 W instead of ~30 W at idle.
 
