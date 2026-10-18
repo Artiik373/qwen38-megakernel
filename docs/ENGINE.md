@@ -287,6 +287,12 @@ are read at 8 bits. The decode attention expands low-bit tiles to int8 in shared
 kernel as the q8_0 cache; the prefill attention reads them too. With exact reuse, each checkpoint also holds the window
 rings as of its position.
 
+Each layer's cache and the RoPE table hold 2 x `MK_MAXT` rows (16 in the served build, ~0.6 MB in all) past the
+context: with more than 5 drafts, the last cycles before "context full" write the MTP block's draft rows up to 4
+positions past it (since 2026-10-17; before, those rows overwrote the first rows of the next head or of the next buffer,
+layer 3's cache, and a reused prefix then decoded differently; the server, which stops 16 tokens before the end, never
+got there, a CLI or C API run decoding to "context full" did).
+
 Presets (opt-in): D' = `MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048` (the README has its accuracy, VRAM and the
 262,144-token context), D = `MK_KV='K*=6,V*=5' MK_KV_WIN=2048`. In the per-layer scans made for the low-bit formats, K
 was ~2.3x as sensitive as V, and no setting that saved 0.5 GB or more stayed within the KL-divergence noise of the

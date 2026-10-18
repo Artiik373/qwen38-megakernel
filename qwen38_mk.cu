@@ -216,6 +216,11 @@ constexpr float ROPE_BASE = 10000000.0f;
 // conv ring: dn_proj writes positions n .. n + T - 1 while dn_core reads n - 3 .. n + T - 1 (T + 3 slots)
 constexpr int CONV_RING = MAXT > 5 ? 16 : 8, KV_RING = 16, H_RING = 16;
 static_assert(MAXT + 3 <= CONV_RING && 2 * MAXT - 1 <= KV_RING, "rings");
+// KV cache rows per kv head and RoPE table rows past the usable context (Bufs::ctx = ctx + KV_PAD): a decode launch at
+// position n writes K / V rows up to n + 2 MAXT - 2 (the MTP block's catch-up rows up to P <= n + MAXT, then its draft
+// rows up to P + MAXT - 2), and step() admits n while n + MAXT + 2 < ctx, so rows up to ctx + MAXT - 5 are written
+constexpr int KV_PAD = 2 * MAXT;
+static_assert((2 * MAXT - 2) - (MAXT + 3) < KV_PAD, "KV_PAD: the deepest MTP draft row at the end of the context");
 constexpr int KVGB = NKH * HK + NVH * HK + 2 * NVH; // k | v | g | beta
 constexpr int KVGB_V = NKH * HK, KVGB_G = KVGB_V + NVH * HK, KVGB_B = KVGB_G + NVH;
 constexpr int N_ATT_SLOTS = 17; // 16 trunk attention layers + MTP block
@@ -369,7 +374,7 @@ struct Bufs {
     unsigned * cnt;
     Ctl * ctl;
     unsigned long long * prof; // optional per-barrier timestamps (block 0)
-    int ctx;
+    int ctx; // KV rows per kv head and RoPE rows (the [ctx] above): the engine's context + KV_PAD
 #if MK_KV_EMU
     int kvemu[2][N_ATT_SLOTS]; // per slot, K / V: 0 plain q8, else the kv_store_emu mode (MK_KV_EMU_SPEC)
     int kvemu_sink;            // positions < kvemu_sink stay plain q8 (attention sinks; MK_KV_EMU_SPEC "sink=N")
@@ -5477,15 +5482,16 @@ struct MKEngine::Impl {
         if (spans == rope_spans) return;
         size_t k = 0;
         while (k < spans.size() && k < rope_spans.size() && spans[k] == rope_spans[k]) k++;
-        int from = ctx, shift = 0;
+        const int nr = hb.ctx; // the table's rows (KV_PAD past ctx)
+        int from = nr, shift = 0;
         if (k < spans.size()) from = std::min(from, spans[k].pos);
         if (k < rope_spans.size()) from = std::min(from, rope_spans[k].pos);
         for (size_t j = 0; j < k; j++) shift += spans[j].n() - std::max(spans[j].nx, spans[j].ny);
         float2 * dst = const_cast<float2 *>(hb.rope);
         std::vector<float2> rows;
         size_t j = k;
-        for (int p = from; p < ctx;) {
-            const int next = j < spans.size() ? spans[j].pos : ctx;
+        for (int p = from; p < nr;) {
+            const int next = j < spans.size() ? spans[j].pos : nr;
             if (p < next) { // text rows p .. next - 1
                 CK(cudaMemcpy(dst + (size_t) p * 32, rope_base.data() + (size_t) (p - shift) * 32, (size_t) (next - p) * 32 * sizeof(float2),
                               cudaMemcpyHostToDevice));
@@ -5493,7 +5499,7 @@ struct MKEngine::Impl {
                 continue;
             }
             const Span & s = spans[j++];
-            const int r = p - shift, n = std::min(s.n(), ctx - p);
+            const int r = p - shift, n = std::min(s.n(), nr - p);
             rows.resize((size_t) n * 32);
             for (int q = 0; q < n; q++) {
                 const int pos3[3] = {r, r + q / s.nx, r + q % s.nx};
@@ -6963,8 +6969,9 @@ struct MKEngine::Impl {
 #if MK_K5
         fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order (MK_K5=1)\n");
 #endif
+        hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
         {
-            const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
+            const size_t rows = (size_t) N_ATT_SLOTS * NKV * hb.ctx;
             size_t free_b = 0, total_b = 0;
             CK(cudaMemGetInfo(&free_b, &total_b));
             // fp16 needs 2 x rows x HD x 2 bytes; leave ~1.5 GB for the prefill buffers, checkpoint and runtime.
@@ -6986,7 +6993,7 @@ struct MKEngine::Impl {
             // (kv_store_qn), e.g. "V*=6r,K16=4r": comma-separated <K|V|*><slot>=<4..8>[r], slot 0..15 = attention layer
             // 4 slot + 3, 16 = MTP block, * or empty = all slots; r: stored Hadamard-rotated (K: the queries get the same
             // rotation; V: the head's attention output is rotated back)
-            const size_t srows = (size_t) NKV * ctx; // rows of one slot
+            const size_t srows = (size_t) NKV * hb.ctx; // rows of one slot
             for (int s = 0; s < N_ATT_SLOTS; s++) {
                 hb.kvb[0][s] = hb.kvb[1][s] = 8;
                 hb.kvr[s] = hb.kvrv[s] = 0;
@@ -7090,8 +7097,8 @@ struct MKEngine::Impl {
         hb.h_hist = dalloc<float>((size_t) H_RING * D);
         mem_mark("attn partials, h ring");
         {
-            std::vector<float2> rt((size_t) ctx * 32);
-            for (int p = 0; p < ctx; p++)
+            std::vector<float2> rt((size_t) hb.ctx * 32); // (rows past ctx: the MTP draft rows, KV_PAD)
+            for (int p = 0; p < hb.ctx; p++)
                 for (int i = 0; i < 32; i++) {
                     const double th = (double) p * std::pow((double) ROPE_BASE, -2.0 * i / 64.0);
                     rt[(size_t) p * 32 + i] = make_float2((float) std::cos(th), (float) std::sin(th));
@@ -7113,7 +7120,6 @@ struct MKEngine::Impl {
         hb.bar = dalloc<unsigned>(2 * GS_GO); // count word | go word (gsync form 1 / 2, the gsync bench) on its own line
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
-        hb.ctx = ctx;
 #if MK_WV
         hb.wvpart = dalloc<float>((size_t) WV_S * MAXT * D);
         hb.wvcnt = dalloc<unsigned>(2 * (D / 32));
@@ -8541,7 +8547,7 @@ struct MKEngine::Impl {
     // the device regions of the state after a batched prefill of 0 .. hend - 1 (pointer, bytes), in file order
     std::vector<std::pair<char *, size_t>> st_regions(int hend) {
         std::vector<std::pair<char *, size_t>> r;
-        const size_t cx = (size_t) ctx, n = (size_t) hend;
+        const size_t cx = (size_t) hb.ctx, n = (size_t) hend; // (row stride per kv head)
         for (int s = 0; s < N_ATT_SLOTS; s++)
             for (int w = 0; w < 2; w++)
                 for (int g = 0; g < NKV; g++) {
@@ -9121,7 +9127,7 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
 
 int MKEngine::step(std::vector<int> & out) {
     Ctl & c = p_->hctl;
-    if (c.n + MAXT + 2 >= p_->ctx) throw std::runtime_error("context full");
+    if (c.n + MAXT + 2 >= p_->ctx) throw std::runtime_error("context full"); // (rows past ctx: KV_PAD)
     // verify the previous launch's drafts, minus any that would put this launch's rows across an
     // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
 #if MK_MAXT > 5
@@ -9203,7 +9209,7 @@ std::vector<unsigned long long> MKEngine::state_digest() {
     typedef unsigned long long u64;
     const int n = c.dn_c, rc = I.hb.kvwin > 0 ? I.hb.kvrc : 0, rlo = rc ? std::max(0, n - rc) : n;
     std::vector<u64> out = {0x4d4b444701ULL, (u64) n, (u64) c.mtp_valid, (u64) rc, (u64) rlo, (u64) N_ATT_SLOTS, (u64) NKV, (u64) H_RING};
-    const size_t ctx = (size_t) I.ctx, sbq = (HD / 32) * sizeof(__half);
+    const size_t ctx = (size_t) I.hb.ctx, sbq = (HD / 32) * sizeof(__half); // (row stride per kv head)
     std::vector<unsigned char> vb, sb;
     auto d2h = [&](std::vector<unsigned char> & dst, const void * src, size_t nb) {
         dst.resize(std::max<size_t>(1, nb));
