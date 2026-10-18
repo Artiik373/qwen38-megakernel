@@ -15,7 +15,8 @@ divergence (saved during earlier prefills: at each generation prompt, each messa
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
 GET /health, GET /v1/models.  One request at a time.  After each request the engine keeps the GPU's
 clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
-Limits (environment): MK_MAX_IMAGES (images per request, default 32).
+Limits (environment): MK_MAX_IMAGES (images per request, default 32). A request whose client disconnects stops
+generating at the next engine cycle.
 """
 import argparse
 import base64
@@ -27,6 +28,8 @@ import json
 import os
 import random
 import re
+import select
+import socket
 import struct
 import sys
 import threading
@@ -352,6 +355,10 @@ def make_template(src):
 
 class BadRequest(Exception):
     pass
+
+
+class ClientGone(Exception):
+    """the client closed its connection: the request stops, nothing is sent"""
 
 
 MEDIA_MARKER = "<__media__>"  # llama-server's (mtmd_default_marker)
@@ -715,18 +722,19 @@ class Server:
         else:
             self.eng.set_sampling(temp, top_p, top_k, min_p, seed)
 
-    def generate(self, body, emit):
+    def generate(self, body, emit, gone=lambda: False):
         """runs one chat completion; emit(kind, payload) is called with ('reasoning'|'content', text) deltas.
-        Returns (finish_reason, tool_calls, usage). emit returning False aborts."""
+        Returns (finish_reason, tool_calls, usage, timings). emit returning False, or gone() returning True (the client
+        closed its connection; asked before the prefill and before each engine cycle) stops it with ClientGone."""
         text, thinking, media = self.render(body)
         toks, images = self.tokenize_prompt(text, media)
         try:
-            return self._generate(body, emit, thinking, toks, images)
+            return self._generate(body, emit, gone, thinking, toks, images)
         finally:
             if images:  # (the request's images stay pinned until here)
                 self.vision.release([im for _, im in images])
 
-    def _generate(self, body, emit, thinking, toks, images):
+    def _generate(self, body, emit, gone, thinking, toks, images):
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
         max_new = int(max_new)
         limit = self.args.ctx - len(toks) - 16
@@ -735,6 +743,9 @@ class Server:
         max_new = limit if max_new <= 0 else min(max_new, limit)
         tools = body.get("tools") or []
         self.sampling(body)
+        if gone():  # (it left while the request waited for the engine)
+            log("the client disconnected before its prompt was processed")
+            raise ClientGone()
         t0 = time.time()
         enc0 = [im.encode_s for _, im in images]
         tok, reused = self.load_prompt(toks, images)
@@ -748,6 +759,9 @@ class Server:
         n_gen, finish, pending, aborted = 0, "length", [tok], False
         while n_gen < max_new and not aborted:
             if not pending:
+                if gone():  # once per engine cycle: a closed connection stops the GPU work here
+                    aborted = True
+                    break
                 pending = self.eng.step()
             t = pending.pop(0)
             n_gen += 1
@@ -758,6 +772,10 @@ class Server:
                 if emit(kind, delta) is False:
                     aborted = True
                     break
+        if aborted:  # (the engine's state is that of a reply cut by max_tokens: the next request reuses it as usual)
+            log(f"prompt {len(toks)} tok ({reused} reused), {n_gen} tok in {time.time() - t1:.2f} s: the client "
+                f"disconnected, stopped")
+            raise ClientGone()
         for kind, delta in parser.feed(dec.decode(b"", final=True), final=True):
             emit(kind, delta)
         calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
@@ -783,6 +801,16 @@ def make_handler(srv):
 
         def log_message(self, *a):
             pass
+
+        def client_gone(self):
+            """True once the client has closed its connection (end of file or reset). The request was read in full, so
+            anything readable is the next request of a keep-alive client (still connected) or the close."""
+            try:
+                if not select.select([self.connection], [], [], 0)[0]:
+                    return False
+                return self.connection.recv(1, socket.MSG_PEEK) == b""
+            except (OSError, ValueError):
+                return True
 
         def _json(self, code, obj):
             data = json.dumps(obj).encode()
@@ -825,8 +853,8 @@ def make_handler(srv):
                         self._complete(body)
                 except BadRequest as e:
                     self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+                except (BrokenPipeError, ConnectionResetError, ClientGone):
+                    self.close_connection = True
                 except Exception as e:  # engine failure: report it, keep serving
                     log("error:", repr(e))
                     try:
@@ -838,7 +866,7 @@ def make_handler(srv):
 
         def _complete(self, body):
             parts = {"reasoning": [], "content": []}
-            finish, calls, usage, timings = srv.generate(body, lambda k, t: parts[k].append(t))
+            finish, calls, usage, timings = srv.generate(body, lambda k, t: parts[k].append(t), self.client_gone)
             msg = {"role": "assistant", "content": "".join(parts["content"]) or (None if calls else "")}
             if parts["reasoning"]:
                 msg["reasoning_content"] = "".join(parts["reasoning"]).strip()
@@ -887,9 +915,9 @@ def make_handler(srv):
             # render / tokenize errors are reported as a 400 before the stream starts
             srv.render(body)
             try:
-                finish, calls, usage, timings = srv.generate(body, emit)
+                finish, calls, usage, timings = srv.generate(body, emit, self.client_gone)
             except Exception as e:
-                if not started[0] or isinstance(e, (BrokenPipeError, ConnectionResetError)):
+                if not started[0] or isinstance(e, (BrokenPipeError, ConnectionResetError, ClientGone)):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 # the status (200) and part of the reply are out: the error is the stream's last event, OpenAI style
                 bad = isinstance(e, BadRequest)

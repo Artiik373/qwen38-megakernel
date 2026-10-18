@@ -597,5 +597,36 @@ class StreamErrorTests(_HttpCase):
         self.assertEqual((status, json.loads(data)["error"]["type"]), (500, "server_error"))
 
 
+# === sec:b5c ===
+class DisconnectTests(_HttpCase):
+    """a client that closes its connection stops the generation at the next engine cycle"""
+
+    def _abandon(self, eng, body, ctx=1024):
+        srv, http_ = self.serve(eng, ctx)
+        s = socket.create_connection(("127.0.0.1", http_.port))
+        s.sendall(_request(body))
+        t0 = time.time()
+        while eng.cycles < 5 and time.time() - t0 < 5:
+            time.sleep(0.01)
+        s.close()
+        time.sleep(0.3)
+        c1 = eng.cycles
+        time.sleep(0.3)
+        self.assertEqual(eng.cycles, c1, "still generating after the client left")
+        t = time.time()
+        status, _ = http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 4})
+        self.assertEqual(status, 200)  # (the engine is free again)
+        self.assertLess(time.time() - t, 2.0)
+
+    def test_non_streaming(self) -> None:
+        self._abandon(_ScriptEngine(["a"], eog=False, delay=0.01),
+                      {"messages": [{"role": "user", "content": "long"}], "max_tokens": 100000})
+
+    def test_streaming_while_a_tool_call_is_held_back(self) -> None:
+        self._abandon(_ScriptEngine(["<tool_call>\n<function=read_file>\n<parameter=path>\n"], eog=False, delay=0.01),
+                      {"messages": [{"role": "user", "content": "long"}], "tools": TOOLS, "max_tokens": 100000,
+                       "stream": True})
+
+
 if __name__ == "__main__":
     unittest.main()
