@@ -472,7 +472,11 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
   sub-block); activations are fp16 with the elements of each 16-group permuted so that a 4-byte weight word is directly
   an MMA A fragment. Products accumulate in fp16 over k = 128, then in fp32. Measured inside a 101.6k prefill: 89-105
   TFLOPS, 108-117 in isolation (2026-10-12). FFN gate and up share one GEMM whose epilogue writes `silu(gate) * up` as
-  the down projection's fp16 input.
+  the down projection's fp16 input. Stage hand-off per type (2026-10-18): in the Q5_K and IQ4_NL GEMMs each warp copies
+  the weight bytes of its own rows, so the block barrier covers only the activation tiles (one per two stages); Q6_K,
+  Q3_K, IQ3_S and seven of the mixed-type gate / up pairs use per-stage mbarriers (copies two stages ahead) instead of
+  the block barrier (both need four cp.async stages); the other kernels keep one block barrier per stage. Same products
+  in the same order: bit-identical outputs.
 - **DeltaNet in chunked (WY) form on tensor cores**: per 32-token chunk, `A = tril(beta K K^T)` with the gate decays,
   `T = (I + A)^-1` (one warp, forward substitution), then `U = T beta V - T beta gamma (K S)`, `O = gamma Q S + P U` and
   `S <- gamma_last S + K^T (decay U)`. Value columns are independent, so a block owns (head, 64 columns) and each warp

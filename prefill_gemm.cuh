@@ -8,8 +8,9 @@
 // IQ4_NL (Q4_K-shaped 144-byte repack) and is dequantised to fp16 in registers.
 // Tile: 128 weight rows x 128 tokens per CTA, 8 warps of 16 rows x 128 tokens.  K is staged 64 at a
 // time (one 64-group of a super-block: two 32-element sub-blocks) through a cp.async pipeline with
-// one block barrier per stage; per-row sub-block scales are decoded one stage ahead.  Products
-// accumulate in fp16 over two stages (k = 128) and are then added to fp32 accumulators.
+// one block barrier per stage (Q5_K / IQ4_NL: per two stages, see pf_wown); per-row sub-block scales
+// are decoded one stage ahead.  Products accumulate in fp16 over two stages (k = 128) and are then
+// added to fp32 accumulators.
 #pragma once
 
 #include <cuda_fp16.h>
@@ -95,6 +96,15 @@ __device__ __forceinline__ void cpa4(unsigned s, const void * g) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(s), "l"(g) : "memory");
 }
 __device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+// mbarriers (sm_80): init, arrive, the asynchronous arrive of a thread's prior cp.async copies, wait for a phase (test_wait)
+__device__ __forceinline__ void mb_init(unsigned a, unsigned n) { asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(a), "r"(n) : "memory"); }
+__device__ __forceinline__ void mb_arrive(unsigned a) {
+    asm volatile("{\n.reg .b64 st;\nmbarrier.arrive.shared.b64 st, [%0];\n}" ::"r"(a) : "memory");
+}
+__device__ __forceinline__ void cpa_mb_arrive(unsigned a) { asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" ::"r"(a) : "memory"); }
+__device__ __forceinline__ void mb_wait(unsigned a, unsigned parity) {
+    asm volatile("{\n.reg .pred p;\nWAIT:\nmbarrier.test_wait.parity.shared.b64 p, [%0], %1;\n@!p bra WAIT;\n}" ::"r"(a), "r"(parity) : "memory");
+}
 template <int N> __device__ __forceinline__ void cpa_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
 
 __device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], unsigned addr) {
@@ -151,8 +161,20 @@ template <int NB> __host__ __device__ constexpr int hm_x() { return NB * 128; } 
 template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_stage() { return HT<TYPE>::SR * BM + hm_x<NB>(); }
 // (A deeper cp.async pipeline for the narrow tiles, up to 8 stages, measured no faster: notes/agent_ttft.md.)
 // At NB = 32 every type fits two CTAs per SM (<= 48 KB smem, <= 96 registers), at NB = 64 / 128 one.
+// Per-stage mbarriers (MBL) instead of the per-stage CTA barrier: full[b] completes when the 256 threads' copies of the
+// stage in buffer b have landed (cp.async.mbarrier.arrive), empty[b] when the 8 warps are done reading it; the copies run
+// two stages ahead (not three), so a warp waits for the others only to reuse the buffer of two stages back. Measured per
+// kernel (notes/s4/gb): Q6_K, Q3_K, IQ3_S and these mixed-type gate / up pairs 1.5-8% faster; Q4_K, IQ4_XS and Q8_0 1-5%
+// slower (Q5_K / IQ4_NL: pf_wown). Needs 4 stages; MBB bytes at the end of the dynamic shared memory.
+__host__ __device__ constexpr bool pf_mbl(int tg, int tu, bool mix) {
+    if (!mix) return tg == TQ6K || tg == TQ3K || tg == TIQ3S;
+    return (tg == TQ4K && (tu == TQ5K || tu == TIQ4)) || (tg == TIQ4 && (tu == TQ4K || tu == TQ3K)) ||
+           (tg == TQ6K && (tu == TQ6K || tu == TQ5K)) || (tg == TQ3K && tu == TIQ4);
+}
+constexpr int MBB = 64; // MBL: full[4] + empty[4]
 template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_smem() {
-    return HT<TYPE>::NS * hm_stage<TYPE, NB>() + 2 * SBT<TYPE>::R * BM + (HT<TYPE>::SEP ? 2 * 2 * BM * 8 : 0);
+    return HT<TYPE>::NS * hm_stage<TYPE, NB>() + 2 * SBT<TYPE>::R * BM + (HT<TYPE>::SEP ? 2 * 2 * BM * 8 : 0) +
+           (pf_mbl(TYPE, TYPE, false) ? MBB : 0);
 }
 
 __device__ __forceinline__ void hmma16(unsigned (&d)[2], const unsigned (&a)[4], unsigned b0, unsigned b1) {
@@ -190,12 +212,19 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // reads one 16-B and one 8-B word and builds the same wd words as from the row-major stage: exact.
 
 // The MMA group (0-3) of a stage after which the next stage's scales + fragments are made (pipelined step): measured per
-// kernel on the microbenchmark (notes/pf/gb, launcher layouts, 1024 tokens; groups 1 vs 2 differ by up to 4%).
+// kernel on the microbenchmark (notes/pf/gb, launcher layouts, 1024 tokens; groups 1 vs 2 differ by up to 4%; re-measured
+// with 4-stage Q5_K, pf_wown and pf_mbl in notes/s4/gb: Q4_K GLU 1).
 __host__ __device__ constexpr int frag_g(int tg, int tu, bool glu, bool mix) {
     if (MK_PF_FRAG_G >= 0) return MK_PF_FRAG_G;
-    if (!mix) return tg == TQ5K || tg == TQ80 || (tg == TIQ4 && !glu) ? 1 : 2;
+    if (!mix) return tg == TQ5K || tg == TQ80 || (tg == TIQ4 && !glu) || (tg == TQ4K && glu) ? 1 : 2;
     return (tg == TIQ4 && (tu == TQ5K || tu == TQ4K)) || tg == TIQ4NL || tu == TIQ4NL || (tg == TQ6K && tu == TQ6K) ? 2 : 1;
 }
+// Warp-owned weight copies (HalfW OWN): each warp copies the weight bytes of its own 16 rows (the only ones it reads), so a
+// warp-level wait covers them and the CTA barrier is needed for the activation tiles only, which are then copied in pairs:
+// one barrier per two stages instead of one per stage. Measured per kernel (notes/s4/gb): Q5_K and IQ4_NL GEMMs (plain and
+// the Q5_K fused gate / up) 4-5% faster; Q4_K, IQ4_XS, Q6_K, Q3_K, IQ3_S and the mixed-type kernels 1-14% slower: they keep
+// the per-stage barrier. Needs the 4 cp.async stages of the same-type kernels.
+__host__ __device__ constexpr bool pf_wown(int t, bool mix) { return !mix && (t == TQ5K || t == TIQ4NL); }
 
 // Mixed-type GLU tiles: both halves' weight bytes + the activations per stage; 4 stages if they fit (NB 32: in 48 KB, two
 // CTAs per SM like the same-type kernels; else in 99 KB), else 3
@@ -204,16 +233,16 @@ template <int TG, int TU> __host__ __device__ constexpr int hm_sep2() { // + the
     return (HT<TG>::SEP || HT<TU>::SEP ? 2 * 2 * BM * 8 : 0) + 2 * BM / 2 * (SBT<TG>::R + SBT<TU>::R);
 }
 template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_ns2() {
-    return 4 * hm_stage2<TG, TU, NB>() + hm_sep2<TG, TU>() <= (NB <= 32 ? 48 : 99) * 1024 ? 4 : 3;
+    return 4 * hm_stage2<TG, TU, NB>() + hm_sep2<TG, TU>() + (pf_mbl(TG, TU, true) ? MBB : 0) <= (NB <= 32 ? 48 : 99) * 1024 ? 4 : 3;
 }
 template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_smem2() {
-    return hm_ns2<TG, TU, NB>() * hm_stage2<TG, TU, NB>() + hm_sep2<TG, TU>();
+    return hm_ns2<TG, TU, NB>() * hm_stage2<TG, TU, NB>() + hm_sep2<TG, TU>() + (pf_mbl(TG, TU, true) ? MBB : 0);
 }
 
 // The weight rows of a CTA that share a type: all BM rows (TW2: the same-type fused gate / up, rows 0 .. BM/2 - 1 from W,
 // the rest from W2), or one half (BM/2 rows) of a mixed-type gate / up. HB: the rows' offset in a stage; TB: the first
 // thread of the per-row copies (scale streams, Q6_K meta, Q3_K / IQ3_S extra bytes): threads TB .. TB + ROWS - 1.
-template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
+template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = false> struct HalfW {
     static constexpr bool FMT = LAY && (TYPE == TIQ4 || (MK_WV_FMK && (TYPE == TQ4K || TYPE == TQ5K))); // fragment-ordered
     static constexpr bool FM6 = LAY && TYPE == TQ6K && MK_WV_Q6F;
     static constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR;
@@ -224,8 +253,14 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
     static constexpr int FQH = 0, FQS = 0, FHO = ROWS * 32;
     static constexpr int FNQ = 32, FCPT = FNQ + (TYPE == TQ5K ? 0 : TYPE == TIQ4 ? 8 : 16);
     static constexpr int SBR = SBT<TYPE>::R, SNC = SBT<TYPE>::NC; // super-block buffer bytes per row, its chunks per row
-    static constexpr int WCHS = SNC ? (FMT ? ROWS / 16 * 48 : ROWS * SNC) : 0, WITS = WCHS ? (WCHS + 255) / 256 : 1;
-    static constexpr int WCH = FMT ? ROWS / 16 * FCPT : FM6 ? ROWS / 16 * 48 : ROWS * NCH, WIT = (WCH + 255) / 256;
+    static constexpr int WCHS = SNC ? (FMT ? ROWS / 16 * 48 : ROWS * SNC) : 0; // super-block buffer chunks (per super-block)
+    static constexpr int WCH = FMT ? ROWS / 16 * FCPT : FM6 ? ROWS / 16 * 48 : ROWS * NCH;        // stage chunks
+    // Copies: thread i copies chunk i (i = tid + 256 k), or (OWN, see pf_wown) warp WB + t copies the CPT stage chunks, the
+    // CPTS super-block buffer chunks and the per-row bytes of the half's 16-row tile t (the chunk index order of the tiles is
+    // contiguous in every layout: FMT / FM6 by tile, row-major by row).
+    static constexpr int WB = TB / 16, CPT = WCH / (ROWS / 16), CPTS = WCHS / (ROWS / 16);
+    static constexpr int WIT = OWN ? (CPT + 31) / 32 : (WCH + 255) / 256;
+    static constexpr int WITS = !WCHS ? 1 : OWN ? (CPTS + 31) / 32 : (WCHS + 255) / 256;
     static constexpr int UB = FM6 ? F6U : 16 * (TYPE == TIQ4 ? 136 : BLK); // LAY: bytes per (tile, super-block) unit
     // LAY 1 offset types (MK_MAXT > 5 ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
     // 16 entries per block (VST: value bytes per super-block, EST: meta bytes per Q6_K / Q3_K block pair or IQ3_S block)
@@ -247,11 +282,21 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
     const __half * dsrc;
     unsigned edst, rdst;
     int rt; // this thread's row for the per-row copies (valid if 0 <= rt < ROWS)
+    unsigned wmask, smask; // OWN: the stage / super-block buffer copies k this thread issues
 
     __device__ __forceinline__ void init(int tid, const WMat & W, const uint8_t * W2, int row0, uint8_t * sbb = nullptr) {
+        const int tw = (tid >> 5) - WB, wl = tid & 31; // OWN: the warp's tile in this half, its lane
+        const bool town = OWN && tw >= 0 && tw < ROWS / 16;
+        wmask = smask = 0u;
 #pragma unroll
         for (int k = 0; k < WIT; k++) {
-            const int i = tid + k * 256, r = i / NCH, c = i % NCH;
+            int i = tid + k * 256;
+            if constexpr (OWN) {
+                const bool own = town && wl + 32 * k < CPT;
+                i = own ? tw * CPT + wl + 32 * k : WCH;
+                wmask |= (unsigned) own << k;
+            }
+            const int r = i / NCH, c = i % NCH;
             int off, inc;
             chunk_src<TYPE>(c, off, inc);
             const int rr = i < WCH ? r : 0;
@@ -296,7 +341,7 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
             wq[k] = c != 0;
             if constexpr (!FMT && !FM6) wdst[k] = HB + r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
         }
-        rt = tid - TB;
+        rt = !OWN ? tid - TB : town && wl < 16 ? 16 * tw + wl : -1;
         const int r = rt & (ROWS - 1);
         // FM6: the thread's row in its unit: sc at 32 g + 16 half (+ 4 p per stage), the d pair at 256 + 4 g
         f6src = f6d = dsrc8 = nullptr;
@@ -331,7 +376,13 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
         if constexpr (SNC > 0) {
 #pragma unroll
             for (int k = 0; k < WITS; k++) {
-                const int i = tid + k * 256, ii = i < WCHS ? i : 0;
+                int i = tid + k * 256;
+                if constexpr (OWN) {
+                    const bool own = town && wl + 32 * k < CPTS;
+                    i = own ? tw * CPTS + wl + 32 * k : WCHS;
+                    smask |= (unsigned) own << k;
+                }
+                const int ii = i < WCHS ? i : 0;
                 if constexpr (FMT) {
                     const int t = ii / 48, cc = ii % 48;
                     const uint8_t * mbt = TW2 ? (t < ROWS / 32 ? W.w : W2) : W.w;
@@ -366,11 +417,12 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
                 const unsigned d = sbba + (sb & 1) * SBR * ROWS;
 #pragma unroll
                 for (int k = 0; k < WITS; k++)
-                    if (WCHS % 256 == 0 || tid + k * 256 < WCHS) cpa16(d + sdst[k], ssrc[k] + (size_t) sb * (LAY ? UB : BLK));
+                    if (OWN ? (smask >> k) & 1u : WCHS % 256 == 0 || tid + k * 256 < WCHS)
+                        cpa16(d + sdst[k], ssrc[k] + (size_t) sb * (LAY ? UB : BLK));
             }
 #pragma unroll
         for (int k = 0; k < WIT; k++)
-            if (WCH % 256 == 0 || tid + k * 256 < WCH) {
+            if (OWN ? (wmask >> k) & 1u : WCH % 256 == 0 || tid + k * 256 < WCH) {
                 if constexpr (LAY) { // (FMT: whole FM chunks to the FMT stage layout)
                     cpa16(s + wdst[k], wsrc[k] + (size_t) sb * UB + p * winc[k]);
                 } else if constexpr (TYPE == TIQ4) // block pairs of 272 B: headers, then the even and the odd block's indices
@@ -630,11 +682,14 @@ __global__ void __launch_bounds__(256, 1)
     static_assert(NB % 32 == 0 && NB <= BN, "token tile: a multiple of 32 (X-tile copy loop, n8-tile pairs)");
     static_assert(HMI == 1, "one 16-row MMA tile per warp");
     constexpr int TU = MIX ? TYPE2 : TYPE, LU = MIX ? LAY2 : LAY;
-    using HA = HalfW<TYPE, LAY, MIX ? BM / 2 : BM, GLU && !MIX, 0, 0>;
+    constexpr bool WOWN = pf_wown(TYPE, MIX) && HT<TYPE>::NS == 4; // warp-owned weight copies, one barrier per two stages
+    using HA = HalfW<TYPE, LAY, MIX ? BM / 2 : BM, GLU && !MIX, 0, 0, WOWN>;
     using HU = HalfW<TU, LU, BM / 2, false, BM / 2 * HT<TYPE>::SR, BM / 2>;
     constexpr int WPART = MIX ? BM / 2 * (HT<TYPE>::SR + HT<TU>::SR) : BM * HT<TYPE>::SR; // weight bytes per stage
     constexpr int STG = MIX ? hm_stage2<TYPE, TU, NB>() : hm_stage<TYPE, NB>();
     constexpr int NSH = MIX ? hm_ns2<TYPE, TU, NB>() : HT<TYPE>::NS;
+    constexpr bool MBL = pf_mbl(TYPE, TU, MIX) && NSH == 4 && !WOWN; // per-stage mbarriers, copies two stages ahead
+    constexpr int SMEM = MIX ? hm_smem2<TYPE, TU, NB>() : hm_smem<TYPE, NB>();
     static_assert(STG == WPART + hm_x<NB>(), "stage layout");
     static_assert(NB * (BM + 4) * 4 <= (MIX ? hm_smem2<TYPE, TU, NB>() : hm_smem<TYPE, NB>()), "epilogue tile");
     constexpr int HWT = NB / (8 / HNWM), HNI = HWT / 8, XIT = NB * 8 / 256, FG = frag_g(TYPE, TU, GLU, MIX);
@@ -663,10 +718,13 @@ __global__ void __launch_bounds__(256, 1)
         xdst[k] = WPART + t * 128 + ((c ^ (t & 7)) << 4);
     }
 
-    auto load = [&](int st) {
+    auto loadw = [&](int st) { // stage st's weight bytes
         const unsigned s = sbase + (st % NSH) * STG;
         ha.load(s, st, tid);
         if constexpr (MIX) hu.load(s, st, tid);
+    };
+    auto loadx = [&](int st) { // stage st's activation tile
+        const unsigned s = sbase + (st % NSH) * STG;
 #pragma unroll
         for (int k = 0; k < XIT; k++) cpa16(s + xdst[k], xsrc[k] + BK * st);
     };
@@ -694,13 +752,45 @@ __global__ void __launch_bounds__(256, 1)
         for (int i = 0; i < HNI; i++) acc[m][i][0] = acc[m][i][1] = acc[m][i][2] = acc[m][i][3] = 0.f;
 
     const int nst = W.K / BK;
+    const unsigned mbf = sbase + SMEM - MBB, mbe = mbf + 32; // MBL: full[4], empty[4] (8 B each); stage s: buffer s % 4, phase s / 4
+    if constexpr (MBL) {
+        if (tid == 0)
 #pragma unroll
-    for (int s = 0; s < NSH - 1; s++) {
-        if (s < nst) load(s);
+            for (int b = 0; b < 4; b++) {
+                mb_init(mbf + 8 * b, 256);
+                mb_init(mbe + 8 * b, 8);
+            }
+        __syncthreads();
+        for (int s = 0; s < 2; s++) { // (nst >= 2)
+            loadw(s);
+            loadx(s);
+            cpa_commit();
+            cpa_mb_arrive(mbf + 8 * s);
+        }
+        mb_wait(mbf, 0);
+    } else if constexpr (WOWN) { // commit groups {X 0, X 1, W 0}, {W 1}, {W 2}, then one per step st: {X st+2, X st+3, W st+3} (st even), {W st+3}
+        loadx(0);
+        loadx(1);
+        loadw(0);
         cpa_commit();
+        loadw(1); // (nst >= 2: K is a multiple of 2 BK)
+        cpa_commit();
+        if (2 < nst) loadw(2);
+        cpa_commit();
+        cpa_wait<2>();
+        __syncwarp(); // the warp's own weights of stage 0 (activations: step 0's barrier)
+    } else {
+#pragma unroll
+        for (int s = 0; s < NSH - 1; s++) {
+            if (s < nst) {
+                loadw(s);
+                loadx(s);
+            }
+            cpa_commit();
+        }
+        cpa_wait<NSH - 2>();
+        __syncthreads();
     }
-    cpa_wait<NSH - 2>();
-    __syncthreads();
     scales(0);
 
     // ldmatrix rows: lanes 0-7 / 8-15 / 16-23 / 24-31 -> tokens +0..7 (slots 0-7) / +0..7 (slots 8-15)
@@ -735,8 +825,16 @@ __global__ void __launch_bounds__(256, 1)
     };
     auto step = [&](int st, auto ph, const unsigned (&a)[HMI][2][2][4], unsigned (&an)[HMI][2][2][4]) {
         constexpr int PH = decltype(ph)::value;
-        cpa_wait<NSH - 3>(); // stages <= st + 1 complete: st's activations, st + 1's weights for the next fragments
-        __syncthreads();
+        if constexpr (MBL) {
+            mb_wait(mbf + 8 * ((st + 1) & 3), ((st + 1) >> 2) & 1); // stage st + 1 landed (st: waited a step earlier)
+        } else if constexpr (WOWN) { // this thread's copies of X st, X st + 1, W st + 1 (st even) / W st + 1 (odd) complete
+            cpa_wait<1>();
+            if constexpr (PH == 0) __syncthreads(); // (also: every warp is done with the activation buffers of st - 2, st - 1)
+            else __syncwarp();
+        } else {
+            cpa_wait<NSH - 3>(); // stages <= st + 1 complete: st's activations, st + 1's weights for the next fragments
+            __syncthreads();
+        }
         const unsigned sx = sbase + (st % NSH) * STG;
 #pragma unroll
         for (int G = 0; G < 4; G++) {
@@ -761,14 +859,34 @@ __global__ void __launch_bounds__(256, 1)
             // next stages' copies, then the next stage's scales and fragments, once the tensor pipe has work queued
             // (at the last stage they read a stale buffer: harmless, unused)
             if (G == 0) {
-                if (st + NSH - 1 < nst) load(st + NSH - 1);
+                if constexpr (MBL) { // stage st + 2 into the buffer of st - 2, once every warp is done with that
+                    if (st >= 2) mb_wait(mbe + 8 * ((st - 2) & 3), ((st - 2) >> 2) & 1);
+                    if (st + 2 < nst) {
+                        loadw(st + 2);
+                        loadx(st + 2);
+                    }
+                } else if constexpr (WOWN) { // (the barrier of an even step precedes the activation copies into st - 2's, st - 1's buffers)
+                    if constexpr (PH == 0) {
+                        if (st + 2 < nst) loadx(st + 2);
+                        if (st + 3 < nst) loadx(st + 3);
+                    }
+                    if (st + 3 < nst) loadw(st + 3);
+                } else if (st + NSH - 1 < nst) {
+                    loadw(st + NSH - 1);
+                    loadx(st + NSH - 1);
+                }
                 cpa_commit();
+                if constexpr (MBL) cpa_mb_arrive(mbf + 8 * ((st + 2) & 3));
             }
             if (G == FG) {
                 scales(st + 1);
                 __syncwarp();
                 frag(st + 1, an);
             }
+        }
+        if constexpr (MBL) { // the warp is done with stage st (activations now, weights in the previous step)
+            __syncwarp();
+            if (lane == 0) mb_arrive(mbe + 8 * (st & 3));
         }
     };
     unsigned fa[HMI][2][2][4], fb[HMI][2][2][4];
