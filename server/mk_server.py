@@ -15,6 +15,7 @@ divergence (saved during earlier prefills: at each generation prompt, each messa
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
 GET /health, GET /v1/models.  One request at a time.  After each request the engine keeps the GPU's
 clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
+Limits (environment): MK_MAX_IMAGES (images per request, default 32).
 """
 import argparse
 import base64
@@ -39,6 +40,8 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOPK_MAX = 32
+# request limits; main() reads them from the environment
+MAX_IMAGES = 32  # MK_MAX_IMAGES: images per request
 # the engine and encoder libraries next to the repo root: qwen38mk.dll / qwen38vision.dll on Windows
 LIB_MK, LIB_VISION = ("qwen38mk.dll", "qwen38vision.dll") if os.name == "nt" else ("libqwen38mk.so", "libqwen38vision.so")
 
@@ -220,7 +223,9 @@ class Engine:
 
 class Vision:
     """ctypes binding of vision/mk_vision.h (libqwen38vision.so): the CPU image encoder (llama.cpp's libmtmd), plus a
-    cache of decoded / encoded images by content hash, so a conversation re-sending its images encodes each once"""
+    cache of decoded / encoded images by content hash, so a conversation re-sending its images encodes each once.
+    A request pins its images (image() .. release()): the cache never frees an image a request still holds, so it can
+    hold more than --image-cache images while a request runs."""
 
     class Image:
         def __init__(self, vision, handle, key):
@@ -229,10 +234,13 @@ class Vision:
             self.n = vision.L.mkv_image_grid(handle, ctypes.byref(nx), ctypes.byref(ny))
             self.nx, self.ny = nx.value, ny.value
             self.encode_s = None
+            self.pins = 0  # requests holding it (Vision.image / Vision.release)
 
         def rows(self):
             """address of the [n][n_embd] fp32 rows, encoding on the first call"""
             L = self.v.L
+            if not self.h:
+                raise RuntimeError("image encode: the image was freed")
             if self.encode_s is None:
                 if L.mkv_image_encode(self.v.ctx, self.h) != 0:
                     raise RuntimeError(f"image encode: {L.mkv_last_error().decode()}")
@@ -275,7 +283,8 @@ class Vision:
         self.cache_max = max(1, cache)
 
     def image(self, data):
-        """the Image of these file bytes (decoded and preprocessed; encoded lazily by rows())"""
+        """the Image of these file bytes (decoded and preprocessed; encoded lazily by rows()), pinned: the caller
+        releases it (release) when its request is done"""
         key = hashlib.sha256(data).hexdigest()
         im = self.cache.pop(key, None)
         if im is None:
@@ -284,10 +293,17 @@ class Vision:
                 raise BadRequest(f"image: {self.L.mkv_last_error().decode()}")
             im = Vision.Image(self, h, key)
         self.cache[key] = im
-        while len(self.cache) > self.cache_max:
-            old = self.cache.pop(next(iter(self.cache)))
-            old.free()
+        im.pins += 1
         return im
+
+    def release(self, images):
+        """unpins the images of a request (image() once per pin), then frees the least recently used unpinned images
+        beyond --image-cache"""
+        for im in images:
+            im.pins -= 1
+        extra = len(self.cache) - self.cache_max
+        for key in [k for k, im in self.cache.items() if im.pins <= 0][:max(extra, 0)]:
+            self.cache.pop(key).free()
 
     def warm_up(self):
         """one encode of a 64 x 64 grey PNG (not cached): the first encode after the engine's load pays ~0.5 s once
@@ -575,6 +591,8 @@ class Server:
         except jinja2.exceptions.TemplateError as e:
             raise BadRequest(f"chat template: {e}")
         thinking = text.endswith("<think>\n")
+        if media and len(media) > MAX_IMAGES:
+            raise BadRequest(f"{len(media)} images in one request: at most {MAX_IMAGES} (MK_MAX_IMAGES)")
         if media and text.count(MEDIA_MARKER) != len(media):
             raise BadRequest(f"the rendered prompt has {text.count(MEDIA_MARKER)} image markers for {len(media)} images")
         return text, thinking, media or []
@@ -582,20 +600,26 @@ class Server:
     def tokenize_prompt(self, text, media):
         """the prompt's token ids and its images [(pos, Vision.Image)]: each MEDIA_MARKER becomes <|vision_start|>, the
         image's rows (<|image_pad|> placeholders, nx * ny of them), <|vision_end|>; the text between is tokenized piece
-        by piece, as mtmd_tokenize does"""
+        by piece, as mtmd_tokenize does. The images are pinned (Vision.image): the caller releases them."""
         if not media:
             return self.eng.tokenize(text), []
         toks, images = [], []
         segs = text.split(MEDIA_MARKER)
-        for i, seg in enumerate(segs):
-            if seg:
-                toks += self.eng.tokenize(seg)
-            if i < len(media):
-                im = self.vision.image(media[i])
-                toks.append(self.vis_start)
-                images.append((len(toks), im))
-                toks += [self.img_pad] * im.n
-                toks.append(self.vis_end)
+        try:
+            for i, seg in enumerate(segs):
+                if seg:
+                    toks += self.eng.tokenize(seg)
+                if i < len(media):
+                    im = self.vision.image(media[i])
+                    toks.append(self.vis_start)
+                    images.append((len(toks), im))
+                    toks += [self.img_pad] * im.n
+                    toks.append(self.vis_end)
+                    if len(toks) + 16 >= self.args.ctx:  # (no more images decoded for a prompt that cannot run)
+                        raise BadRequest(f"prompt of at least {len(toks)} tokens does not fit the context of {self.args.ctx}")
+        except BaseException:
+            self.vision.release([im for _, im in images])
+            raise
         return toks, images
 
     def ck_positions(self, toks, start):
@@ -696,6 +720,13 @@ class Server:
         Returns (finish_reason, tool_calls, usage). emit returning False aborts."""
         text, thinking, media = self.render(body)
         toks, images = self.tokenize_prompt(text, media)
+        try:
+            return self._generate(body, emit, thinking, toks, images)
+        finally:
+            if images:  # (the request's images stay pinned until here)
+                self.vision.release([im for _, im in images])
+
+    def _generate(self, body, emit, thinking, toks, images):
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
         max_new = int(max_new)
         limit = self.args.ctx - len(toks) - 16
@@ -866,7 +897,18 @@ def make_handler(srv):
     return H
 
 
+def env_int(name, default):
+    """a positive integer setting from the environment (default when unset or empty)"""
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return default
+    if not v.isdecimal() or int(v) < 1:
+        sys.exit(f"{name}: expected a positive integer, not {v!r}")
+    return int(v)
+
+
 def main():
+    global MAX_IMAGES
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
@@ -892,8 +934,10 @@ def main():
     ap.add_argument("--image-min-tokens", type=int, default=0, help="minimum tokens per image (0: the mmproj's default)")
     ap.add_argument("--image-max-tokens", type=int, default=0,
                     help="maximum tokens per image (0: the mmproj's default, 4096 for Qwen3.x; fewer encode faster)")
-    ap.add_argument("--image-cache", type=int, default=8, help="images kept decoded / encoded for reuse")
+    ap.add_argument("--image-cache", type=int, default=8,
+                    help="images kept decoded / encoded for reuse (a request holds all of its own while it runs)")
     args = ap.parse_args()
+    MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     if args.exact_reuse:
         os.environ["MK_EXACT"] = "1"  # read by the engine at construction
     srv = Server(args)

@@ -1,5 +1,6 @@
 """Tests of server/mk_server.py without a GPU: request parsing, prompt reuse and image handling against fake engines.
 (Moved from open-jet's tests/test_megakernel_backend.py with the server itself.)"""
+import base64
 import http.client
 import importlib.util
 import json
@@ -253,7 +254,7 @@ class MegakernelVisionTests(unittest.TestCase):
     def _server(self, images):
         srv = object.__new__(self.mk.Server)
         srv.eng, srv.im_start = _FakeVisionEngine(), self.IM
-        srv.args = mock.Mock(ck_every=0, ck_msgs=1)
+        srv.args = mock.Mock(ck_every=0, ck_msgs=1, ctx=4096)
         srv.vis_start, srv.vis_end, srv.img_pad = self.VS, self.VE, self.PAD
         srv.vision = mock.Mock()
         srv.vision.image.side_effect = lambda data: images[data]
@@ -479,6 +480,96 @@ class ToolCallCutTests(_HttpCase):
                 pieces, finish, content, calls = self._reply(n - cut, stream)
                 self.assertEqual((finish, calls), ("length", []), (cut, stream))
                 self.assertEqual(content, "".join(pieces[:n - cut]), (cut, stream))  # (all of the generated text)
+
+
+# === sec:b1 ===
+class _FakeVisionLib:
+    """libqwen38vision's C API over Python objects; using a freed image is recorded (the real library crashes)"""
+
+    def __init__(self):
+        self.live, self.freed, self.misuse, self.next = {}, [], [], 1
+
+    def mkv_image_load(self, ctx, data, n):
+        if data.startswith(b"bad"):
+            return None
+        h, self.next = self.next, self.next + 1
+        self.live[h] = data
+        return h
+
+    def mkv_last_error(self):
+        return b"cannot decode the image"
+
+    def mkv_image_grid(self, h, nx, ny):
+        nx._obj.value, ny._obj.value = 2, 2
+        return 4
+
+    def mkv_image_encode(self, ctx, h):
+        if h not in self.live:
+            self.misuse.append(("encode", h))
+            return -1
+        return 0
+
+    def mkv_image_encode_ms(self, h):
+        return 1.0
+
+    def mkv_image_rows(self, h):
+        if h not in self.live:
+            self.misuse.append(("rows", h))
+        return 4096 + 16 * (h or 0)
+
+    def mkv_image_free(self, h):
+        self.freed.append(self.live.pop(h))
+
+
+class ImagePinTests(_HttpCase):
+    """a request owns every image it references until it is done; at most MK_MAX_IMAGES images per request"""
+
+    def serve_vision(self, cache=8):
+        eng = _ScriptEngine(["ok"])
+        srv, http_ = self.serve(eng)
+        lib = _FakeVisionLib()
+        v = object.__new__(self.mk.Vision)
+        v.L, v.ctx, v.cache, v.cache_max = lib, 1, {}, cache
+        srv.vision, srv.vis_start, srv.vis_end, srv.img_pad = v, 1001, 1002, 1003
+        return v, lib, http_
+
+    def _images(self, datas):
+        parts = [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(d).decode()}}
+                 for d in datas]
+        return {"messages": [{"role": "user", "content": [{"type": "text", "text": "what?"}] + parts}], "max_tokens": 4}
+
+    def test_more_images_than_the_cache_in_one_request(self) -> None:
+        v, lib, http_ = self.serve_vision(cache=8)
+        datas = [b"img%d" % i for i in range(9)]
+        status, data = http_.post(self._images(datas))
+        self.assertEqual((status, lib.misuse, lib.freed), (200, [], [b"img0"]), data[:300])  # (freed after the request)
+        self.assertEqual(len(v.cache), 8)
+        self.assertTrue(all(im.pins == 0 for im in v.cache.values()))
+        status, _ = http_.post(self._images(datas))  # again: 8 cached, the first decoded again
+        self.assertEqual((status, lib.misuse, len(v.cache)), (200, [], 8))
+
+    def test_the_same_image_twice_in_a_request(self) -> None:
+        v, lib, http_ = self.serve_vision(cache=1)
+        status, _ = http_.post(self._images([b"a", b"b", b"a"]))
+        self.assertEqual((status, lib.misuse, lib.freed, list(v.cache)), (200, [], [b"b"], list(v.cache)))
+        self.assertEqual(len(v.cache), 1)
+
+    def test_a_failed_request_releases_its_images(self) -> None:
+        v, lib, http_ = self.serve_vision(cache=2)
+        status, data = http_.post(self._images([b"a", b"b", b"c", b"bad"]))
+        self.assertEqual(status, 400)
+        self.assertIn(b"cannot decode the image", data)
+        self.assertEqual((len(v.cache), lib.freed, lib.misuse), (2, [b"a"], []))
+        self.assertTrue(all(im.pins == 0 for im in v.cache.values()))
+
+    def test_too_many_images_is_a_400(self) -> None:
+        v, lib, http_ = self.serve_vision()
+        with mock.patch.object(self.mk, "MAX_IMAGES", 4):
+            status, data = http_.post(self._images([b"i%d" % i for i in range(5)]))
+            self.assertEqual(status, 400)
+            self.assertIn(b"MK_MAX_IMAGES", data)
+            self.assertEqual(lib.live, {})  # (refused before decoding any)
+            self.assertEqual(http_.post(self._images([b"i%d" % i for i in range(4)]))[0], 200)
 
 
 if __name__ == "__main__":

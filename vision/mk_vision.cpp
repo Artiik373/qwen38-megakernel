@@ -241,13 +241,17 @@ mkv_image * mkv_image_load(mkv_ctx * c, const unsigned char * data, size_t len) 
 }
 
 int mkv_image_grid(const mkv_image * im, int * nx, int * ny) {
-    if (nx) *nx = im->nx;
-    if (ny) *ny = im->ny;
-    return im->n;
+    if (nx) *nx = im ? im->nx : 0;
+    if (ny) *ny = im ? im->ny : 0;
+    return im ? im->n : 0;
 }
 
 int mkv_image_encode(mkv_ctx * c, mkv_image * im) {
     g_err.clear();
+    if (!im) {
+        g_err = "no image";
+        return -1;
+    }
     if (!im->rows.empty()) return 0;
     const double t0 = now_ms();
 #ifndef MKV_NO_VIT
@@ -275,8 +279,8 @@ int mkv_image_encode(mkv_ctx * c, mkv_image * im) {
     return 0;
 }
 
-const float * mkv_image_rows(const mkv_image * im) { return im->rows.empty() ? nullptr : im->rows.data(); }
-double mkv_image_encode_ms(const mkv_image * im) { return im->encode_ms; }
+const float * mkv_image_rows(const mkv_image * im) { return !im || im->rows.empty() ? nullptr : im->rows.data(); }
+double mkv_image_encode_ms(const mkv_image * im) { return im ? im->encode_ms : 0; }
 
 void mkv_image_free(mkv_image * im) {
     if (!im) return;
