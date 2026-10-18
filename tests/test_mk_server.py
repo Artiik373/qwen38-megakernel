@@ -1,9 +1,14 @@
 """Tests of server/mk_server.py without a GPU: request parsing, prompt reuse and image handling against fake engines.
 (Moved from open-jet's tests/test_megakernel_backend.py with the server itself.)"""
+import http.client
 import importlib.util
 import json
+import socket
 import sys
+import threading
+import time
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -287,6 +292,193 @@ class MegakernelVisionTests(unittest.TestCase):
         _, reused = srv.load_prompt(toks2, images2)
         self.assertEqual(reused, 10)
         self.assertEqual(srv.eng.calls[-3:-1], [("rewind", 10), ("images", ((2, 4, 4),))])
+
+
+# === sec:harness ===
+# The HTTP handler end to end (make_handler on a local port) over a scripted engine: no GPU, no model.
+
+TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
+
+
+class _ScriptEngine(_FakeEngine):
+    """generates a fixed text: one token per piece (the first from the prefill, two per decode cycle), then an
+    end-of-generation token (eog=False: filler pieces forever); delay: seconds per decode cycle; fail_at: the decode
+    cycle that raises, as the engine does on an error"""
+
+    EOG, FILL = 900000, 900001
+
+    def __init__(self, pieces, eog=True, delay=0.0, fail_at=None):
+        super().__init__()
+        self.pieces, self.eog, self.delay, self.fail_at = [p.encode() for p in pieces], eog, delay, fail_at
+        self.i = self.cycles = 0
+
+    def tokenize(self, text):
+        return [ord(c) for c in text]
+
+    def set_penalty(self, *a):
+        pass
+
+    def set_sampling(self, *a):
+        pass
+
+    def keep_warm(self, on=True):
+        return 0.0
+
+    def _next(self):
+        self.i += 1
+        if self.i <= len(self.pieces):
+            return 1000 + self.i - 1
+        return self.EOG if self.eog else self.FILL
+
+    def prefill(self, toks, ck_at=-1, cks=(), images=()):
+        super().prefill(toks, ck_at, cks)
+        self.i = 0  # (each request replays the script)
+        return self._next()
+
+    def step(self):
+        self.cycles += 1
+        if self.cycles == self.fail_at:
+            raise RuntimeError("decode: no finite logit (test)")
+        time.sleep(self.delay)
+        return [self._next(), self._next()]
+
+    def is_eog(self, tok):
+        return tok == self.EOG
+
+    def piece(self, tok):
+        return b" x" if tok == self.FILL else self.pieces[tok - 1000]
+
+
+def _chat_server(mk, eng, ctx=4096):
+    srv = object.__new__(mk.Server)
+    srv.eng, srv.im_start, srv.vision = eng, None, None
+    srv.template = mk.make_template(TEMPLATE)
+    srv.args = mock.Mock(ctx=ctx, ck_every=0, ck_msgs=0)
+    srv.lock, srv.warned, srv.model_id = threading.Lock(), set(), "test"
+    return srv
+
+
+class _Http:
+    """make_handler(srv) on 127.0.0.1:<free port>"""
+
+    def __init__(self, mk, srv):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), mk.make_handler(srv))
+        self.httpd.daemon_threads = True
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, body, timeout=20):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        return r.status, data
+
+    def raw(self, data, timeout=3.0, until=None):
+        """sends raw bytes; returns what comes back until the server closes, `until` ends the data, or the timeout"""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as s:
+            s.sendall(data)
+            out = b""
+            try:
+                while not (until and out.endswith(until)):
+                    b = s.recv(65536)
+                    if not b:
+                        break
+                    out += b
+            except (socket.timeout, ConnectionResetError):  # (a reset after the answer: an unread request body)
+                pass
+            return out
+
+
+def _request(body, headers=None):
+    data = json.dumps(body).encode()
+    h = {"Content-Type": "application/json", "Content-Length": str(len(data)), **(headers or {})}
+    return (b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" + b"".join(f"{k}: {v}\r\n".encode() for k, v in h.items())
+            + b"\r\n" + data)
+
+
+def _sse(raw):
+    """the data: payloads of a chunked SSE response, decoded strictly (a status line inside the body fails here)"""
+    head, _, body = raw.partition(b"\r\n\r\n")
+    events, pos = [], 0
+    while True:
+        eol = body.index(b"\r\n", pos)
+        n = int(body[pos:eol], 16)
+        if n == 0:
+            return head, events
+        chunk = body[eol + 2:eol + 2 + n]
+        assert body[eol + 2 + n:eol + 4 + n] == b"\r\n"
+        events += [ln[6:] for ln in chunk.split(b"\n") if ln.startswith(b"data: ")]
+        pos = eol + 4 + n
+
+
+class _HttpCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mk = _load_mk_server()
+
+    def serve(self, eng, ctx=4096):
+        srv = _chat_server(self.mk, eng, ctx)
+        http_ = _Http(self.mk, srv)
+        self.addCleanup(http_.close)
+        return srv, http_
+
+
+# === sec:b3 ===
+TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {
+    "type": "object", "properties": {"path": {"type": "string"}}}}}]
+CALL = "<tool_call>\n<function=read_file>\n<parameter=path>\n/etc/hostname\n</parameter>\n</function>\n</tool_call>"
+
+
+class ToolCallCutTests(_HttpCase):
+    """a tool call counts only with its closing tags: one cut by max_tokens is text and the reply ends with 'length'"""
+
+    def test_only_a_closed_call_is_parsed(self) -> None:
+        self.assertEqual(len(self.mk.parse_tool_calls(CALL, TOOLS)), 1)
+        for n in range(len(CALL)):
+            self.assertEqual(self.mk.parse_tool_calls(CALL[:n], TOOLS), [], CALL[:n])
+            self.assertEqual(self.mk.unparsed_tool_call(CALL[:n]), CALL[CALL.find("<tool_call>"):n] if n >= 11 else "")
+        self.assertEqual(self.mk.unparsed_tool_call(CALL + "\n" + CALL[:30]), CALL[:30])
+
+    PIECES = (lambda t: [t[i:i + 3] for i in range(0, len(t), 3)])("Let me look.\n\n" + CALL)
+
+    def _reply(self, max_tokens, stream):
+        pieces = self.PIECES
+        _, http_ = self.serve(_ScriptEngine(pieces))
+        body = {"messages": [{"role": "user", "content": "hostname?"}], "tools": TOOLS, "max_tokens": max_tokens,
+                "stream": stream}
+        if not stream:
+            status, data = http_.post(body)
+            self.assertEqual(status, 200)
+            o = json.loads(data)
+            c = o["choices"][0]
+            return pieces, c["finish_reason"], c["message"].get("content"), c["message"].get("tool_calls") or []
+        _, events = _sse(http_.raw(_request(body), until=b"0\r\n\r\n"))
+        self.assertEqual(events[-1], b"[DONE]")
+        deltas = [c for e in events[:-1] for c in json.loads(e)["choices"]]
+        content = "".join(d["delta"].get("content") or "" for d in deltas)
+        calls = [tc for d in deltas for tc in d["delta"].get("tool_calls") or []]
+        return pieces, [d["finish_reason"] for d in deltas if d["finish_reason"]][-1], content, calls
+
+    def test_a_complete_call_is_a_tool_call(self) -> None:
+        for stream in (False, True):
+            _, finish, content, calls = self._reply(500, stream)
+            self.assertEqual((finish, content, len(calls)), ("tool_calls", "Let me look.", 1), stream)
+            self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"path": "/etc/hostname"})
+
+    def test_a_call_cut_by_max_tokens_is_text_and_length(self) -> None:
+        n = len(self.PIECES)
+        for cut in (1, 2, 4, 12):  # inside </tool_call>, </function>, the parameter
+            for stream in (False, True):
+                pieces, finish, content, calls = self._reply(n - cut, stream)
+                self.assertEqual((finish, calls), ("length", []), (cut, stream))
+                self.assertEqual(content, "".join(pieces[:n - cut]), (cut, stream))  # (all of the generated text)
 
 
 if __name__ == "__main__":

@@ -390,8 +390,19 @@ def normalize_messages(messages, media=None):
     return out
 
 
-TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)(?:</function>\s*(?:</tool_call>|$)|$)", re.S)
+# a tool call counts only with both closing tags: one cut by max_tokens (or left open) is not a call
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>((?:(?!<tool_call>).)*?)</function>\s*</tool_call>", re.S)
 PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
+
+
+def unparsed_tool_call(text):
+    """the tool-call markup after the last complete call that is not a call itself (cut by max_tokens, left open or
+    malformed), from its <tool_call> to the end; empty if there is none"""
+    end = 0
+    for m in TOOL_CALL_RE.finditer(text):
+        end = m.end()
+    i = text.find("<tool_call>", end)
+    return text[i:] if i >= 0 else ""
 
 
 def parse_tool_calls(text, tools):
@@ -427,6 +438,8 @@ class OutputParser:
         self.tools = tools
         self.buf = ""
         self.tool_text = ""
+        self.tool_sep = ""  # the whitespace between the content and the first <tool_call>
+        self.content_seen = False
 
     def feed(self, text, final=False):
         """returns [(kind, text)] with kind in {reasoning, content}"""
@@ -455,7 +468,9 @@ class OutputParser:
                 if self.tools:
                     i = self.buf.find("<tool_call>")
                     if i >= 0:
-                        out.append(("content", self.buf[:i].rstrip()))
+                        head = self.buf[:i].rstrip()
+                        out.append(("content", head))
+                        self.tool_sep = self.buf[len(head):i]
                         self.tool_text = self.buf[i:]
                         self.buf = ""
                         self.mode = "tools"
@@ -477,7 +492,15 @@ class OutputParser:
             self.tool_text += self.buf
             self.buf = ""
             break
-        return [(k, t) for k, t in out if t]
+        out = [(k, t) for k, t in out if t]
+        self.content_seen = self.content_seen or any(k == "content" for k, _ in out)
+        return out
+
+    def unparsed(self):
+        """the tool-call markup that is not a complete call (unparsed_tool_call), as the rest of the content: the
+        client gets the text, as from llama-server, instead of a call it would execute half-written"""
+        rest = unparsed_tool_call(self.tool_text)
+        return (self.tool_sep if self.content_seen else "") + rest if rest else ""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -707,7 +730,11 @@ class Server:
         for kind, delta in parser.feed(dec.decode(b"", final=True), final=True):
             emit(kind, delta)
         calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
-        if calls:
+        rest = parser.unparsed()
+        if rest:
+            emit("content", rest)
+        # a call cut by max_tokens is text, and the reply ends with "length" (complete calls before it are still sent)
+        if calls and not (rest and finish == "length"):
             finish = "tool_calls"
         t2 = time.time()
         log(f"prompt {len(toks)} tok ({reused} reused) in {t1 - t0:.2f} s, {n_gen} tok in {t2 - t1:.2f} s "
