@@ -5,10 +5,11 @@ llama-server's API that open-jet uses).
   python3 server/mk_server.py -m model.gguf --port 18080 [--ctx 32768] [--draft 4]
 
 POST /v1/chat/completions (streaming or not): the request is rendered with the chat template stored
-in the GGUF (enable_thinking / preserve_thinking / reasoning_effort via chat_template_kwargs, tools
-via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured
-`tool_calls`.  Sampling: temperature, top_p, top_k (1..32; absent or <= 0: 32, the engine's maximum),
-min_p, seed; stop strings (`stop`).  Successive requests of a conversation reuse the processed tokens: the new prompt is
+in the GGUF, or the one given by --chat-template-file / --chat-template (llama-server's options), with
+enable_thinking / preserve_thinking / reasoning_effort via chat_template_kwargs and tools via `tools`;
+reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured `tool_calls`.
+Sampling: temperature, top_p, top_k (1..32; absent or <= 0: 32, the engine's maximum), min_p, seed; stop strings
+(`stop`).  Successive requests of a conversation reuse the processed tokens: the new prompt is
 matched against the sequence so far and only the rest is prefilled. When the new prompt diverges inside
 what the engine already processed, it rewinds to the last DeltaNet checkpoint at or before the
 divergence (saved during earlier prefills: at each generation prompt, each message start and every
@@ -713,6 +714,59 @@ def make_template(src):
     return env.from_string(src)
 
 
+# llama.cpp's CHATML_TEMPLATE_SRC: `--chat-template chatml`, and the template of a GGUF that has none
+CHATML_TEMPLATE = ("{%- for message in messages -%}\n"
+                   "  {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' -}}\n"
+                   "{%- endfor -%}\n"
+                   "{%- if add_generation_prompt -%}\n"
+                   "  {{- '<|im_start|>assistant\\n' -}}\n"
+                   "{%- endif -%}")
+# the conversation a template given at startup must render (llama-server renders it at startup too)
+TEMPLATE_EXAMPLE = [{"role": "system", "content": "You are a helpful assistant"}, {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi there"}, {"role": "user", "content": "How are you?"}]
+
+
+def chat_template_source(kind, value):
+    """the chat template of --chat-template-file PATH (kind "file": the file's text, UTF-8; CRLF line ends are read as
+    LF, as llama-server on Windows reads it, and a byte-order mark is dropped) or --chat-template TEMPLATE (kind
+    "inline": the Jinja source itself; "chatml" = llama.cpp's ChatML template), checked at startup: it must compile
+    and render a short conversation with its messages in it. ValueError names the problem."""
+    opt = "--chat-template-file" if kind == "file" else "--chat-template"
+    if kind == "file":
+        try:
+            with open(value, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            raise ValueError(f"{opt}: cannot read {value}: {e.strerror or e}") from None
+        try:
+            src = raw.decode("utf-8-sig").replace("\r\n", "\n")
+        except UnicodeDecodeError as e:
+            raise ValueError(f"{opt}: {value} is not UTF-8 text ({e.reason} at byte {e.start})") from None
+        what = value
+    else:
+        src, what = (CHATML_TEMPLATE if value == "chatml" else value), "the template"
+    try:
+        tmpl = make_template(src)
+    except jinja2.exceptions.TemplateSyntaxError as e:
+        raise ValueError(f"{opt}: {what} does not compile: {e.message} (line {e.lineno})") from None
+    try:
+        text = tmpl.render(messages=TEMPLATE_EXAMPLE, add_generation_prompt=True)
+    except Exception as e:  # (raise_exception, an undefined name, or a Python error inside an expression)
+        raise ValueError(f"{opt}: {what} fails on a short conversation (system, user, assistant, user): "
+                         f"{type(e).__name__}: {e}") from None
+    if TEMPLATE_EXAMPLE[-1]["content"] not in text:
+        raise ValueError(f"{opt}: {what} does not render the conversation's messages: not a chat template"
+                         + (" (the only built-in name is chatml)" if kind == "inline" else ""))
+    return src
+
+
+class ChatTemplateArg(argparse.Action):
+    """--chat-template-file / --chat-template: one setting, the last one given wins (as in llama-server)"""
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        setattr(namespace, self.dest, ("file" if option_string == "--chat-template-file" else "inline", value))
+
+
 class BadRequest(Exception):
     pass
 
@@ -1191,7 +1245,13 @@ class Server:
                           {"f16": 0, "q8": 1, "auto": -1}[args.kv], "none" if args.no_mtp else args.mtp)
         if not self.eng.has_mtp:
             log("no MTP layer: plain decoding (depth 0)")
-        self.template_src = self.eng.chat_template()
+        # --chat-template-file / --chat-template (read and checked in main) replace the GGUF's template everywhere it is
+        # used: chat and Anthropic requests, /apply-template, token counts, /props; a GGUF without one gets ChatML
+        src = getattr(args, "chat_template_src", None)
+        self.template_src = src if src is not None else self.eng.chat_template()
+        if not self.template_src:
+            log("the GGUF has no chat template: using ChatML (as llama-server; --chat-template-file to give one)")
+            self.template_src = CHATML_TEMPLATE
         self.template = make_template(self.template_src)
         im = self.eng.tokenize("<|im_start|>")
         self.im_start = im[0] if len(im) == 1 else None  # checkpoint at the start of the generation prompt
@@ -2167,6 +2227,12 @@ def main():
     ap.add_argument("--exact-reuse", action="store_true",
                     help="reused requests answer exactly as fresh ones (MK_EXACT=1): restore a checkpoint and prefill "
                          "instead of appending to decoded rows (costs prompt time when a long reply is reused)")
+    ap.add_argument("--chat-template-file", dest="chat_template", action=ChatTemplateArg, metavar="PATH",
+                    help="Jinja chat template file to use instead of the GGUF's (as llama-server), e.g. another "
+                         "template for a fine-tune of the same model")
+    ap.add_argument("--chat-template", dest="chat_template", action=ChatTemplateArg, metavar="TEMPLATE",
+                    help="the chat template itself (Jinja source; 'chatml': llama.cpp's ChatML) instead of the GGUF's; "
+                         "the last of --chat-template / --chat-template-file wins")
     ap.add_argument("--mmproj", default=None,
                     help="vision projector GGUF (e.g. mmproj-*.gguf): image_url inputs, encoded on the CPU (no VRAM)")
     ap.add_argument("--vision-lib", default=os.path.join(os.path.dirname(HERE), LIB_VISION))
@@ -2195,6 +2261,14 @@ def main():
         ap.error("--video-fps: expected a rate in (0, 30]")
     if args.video_max_tokens and args.video_max_tokens < max(8, args.image_min_tokens):
         ap.error("--video-max-tokens: expected 0 or at least 8 (and --image-min-tokens)")
+    args.chat_template_src = None  # (before the port opens: a bad template fails at once, not after the model load)
+    if args.chat_template:
+        try:
+            args.chat_template_src = chat_template_source(*args.chat_template)
+        except ValueError as e:
+            ap.error(str(e))
+        kind, value = args.chat_template
+        log(f"chat template: {value if kind == 'file' else 'from --chat-template'} instead of the GGUF's")
     MAX_BODY_MB = env_int("MK_MAX_BODY_MB", MAX_BODY_MB)
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     MAX_VIDEO_FRAMES = env_int("MK_MAX_VIDEO_FRAMES", MAX_VIDEO_FRAMES)

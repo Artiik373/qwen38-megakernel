@@ -230,7 +230,10 @@ What the API supports:
 - **Sampling:** temperature, top_p, top_k (1..32; absent or <= 0 means 32), min_p, seed, and presence / frequency
   penalty. Absent values default to temperature 0.8, top_p 0.95 and min_p 0.05. There is no repetition penalty.
 - **Chat template:** the one stored in the GGUF, with `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...)
-  and OpenAI `tools`.
+  and OpenAI `tools`; `--chat-template-file` replaces it, as in llama-server (`MK_CHAT_TEMPLATE_FILE` in the launchers).
+  Example: a fine-tune whose GGUF ships Qwen's original template answers a `developer` message, a second system
+  message, a turn without a user query or `reasoning_effort` "high" with a 400; unsloth's template (the one in its
+  Qwen3.8-27B GGUFs) takes all four.
 - **Images:** base64 `data:` URLs only.
 - **Video:** `input_video` parts (`{"data": <base64>}`, as llama-server) or `video_url` parts with a base64 `data:` URL;
   ffmpeg samples `--video-fps` frames per second (default 4) and the prompt is laid out as llama.cpp does

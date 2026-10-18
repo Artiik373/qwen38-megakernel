@@ -4,9 +4,11 @@ import base64
 import contextlib
 import http.client
 import importlib.util
+import io
 import json
 import socket
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -1283,6 +1285,207 @@ class ExtraRouteTests(_HttpCase):
             self.assertEqual(status, 501, path)
             self.assertIn(path.split("?")[0], o["error"]["message"])
         self.assertEqual(self._post(http_, "/nope", {})[0], 404)
+
+
+# === M8: --chat-template-file / --chat-template ===
+# tests/templates: the chat templates of real GGUFs (tokenizer.chat_template, exact bytes): qwen38_unsloth.jinja =
+# unsloth's Qwen3.8-27B GGUFs (developer role, merged system messages, tool-only turns), qwen38_original.jinja = Qwen's
+# original, as a fine-tune's GGUF ships it (Swift-1.5-Qwen3.8-27B)
+TEMPLATES = ROOT / "tests" / "templates"
+
+
+class _GgufEngine(_ScriptEngine):
+    """what Server.__init__ needs of mk.Engine (patched in): the GGUF's chat template, a warm-up, stats"""
+
+    has_mtp = True
+
+    def __init__(self, gguf_template):
+        super().__init__(["ok"])
+        self.gguf_template = gguf_template
+
+    def chat_template(self):
+        return self.gguf_template
+
+    def stats(self):
+        return (0, 0, 0)
+
+
+class ChatTemplateOptionTests(_HttpCase):
+    UNSLOTH = (TEMPLATES / "qwen38_unsloth.jinja").read_bytes().decode()
+    ORIGINAL = (TEMPLATES / "qwen38_original.jinja").read_bytes().decode()
+    CALL = {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "/etc/hostname"}'}}
+
+    def _tmpdir(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        return t.name
+
+    def _file(self, text, crlf=False, bom=False):
+        p = Path(self._tmpdir()) / "t.jinja"
+        p.write_bytes((b"\xef\xbb\xbf" if bom else b"") + (text.replace("\n", "\r\n") if crlf else text).encode())
+        return str(p)
+
+    def _server(self, gguf_template, kind=None, value=None):
+        """Server(args) as main builds it (mk.Engine replaced), the template option read by chat_template_source"""
+        args = types.SimpleNamespace(lib="libqwen38mk.so", model="test.gguf", ctx=4096, draft=4, draft_vocab=None, kv="q8",
+                                     no_mtp=False, mtp=None, mmproj=None, ck_every=0, ck_msgs=0, chat_template_src=None)
+        if kind:
+            args.chat_template_src = self.mk.chat_template_source(kind, value)
+        with mock.patch.object(self.mk, "Engine", lambda *a: _GgufEngine(gguf_template)):
+            srv = self.mk.Server(args)
+        http_ = _Http(self.mk, srv)
+        self.addCleanup(http_.close)
+        return srv, http_
+
+    def _post(self, http_, path, body):
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=20)
+        c.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
+        r = c.getresponse()
+        return r.status, json.loads(r.read())
+
+    def _props(self, http_):
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=20)
+        c.request("GET", "/props")
+        return json.loads(c.getresponse().read())
+
+    def _prompt_of_last_prefill(self, eng):
+        n = [c for c in eng.calls if c[0] == "prefill"][-1][2]
+        return "".join(chr(t) for t in eng.seq[:n])  # (a character tokenizer; one request per server here)
+
+    def test_the_file_replaces_the_gguf_template_everywhere(self) -> None:
+        mine = ("{% for m in messages %}[{{ m.role }}]{{ m.content }}\n{% endfor %}"
+                "{% if add_generation_prompt %}[assistant]{% endif %}")
+        path = self._file(mine, crlf=True, bom=True)  # (a file saved on Windows: CRLF line ends and a BOM)
+        srv, http_ = self._server(TEMPLATE, "file", path)
+        self.assertEqual(srv.template_src, mine)
+        self.assertEqual(self._props(http_)["chat_template"], mine)
+        body = {"messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hi"}],
+                "max_tokens": 5}
+        prompt = "[system]Be brief.\n[user]hi\n[assistant]"
+        self.assertEqual(self._post(http_, "/apply-template", body), (200, {"prompt": prompt}))
+        self.assertEqual(self._post(http_, "/v1/chat/completions/input_tokens", body)[1]["input_tokens"], len(prompt))
+        anth = {"model": "m", "system": "Be brief.", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
+        self.assertEqual(self._post(http_, "/v1/messages/count_tokens", anth), (200, {"input_tokens": len(prompt)}))
+        status, o = self._post(http_, "/v1/chat/completions", body)
+        self.assertEqual((status, o["choices"][0]["message"]["content"]), (200, "ok"))
+        self.assertEqual(self._prompt_of_last_prefill(srv.eng), prompt)
+        srv2, http2 = self._server(TEMPLATE, "file", path)
+        status, o = self._post(http2, "/v1/messages", anth)
+        self.assertEqual((status, o["content"]), (200, [{"type": "text", "text": "ok"}]))
+        self.assertEqual(self._prompt_of_last_prefill(srv2.eng), prompt)
+        # without the option: the GGUF's
+        srv3, http3 = self._server(TEMPLATE)
+        self.assertEqual((srv3.template_src, self._props(http3)["chat_template"]), (TEMPLATE, TEMPLATE))
+        self.assertEqual(self._post(http3, "/apply-template", body)[1]["prompt"],
+                         "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n")
+
+    def test_requests_the_original_template_refuses_render_under_unsloths(self) -> None:
+        """a fine-tune shipping Qwen's original template: 400s for a developer role, a second system message, a turn with
+        no user query, reasoning_effort high; with --chat-template-file of unsloth's template the same requests render"""
+        user = {"role": "user", "content": "hi"}
+        bodies = {
+            "Unexpected message role": {"messages": [{"role": "developer", "content": "Be brief."}, user]},
+            "System message must be at the beginning": {"messages": [{"role": "system", "content": "a"},
+                                                                      {"role": "system", "content": "b"}, user]},
+            "No user query found": {"messages": [{"role": "system", "content": "s"},
+                                                 {"role": "assistant", "content": "", "tool_calls": [self.CALL]},
+                                                 {"role": "tool", "tool_call_id": "c1", "content": "host"}],
+                                    "tools": TOOLS},
+            "Unexpected reasoning effort high": {"messages": [user], "reasoning_effort": "high"},
+        }
+        _, http_ = self._server(self.ORIGINAL)
+        for why, body in bodies.items():
+            status, o = self._post(http_, "/v1/chat/completions", {**body, "max_tokens": 5})
+            self.assertEqual(status, 400, why)
+            self.assertIn(why, o["error"]["message"])
+        srv, http_ = self._server(self.ORIGINAL, "file", str(TEMPLATES / "qwen38_unsloth.jinja"))
+        self.assertEqual(self._props(http_)["chat_template"], self.UNSLOTH)
+        for why, body in bodies.items():
+            status, o = self._post(http_, "/apply-template", body)
+            self.assertEqual(status, 200, why)
+            self.assertTrue(o["prompt"].endswith("<|im_start|>assistant\n<think>\n"), why)
+        p = self._post(http_, "/apply-template", bodies["Unexpected message role"])[1]["prompt"]
+        self.assertTrue(p.startswith("<|im_start|>system\n") and "Be brief.<|im_end|>" in p, p)  # (developer = system)
+        p = self._post(http_, "/apply-template", bodies["Unexpected reasoning effort high"])[1]["prompt"]
+        self.assertIn("Reasoning effort is set to xhigh", p)  # (unsloth's template maps high to xhigh)
+        status, o = self._post(http_, "/v1/chat/completions", {**bodies["No user query found"], "max_tokens": 5})
+        self.assertEqual(status, 200, o)
+
+    def test_the_gguf_template_as_a_file_renders_byte_identical_prompts(self) -> None:
+        """the GGUF's own template given as a file (written with CRLF line ends, as an extraction on Windows writes it):
+        every prompt is byte-identical to the one rendered from the GGUF"""
+        gguf, _ = self._server(self.UNSLOTH)
+        filed, http_ = self._server(self.UNSLOTH, "file", self._file(self.UNSLOTH, crlf=True))
+        self.assertEqual((filed.template_src, self._props(http_)["chat_template"]), (self.UNSLOTH, self.UNSLOTH))
+        user, sys_ = {"role": "user", "content": "What is 2+2?"}, {"role": "system", "content": "Be brief."}
+        turn = [sys_, user, {"role": "assistant", "content": "4", "reasoning_content": "Add them."},
+                {"role": "user", "content": "And 3+3?"}]
+        tool_turn = [user, {"role": "assistant", "content": "Let me look.", "tool_calls": [self.CALL]},
+                     {"role": "tool", "tool_call_id": "c1", "content": "box"}]
+        bodies = [{"messages": [user]}, {"messages": turn},
+                  {"messages": turn, "chat_template_kwargs": {"preserve_thinking": False}},
+                  {"messages": [sys_, user], "chat_template_kwargs": {"enable_thinking": False}},
+                  {"messages": tool_turn, "tools": TOOLS}]
+        bodies += [{"messages": turn, "reasoning_effort": e} for e in ("none", "minimal", "low", "medium", "high", "xhigh")]
+        bodies.append(self.mk.anthropic_to_chat({"system": "Be brief.", "max_tokens": 5,
+                                                 "thinking": {"type": "enabled", "budget_tokens": 64},
+                                                 "messages": [{"role": "user", "content": "hi"}]}))
+        for body in bodies:
+            self.assertEqual(filed.render(body), gguf.render(body), body)
+
+    def test_a_gguf_without_a_template_gets_chatml_and_chatml_is_built_in(self) -> None:
+        srv, http_ = self._server("")
+        self.assertEqual(srv.template_src, self.mk.CHATML_TEMPLATE)
+        chatml, hi = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n", {"messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(self._post(http_, "/apply-template", hi)[1]["prompt"], chatml)
+        srv, http_ = self._server(self.UNSLOTH, "inline", "chatml")
+        self.assertEqual(self._props(http_)["chat_template"], self.mk.CHATML_TEMPLATE)
+        self.assertEqual(self._post(http_, "/apply-template", hi)[1]["prompt"], chatml)
+        srv, _ = self._server(self.UNSLOTH, "inline", TEMPLATE)  # (Jinja source inline)
+        self.assertEqual(srv.template_src, TEMPLATE)
+
+    def _main(self, *argv):
+        """mk.main() with these options up to the point where it opens the port (HTTPServer stops it there); returns
+        (exit code or None if it got there, stderr, the chat_template_source calls)"""
+        class Reached(Exception):
+            pass
+        err = io.StringIO()
+        spy = mock.Mock(wraps=self.mk.chat_template_source)
+        with mock.patch.object(sys, "argv", ["mk_server.py", "-m", "test.gguf", *argv]), \
+                mock.patch.object(self.mk, "HTTPServer", side_effect=Reached), \
+                mock.patch.object(self.mk, "chat_template_source", spy), contextlib.redirect_stderr(err):
+            try:
+                self.mk.main()
+            except SystemExit as e:
+                return e.code, err.getvalue(), spy.call_args_list
+            except Reached:
+                return None, err.getvalue(), spy.call_args_list
+        self.fail("main() returned")
+
+    def test_startup_errors_name_the_problem_before_the_port_opens(self) -> None:
+        d = Path(self._tmpdir())
+        (d / "syntax.jinja").write_text("{% for m in messages %}{{ m.content }}", encoding="utf-8")
+        (d / "raises.jinja").write_text("{{ raise_exception('no system messages here') }}", encoding="utf-8")
+        (d / "latin1.jinja").write_bytes("{{ messages }} caf\xe9".encode("latin-1"))
+        (d / "ok.jinja").write_text(TEMPLATE, encoding="utf-8")
+        cases = [(("--chat-template-file", str(d / "missing.jinja")), "--chat-template-file: cannot read"),
+                 (("--chat-template-file", str(d / "syntax.jinja")), "does not compile"),
+                 (("--chat-template-file", str(d / "raises.jinja")), "no system messages here"),
+                 (("--chat-template-file", str(d / "latin1.jinja")), "is not UTF-8"),
+                 (("--chat-template", "llama3"), "the only built-in name is chatml"),
+                 (("--chat-template", "{{ nope("), "--chat-template: the template does not compile"),
+                 (("--chat-template", "chatml", "--chat-template-file", str(d / "syntax.jinja")), "does not compile")]
+        for argv, want in cases:
+            code, err, _ = self._main(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertIn(want, err, argv)
+        # the last of the two options wins (one setting, as in llama-server)
+        code, err, calls = self._main("--chat-template-file", str(d / "syntax.jinja"), "--chat-template", "chatml")
+        self.assertEqual((code, [c.args for c in calls]), (None, [("inline", "chatml")]), err)
+        code, err, calls = self._main("--chat-template", "llama3", "--chat-template-file", str(d / "ok.jinja"))
+        self.assertEqual((code, [c.args for c in calls]), (None, [("file", str(d / "ok.jinja"))]), err)
+        self.assertIn("chat template: " + str(d / "ok.jinja"), err)
+        self.assertEqual(self._main()[0:3:2], (None, []))  # (no option: the GGUF's, nothing read)
 
 
 if __name__ == "__main__":

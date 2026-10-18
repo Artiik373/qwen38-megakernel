@@ -282,7 +282,8 @@ python3 server/mk_server.py -m ~/models/Qwen3.8-27B-UD-Q4_K_XL.gguf -c 120000 --
 Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `-c` context [32768], `-d` drafts [4],
 `--kv auto|f16|q8` [auto: q8_0 only when fp16 does not fit], `--draft-vocab` [draft_vocab_32k.bin], `--mtp FILE` (the
 MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decoding; env `MK_NO_MTP=1`), `--exact-reuse`
-[off; the launchers turn it on], `--ck-every n` (a checkpoint every n prompt tokens [4096], 0 = off), `--ck-msgs 1|0`
+[off; the launchers turn it on], `--chat-template-file PATH` / `--chat-template TEMPLATE` [the GGUF's; below],
+`--ck-every n` (a checkpoint every n prompt tokens [4096], 0 = off), `--ck-msgs 1|0`
 (a checkpoint at each message start [1]), `--mmproj` (images, below), `--vision-backend auto|cpu|mtmd` [auto],
 `--vision-threads` [0 = every logical CPU but two], `--image-min-tokens` / `--image-max-tokens` [the mmproj's],
 `--image-cache` [8; images kept between requests], `--video-fps` [4], `--video-max-tokens` [0 = the image limit],
@@ -293,6 +294,14 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   `reasoning_content`, Qwen's XML tool calls are returned as structured `tool_calls`. A call counts only with both
   closing tags (`</function>`, `</tool_call>`): one cut by `max_tokens` (or left open) is returned as text at the end
   of `content`, and the reply ends with `finish_reason` "length" (complete calls before it are still returned).
+- **Chat template option** (llama-server's): `--chat-template-file PATH` (the file's text, UTF-8; CRLF line ends are
+  read as LF, as llama-server on Windows reads them) or `--chat-template TEMPLATE` (the Jinja source itself, or
+  `chatml`) replaces the GGUF's template everywhere: chat and Anthropic requests, `/apply-template`, token counts,
+  `/props` `chat_template`; the last of the two options given wins. The server does not start (it exits before it
+  opens the port) when the file cannot be read, the template does not compile, or it fails on a short conversation
+  (system, user, assistant, user). A GGUF without a template gets ChatML, as in llama-server. Use: a fine-tune of the
+  same model whose GGUF ships Qwen's original template (a 400 for a `developer` message, a second system message, a
+  turn without a user query, `reasoning_effort` "high") served with unsloth's.
 - Successive requests of a conversation only prefill what is new: the prompt is matched against the engine's sequence
   (prompts + emitted tokens). When the new prompt diverges inside what the engine already processed (an edited message,
   a re-rendered thinking block or tool call), the engine rewinds to the last DeltaNet checkpoint at or before the

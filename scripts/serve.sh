@@ -24,6 +24,7 @@
 #   MK_MTP              the MTP draft layer from a separate GGUF of the same model (e.g. an mtp-*.gguf), for a model
 #                       file without one or instead of the file's own
 #   MK_NO_MTP=1         no MTP layer: plain decoding, depth 0 (also automatic for a model file without one)
+#   MK_CHAT_TEMPLATE_FILE  a Jinja chat template file used instead of the GGUF's (--chat-template-file, as llama-server)
 #   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS, MK_MAX_VIDEO_FRAMES
 #                       request limits: body size (default 128 MB), images per request (32), pixels per image
 #                       (100,000,000; checked before decoding), video frames per request (256)
@@ -39,6 +40,8 @@ PY="${MK_PYTHON:-python3}"
 if [ "$CTX" -gt 96000 ]; then export MK_PF_CAP="${MK_PF_CAP:-1024}"; fi
 XR=(--exact-reuse) XS=on
 [ "${MK_EXACT_REUSE:-1}" = 0 ] && XR=() XS=off
+CT=()
+[ -n "${MK_CHAT_TEMPLATE_FILE:-}" ] && CT=(--chat-template-file "$MK_CHAT_TEMPLATE_FILE")
 if [ -n "${MK_MMPROJ+x}" ]; then MMPROJ="$MK_MMPROJ"
 else MMPROJ=$(ls "$(dirname "$MODEL")/mmproj-BF16.gguf" "$HOME/models/mmproj-BF16.gguf" "$HOME/models/mmproj-Qwen3.8-27B-BF16.gguf" \
                     2>/dev/null | head -n1 || true)
@@ -50,6 +53,7 @@ if [ -n "$MMPROJ" ] && [ -f "$MMPROJ" ] && [ -f "$HERE/libqwen38vision.so" ]; th
     VS="on the CPU ($(basename "$MMPROJ"))"
 fi
 echo "megakernel: $MODEL, ctx $CTX, KV q8_0${MK_KV:+ + MK_KV=$MK_KV (window ${MK_KV_WIN:-off})}, ${MK_DRAFT:-7} MTP drafts," \
-     "prefill chunk ${MK_PF_CAP:-2048}, exact reuse $XS, images $VS, http://${MK_HOST:-127.0.0.1}:$PORT"
+     "prefill chunk ${MK_PF_CAP:-2048}, exact reuse $XS, images $VS${MK_CHAT_TEMPLATE_FILE:+, chat template $MK_CHAT_TEMPLATE_FILE}," \
+     "http://${MK_HOST:-127.0.0.1}:$PORT"
 exec "$PY" "$HERE/server/mk_server.py" -m "$MODEL" --host "${MK_HOST:-127.0.0.1}" --port "$PORT" -c "$CTX" --kv q8 \
-    -d "${MK_DRAFT:-7}" "${XR[@]}" "${VA[@]}"
+    -d "${MK_DRAFT:-7}" "${XR[@]}" "${VA[@]}" "${CT[@]}"
