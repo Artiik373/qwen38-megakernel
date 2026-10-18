@@ -320,9 +320,10 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   An image the request encodes on the CPU (up to ~3.5 s for 1024 tokens, after the engine calls that stopped the load)
   re-arms it first, so the GPU stays warm until the prefill's first launch.
   `MK_KEEP_WARM_LOAD=blocks,threads,on_ms,off_ms,spin` changes the load (for measurements).
-- Sampling: temperature [0.8], top_p [0.95], top_k (1..32; absent or <= 0 means 32, the engine's maximum; above 32 is
-  clamped with a one-time warning), min_p [0.05], seed, presence_penalty / frequency_penalty (-2..2, vLLM's semantics:
-  the tokens generated in this response); repetition_penalty is ignored (with a warning). One request at a time.
+- Sampling (defaults in [], Unsloth's thinking-mode preset for Qwen3.8): temperature [1.0], top_p [0.95], top_k [20]
+  (1..32; <= 0 means 32, the engine's maximum; above 32 is clamped with a one-time warning), min_p [0], seed,
+  presence_penalty / frequency_penalty (-2..2, vLLM's semantics: the tokens generated in this response);
+  repetition_penalty is ignored (with a warning). One request at a time.
 - Request fields the engine cannot honour are a 400 naming the field, never ignored silently: `n` > 1, `logprobs` /
   `top_logprobs` / `n_probs`, `logit_bias`, `response_format` other than `{"type": "text"}`, `json_schema`, `grammar`,
   `tool_choice` other than "auto" / "none" (forcing a call needs constrained sampling), legacy `functions`,

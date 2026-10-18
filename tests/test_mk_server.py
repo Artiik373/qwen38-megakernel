@@ -196,8 +196,12 @@ class MegakernelSamplingTests(unittest.TestCase):
         srv.sampling({"temperature": 0.7, "seed": 1, **body})
         return srv.eng.sampling[2], srv.warned
 
-    def test_top_k_absent_or_off_is_the_engine_maximum_without_a_warning(self) -> None:
-        for body in ({}, {"top_k": None}, {"top_k": 0}, {"top_k": -1}):
+    def test_top_k_absent_is_the_default_without_a_warning(self) -> None:
+        for body in ({}, {"top_k": None}):
+            self.assertEqual(self._top_k(body), (self.mk.DEF_TOP_K, set()), body)
+
+    def test_top_k_off_is_the_engine_maximum_without_a_warning(self) -> None:
+        for body in ({"top_k": 0}, {"top_k": -1}):
             self.assertEqual(self._top_k(body), (self.mk.TOPK_MAX, set()), body)
 
     def test_top_k_in_range_is_kept(self) -> None:

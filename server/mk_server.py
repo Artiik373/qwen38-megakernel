@@ -8,7 +8,7 @@ POST /v1/chat/completions (streaming or not): the request is rendered with the c
 in the GGUF, or the one given by --chat-template-file / --chat-template (llama-server's options), with
 enable_thinking / preserve_thinking / reasoning_effort via chat_template_kwargs and tools via `tools`;
 reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured `tool_calls`.
-Sampling: temperature, top_p, top_k (1..32; absent or <= 0: 32, the engine's maximum), min_p, seed; stop strings
+Sampling: temperature, top_p, top_k (1..32; <= 0: 32, the engine's maximum), min_p, seed; stop strings
 (`stop`).  Successive requests of a conversation reuse the processed tokens: the new prompt is
 matched against the sequence so far and only the rest is prefilled. When the new prompt diverges inside
 what the engine already processed, it rewinds to the last DeltaNet checkpoint at or before the
@@ -57,7 +57,8 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOPK_MAX = 32
-DEF_TEMP, DEF_TOP_P, DEF_MIN_P = 0.8, 0.95, 0.05  # sampling defaults (a request's absent / null fields)
+# sampling defaults (a request's absent / null fields): Unsloth's thinking-mode preset for Qwen3.8
+DEF_TEMP, DEF_TOP_P, DEF_TOP_K, DEF_MIN_P = 1.0, 0.95, 20, 0.0
 # request limits; main() reads them from the environment
 MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64 data: URLs fit)
 MAX_IMAGES = 32  # MK_MAX_IMAGES: images per request
@@ -1387,7 +1388,7 @@ class Server:
     def props(self):
         """llama-server's GET /props fields we have, plus `engine` (engine_info)"""
         b = getattr(self.eng, "build", None) or {}
-        params = {"temperature": DEF_TEMP, "top_k": TOPK_MAX, "top_p": DEF_TOP_P, "min_p": DEF_MIN_P, "seed": -1,
+        params = {"temperature": DEF_TEMP, "top_k": DEF_TOP_K, "top_p": DEF_TOP_P, "min_p": DEF_MIN_P, "seed": -1,
                   "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": -1, "n_predict": -1, "stop": [],
                   "stream": False, "n_probs": 0}
         return {
@@ -1611,12 +1612,12 @@ class Server:
         return r
 
     def sampling(self, body):
-        """top_k: absent or <= 0 ("off" for llama.cpp / OpenAI-style clients) -> TOPK_MAX, the engine's maximum;
-        above TOPK_MAX -> TOPK_MAX with a one-time warning"""
+        """top_k: absent -> DEF_TOP_K; <= 0 ("off" for llama.cpp / OpenAI-style clients) -> TOPK_MAX, the engine's
+        maximum; above TOPK_MAX -> TOPK_MAX with a one-time warning"""
         try:
             temp = float(body["temperature"] if body.get("temperature") is not None else DEF_TEMP)
             top_p = float(body["top_p"] if body.get("top_p") is not None else DEF_TOP_P)
-            top_k = int(body["top_k"]) if body.get("top_k") is not None else TOPK_MAX
+            top_k = int(body["top_k"]) if body.get("top_k") is not None else DEF_TOP_K
             min_p = float(body["min_p"] if body.get("min_p") is not None else DEF_MIN_P)
             seed = body.get("seed")
             seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)

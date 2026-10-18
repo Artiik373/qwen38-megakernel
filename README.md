@@ -227,8 +227,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 ```
 
 What the API supports:
-- **Sampling:** temperature, top_p, top_k (1..32; absent or <= 0 means 32), min_p, seed, and presence / frequency
-  penalty. Absent values default to temperature 0.8, top_p 0.95 and min_p 0.05. There is no repetition penalty.
+- **Sampling:** temperature, top_p, top_k (1..32; <= 0 means 32), min_p, seed, and presence / frequency penalty.
+  Absent values default to Unsloth's thinking-mode preset for Qwen3.8: temperature 1.0, top_p 0.95, top_k 20 and
+  min_p 0. There is no repetition penalty.
 - **Chat template:** the one stored in the GGUF, with `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...)
   and OpenAI `tools`; `--chat-template-file` replaces it, as in llama-server (`MK_CHAT_TEMPLATE_FILE` in the launchers).
   Example: a fine-tune whose GGUF ships Qwen's original template answers a `developer` message, a second system
