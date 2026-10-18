@@ -164,7 +164,10 @@ int8; `=2`: one Q scale per row instead of per 32 dims), `MK_DATTN=0` (q8 cache:
 attention; same output), `MK_MTP_Q4=0` (the MTP block in its stored types, see [The GGUF](#the-gguf)),
 `MK_MTP_WIN=n` (the MTP block's decode attention sees the last n positions only; output stays exact, acceptance can
 change), `MK_REENC3=1` / `MK_IQ4NL_Q8=1` / `MK_AB_F32=1` / `MK_PF_GLU_MIX=0` (the earlier load and prefill paths
-named in [The GGUF](#the-gguf)), `MK_MEMLOG=1` (device memory per load step). Compile-time options for tests and
+named in [The GGUF](#the-gguf)), `MK_MEMLOG=1` (device memory per load step), `MK_POISON=1` (test: every device
+allocation is filled with 0xFF bytes, NaN in fp32 / fp16, instead of zeros, so an output that reads memory nothing wrote
+changes; the arrival counters that start at 0 by design stay zeroed; `MK_POISON_SKIP=i,j` / `MK_POISON_LOG=1` bisect
+by allocation number). Compile-time options for tests and
 analysis: `-DMK_SPEC_LOG=1` (with `MK_SPEC_LOG_FILE=path`: one JSON line per decode cycle), `-DMK_TEST_NAN=1` (with
 `MK_TEST_NAN_AT=n`: poisons the first attention layer's K scales before decode launch n; the engine must stop with an
 error and the server answer HTTP 500, or an error event in a started stream, and recover), `-DMK_KV_EMU=1` (scores

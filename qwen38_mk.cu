@@ -6127,10 +6127,24 @@ struct MKEngine::Impl {
     // MK_CUDAMALLOC=1: plain cudaMalloc.
     bool pool_init = false, use_pool = true;
     double dalloc_s = 0; // time in dalloc (load report)
-    template <class T> T * dalloc(size_t n, bool zero = true) {
+    // MK_POISON=1 (test runs, read-before-write check): every device allocation is filled with 0xFF bytes (NaN in fp32 /
+    // fp16, -1 in integers) instead of zeros, the weight buffers too (their padding), except DA_INIT0 buffers, whose zeros
+    // are their initial value (arrival counters). An output that differs from a normal run's read memory nothing wrote.
+    // MK_POISON_SKIP=i,j,..: allocations number i, j zero-filled instead (bisecting); MK_POISON_LOG=1 lists every one.
+    static constexpr int DA_INIT0 = 2; // dalloc fill: zeros that are the buffer's initial value (kept under MK_POISON)
+    bool poison = false;               // (read on the first dalloc)
+    std::vector<long> poison_skip;
+    long n_dalloc = 0;
+    template <class T> T * dalloc(size_t n, int zero = 1) {
         void * p;
         if (!pool_init) {
             pool_init = true;
+            poison = getenv("MK_POISON") && atoi(getenv("MK_POISON")) != 0;
+            if (poison) {
+                for (const char * s = getenv("MK_POISON_SKIP"); s && *s; s = strchr(s, ',') ? strchr(s, ',') + 1 : "")
+                    poison_skip.push_back(atol(s));
+                fprintf(stderr, "[mk] MK_POISON=1: device allocations filled with 0xFF bytes (test mode; %zu skipped)\n", poison_skip.size());
+            }
             const char * cm = getenv("MK_CUDAMALLOC");
             int ok = 0;
             cudaDeviceGetAttribute(&ok, cudaDevAttrMemoryPoolsSupported, 0);
@@ -6149,7 +6163,15 @@ struct MKEngine::Impl {
         } else {
             CK(cudaMalloc(&p, n * sizeof(T) + 16));
         }
-        if (zero) CK(cudaMemset(p, 0, n * sizeof(T) + 16));
+        if (poison) {
+            const bool skip = zero == DA_INIT0 || std::find(poison_skip.begin(), poison_skip.end(), n_dalloc) != poison_skip.end();
+            CK(cudaMemset(p, skip ? 0 : 0xff, n * sizeof(T) + 16));
+            CK(cudaStreamSynchronize(0)); // (before an upload on another stream writes the buffer)
+            if (getenv("MK_POISON_LOG")) fprintf(stderr, "[mk-poison] #%ld %zu bytes%s\n", n_dalloc, n * sizeof(T), skip ? " zeroed" : "");
+        } else if (zero) {
+            CK(cudaMemset(p, 0, n * sizeof(T) + 16));
+        }
+        n_dalloc++;
         dalloc_s += lsec(ta);
         allocs.push_back(p);
         alloc_bytes += n * sizeof(T) + 16;
@@ -7207,7 +7229,7 @@ struct MKEngine::Impl {
         hb.ctl = dalloc<Ctl>(1);
 #if MK_WV
         hb.wvpart = dalloc<float>((size_t) WV_S * MAXT * D);
-        hb.wvcnt = dalloc<unsigned>(2 * (D / 32));
+        hb.wvcnt = dalloc<unsigned>(2 * (D / 32), DA_INIT0); // (starts at 0; the last arrival of each use resets it)
 #endif
         profiling = getenv("MK_PROFILE") != nullptr;
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
@@ -8610,7 +8632,7 @@ struct MKEngine::Impl {
     void set_penalty(float pres, float freq) {
         if (!std::isfinite(pres) || !std::isfinite(freq)) throw std::runtime_error("penalties must be finite");
         if ((pres != 0.f || freq != 0.f) && !hb.pcnt) {
-            hb.pcnt = dalloc<unsigned short>(VOCAB);
+            hb.pcnt = dalloc<unsigned short>(VOCAB, DA_INIT0); // (the first response's counts start from these zeros)
             CK(cudaMemcpyToSymbol(cB, &hb.pcnt, sizeof(hb.pcnt), offsetof(Bufs, pcnt)));
             mem_mark("penalty counts");
         }
