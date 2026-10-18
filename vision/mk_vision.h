@@ -52,6 +52,12 @@ int mkv_backend(const mkv_ctx * ctx);
 // An image of more than MK_IMAGE_MAX_PIXELS pixels (environment, read by mkv_new; default 100,000,000) is refused from
 // its header, before decoding.
 mkv_image * mkv_image_load(mkv_ctx * ctx, const unsigned char * data, size_t len);
+// Video: one frame, or a pair of consecutive frames (Qwen-VL's temporal patch of 2: llama.cpp's merged frame pair, one
+// grid of tokens for both), from raw RGB8 pixels (nx * ny * 3 bytes each, as ffmpeg's rgb24); rgb1 NULL: one frame,
+// which is encoded exactly as a still image of these pixels. Each frame is preprocessed as an image (smart resize);
+// max_tokens > 0: that token limit instead of the context's max_tokens (cpu backend only; mtmd: an error). Then as an
+// image: mkv_image_grid / mkv_image_encode / mkv_image_rows / mkv_image_free. NULL on error.
+mkv_image * mkv_frames_load(mkv_ctx * ctx, const unsigned char * rgb0, const unsigned char * rgb1, int nx, int ny, int max_tokens);
 // grid of merged image tokens (columns, rows); returns nx * ny, the number of embedding rows
 int mkv_image_grid(const mkv_image * im, int * nx, int * ny);
 // Runs the encoder (CPU); 0, or -1 (mkv_last_error). A second call returns at once.

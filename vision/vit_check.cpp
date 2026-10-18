@@ -1,9 +1,12 @@
 // Test tool (not part of the library): the CPU encoder (vit_cpu) against libmtmd on the same images.
-//   vit_check -m model.gguf --mmproj mmproj.gguf [-t threads] [-r reps] [--dump prefix] [--max-tokens n] image...
+//   vit_check -m model.gguf --mmproj mmproj.gguf [-t threads] [-r reps] [--dump prefix] [--max-tokens n] [--pair] image...
 // Per image: (a) libmtmd's own path (decode, preprocess, encode: what llama-server feeds), (b) libmtmd's encoder on
 // vit_cpu's preprocessed pixels (clip_image_encode; a == b bit for bit means the preprocessing is llama.cpp's),
 // (c) vit_cpu. Reports the differences and times; --dump writes <prefix>.<i>.{img,mtmd,vit}.f32 (+ .txt dims) for
 // the fp64 reference (vit_ref.py). Uses libmtmd's internal clip API (clip.h, clip-impl.h): a test, nothing ships it.
+// --pair: the images two at a time as video frame pairs (same size): (a) libmtmd's merged pair (mtmd_tokenize of two
+// bitmaps), (b) clip_image_batch_encode of vit_cpu's two preprocessed frames, (c) vit_cpu encode_pair; --dump adds
+// <prefix>.<i>.img2.f32 (the second frame).
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -70,6 +73,7 @@ static Diff compare(const float * a, const float * b, int rows, int ne) {
 int main(int argc, char ** argv) {
     const char * model = nullptr, * mmproj = nullptr, * prefix = nullptr;
     int threads = 0, reps = 1, max_tok = 0;
+    bool pair = false;
     std::vector<const char *> imgs;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -80,6 +84,7 @@ int main(int argc, char ** argv) {
         else if (a == "-r") reps = atoi(next());
         else if (a == "--dump") prefix = next();
         else if (a == "--max-tokens") max_tok = atoi(next());
+        else if (a == "--pair") pair = true;
         else imgs.push_back(argv[i]);
     }
     if (!model || !mmproj || imgs.empty()) {
@@ -115,7 +120,100 @@ int main(int argc, char ** argv) {
     mkv::Vit vit(mmproj, vp);
     printf("vit_cpu: %d threads, loaded in %.0f ms\n", vit.n_threads(), now_ms() - tl);
     const int ne = vit.n_embd();
-    for (size_t k = 0; k < imgs.size(); k++) {
+    for (size_t k = 0; pair && k + 1 < imgs.size(); k += 2) {
+        mtmd_helper_bitmap_wrapper bw[2];
+        for (int f = 0; f < 2; f++) {
+            const std::vector<unsigned char> b = read_file(imgs[k + f]);
+            bw[f] = mtmd_helper_bitmap_init_from_buf(mt, b.data(), b.size(), false);
+            if (!bw[f].bitmap) {
+                fprintf(stderr, "%s: cannot decode\n", imgs[k + f]);
+                return 3;
+            }
+        }
+        const int nx = (int) mtmd_bitmap_get_nx(bw[0].bitmap), ny = (int) mtmd_bitmap_get_ny(bw[0].bitmap);
+        if ((int) mtmd_bitmap_get_nx(bw[1].bitmap) != nx || (int) mtmd_bitmap_get_ny(bw[1].bitmap) != ny) {
+            fprintf(stderr, "%s / %s: frames of different sizes\n", imgs[k], imgs[k + 1]);
+            return 3;
+        }
+        // (a) libmtmd: two consecutive markers, the bitmaps merged into one chunk
+        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+        const std::string two = std::string(mtmd_default_marker()) + mtmd_default_marker();
+        mtmd_input_text txt = {two.c_str(), two.size(), false, true};
+        const mtmd_bitmap * bms[2] = {bw[0].bitmap, bw[1].bitmap};
+        if (mtmd_tokenize(mt, chunks, &txt, bms, 2) != 0) return 4;
+        const mtmd_input_chunk * img = nullptr;
+        int n_img = 0;
+        for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++)
+            if (mtmd_input_chunk_get_type(mtmd_input_chunks_get(chunks, i)) == MTMD_INPUT_CHUNK_TYPE_IMAGE) img = mtmd_input_chunks_get(chunks, i), n_img++;
+        if (n_img != 1) {
+            fprintf(stderr, "libmtmd made %d image chunks of the pair (expected 1)\n", n_img);
+            return 4;
+        }
+        const size_t nt = mtmd_image_tokens_get_n_tokens(mtmd_input_chunk_get_tokens_image(img));
+        double ta = 1e30;
+        for (int r = 0; r < reps; r++) {
+            const double t0 = now_ms();
+            if (mtmd_encode_chunk(mt, img) != 0) return 5;
+            ta = std::min(ta, now_ms() - t0);
+        }
+        std::vector<float> ra(mtmd_get_output_embd(mt), mtmd_get_output_embd(mt) + nt * ne);
+        // vit_cpu's preprocessing of each frame
+        std::vector<float> pix[2];
+        int tw = 0, th = 0;
+        for (int f = 0; f < 2; f++) vit.preprocess(mtmd_bitmap_get_data(bw[f].bitmap), nx, ny, pix[f], tw, th);
+        const int nv = (tw / 32) * (th / 32);
+        // (b) libmtmd's encoder on those pixels, the two frames as its batch (= temporal) dimension
+        clip_image_f32_batch batch;
+        for (int f = 0; f < 2; f++) {
+            clip_image_f32 cim;
+            cim.set_size({tw, th}, false, false);
+            cim.cpy_buf(pix[f]);
+            batch.entries.push_back(std::move(cim));
+        }
+        std::vector<float> rb(nt * ne);
+        if (!clip_image_batch_encode(cc, cp.n_threads, &batch, rb)) return 6;
+        // (c) vit_cpu
+        std::vector<float> rc((size_t) nv * ne);
+        double tc = 1e30, ph[5] = {};
+        for (int r = 0; r < reps; r++) {
+            vit.encode_pair(pix[0].data(), pix[1].data(), tw, th, rc.data());
+            if (vit.ms[4] < tc) {
+                tc = vit.ms[4];
+                memcpy(ph, vit.ms, sizeof(ph));
+            }
+        }
+        printf("pair %s + %s: %d x %d -> %d x %d px, %zu tokens (vit %d)\n", imgs[k], imgs[k + 1], nx, ny, tw, th, nt, nv);
+        if ((size_t) nv != nt || rb.size() != nt * ne) {
+            printf("   TOKEN COUNT MISMATCH\n");
+            return 7;
+        }
+        const Diff ab = compare(ra.data(), rb.data(), (int) nt, ne), ac = compare(ra.data(), rc.data(), (int) nt, ne);
+        printf("   preprocessing: mtmd pair path vs mtmd encoder on vit_cpu pixels: %s (rel %.3g, max |d| %.3g)\n",
+               ab.maxabs == 0 ? "IDENTICAL" : "differ", ab.rel, ab.maxabs);
+        printf("   vit_cpu pair vs mtmd pair: rel L2 %.4g, max |d| %.4g, min row cosine %.6f\n", ac.rel, ac.maxabs, ac.mincos);
+        {   // control: the pair against the first frame encoded as a still (the second kernel matters)
+            std::vector<float> rs((size_t) nv * ne);
+            vit.encode(pix[0].data(), tw, th, rs.data());
+            const Diff s = compare(ra.data(), rs.data(), (int) nt, ne);
+            printf("   control, mtmd pair vs vit_cpu still of frame 1: rel L2 %.4g, min row cosine %.6f\n", s.rel, s.mincos);
+        }
+        printf("   time: mtmd %.0f ms (%d threads), vit_cpu %.0f ms (%d threads: patch %.0f, gemm %.0f, attn %.0f, merger %.0f)\n",
+               ta, cp.n_threads, tc, vit.n_threads(), ph[0], ph[1], ph[2], ph[3]);
+        if (prefix) {
+            const std::string p = std::string(prefix) + "." + std::to_string(k / 2);
+            dump(p + ".img.f32", pix[0].data(), pix[0].size());
+            dump(p + ".img2.f32", pix[1].data(), pix[1].size());
+            dump(p + ".mtmd.f32", ra.data(), ra.size());
+            dump(p + ".vit.f32", rc.data(), rc.size());
+            FILE * f = fopen((p + ".txt").c_str(), "w");
+            fprintf(f, "%d %d %zu %d\n", tw, th, nt, ne);
+            fclose(f);
+        }
+        fflush(stdout);
+        mtmd_input_chunks_free(chunks);
+        for (auto & w : bw) mtmd_bitmap_free(w.bitmap);
+    }
+    for (size_t k = 0; !pair && k < imgs.size(); k++) {
         const std::vector<unsigned char> b = read_file(imgs[k]);
         mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_buf(mt, b.data(), b.size(), false);
         if (!bw.bitmap) {

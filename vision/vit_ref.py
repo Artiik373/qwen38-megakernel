@@ -3,7 +3,9 @@ preprocessed image (<prefix>.<i>.img.f32 + .txt), compared with its dumped libmt
 (.vit.f32). Same graph as llama.cpp's clip (models/qwen3vl.cpp), every op in float64.
 Writes the reference rows (rounded to fp32) to <prefix>.<i>.f64.f32. Needs numpy and gguf-py (pip install gguf, or
 LLAMA=<llama.cpp checkout>). Usage: python vit_ref.py <mmproj.gguf> <dump prefix> <i> [<i> ...]
-(the dumps: tools/vit_check ... --dump <prefix> image...)"""
+(the dumps: tools/vit_check ... --dump <prefix> image...; with a <prefix>.<i>.img2.f32 (vit_check --pair) the two
+frames are a video frame pair: the first through the patch embedding's first temporal kernel, the second through the
+other)"""
 import os
 import sys
 import time
@@ -25,8 +27,10 @@ def W(name):
 
 
 D, nH, HD, nL = 1152, 16, 72, 27
-pe0 = W("v.patch_embd.weight") + W("v.patch_embd.weight.1")  # [1152][3][16][16]
+Wt0, Wt1 = W("v.patch_embd.weight"), W("v.patch_embd.weight.1")  # [1152][3][16][16] each (the temporal kernels)
+pe0 = Wt0 + Wt1
 Wp = pe0.reshape(D, 768)
+Wt0, Wt1 = Wt0.reshape(D, 768), Wt1.reshape(D, 768)
 bp = W("v.patch_embd.bias")
 pos = W("v.position_embd.weight")  # [2304][1152]
 S = int(round(np.sqrt(pos.shape[0])))
@@ -51,16 +55,19 @@ def gelu(x):  # tanh form (ggml_gelu)
     return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
 
 
-def encode(img, tw, th):
+def encode(img, tw, th, img2=None):
     pw, ph = tw // 16, th // 16
     M = pw * ph
     t = np.arange(M)
     g, q = t >> 2, t & 3
     px = 2 * (g % (pw // 2)) + (q & 1)
     py = 2 * (g // (pw // 2)) + (q >> 1)
-    im = img.reshape(th, tw, 3).astype(np.float64)
-    patches = np.stack([im[y * 16:(y + 1) * 16, x * 16:(x + 1) * 16, :].transpose(2, 0, 1).reshape(768)
-                        for x, y in zip(px, py)])
+
+    def patchify(a):
+        im = a.reshape(th, tw, 3).astype(np.float64)
+        return np.stack([im[y * 16:(y + 1) * 16, x * 16:(x + 1) * 16, :].transpose(2, 0, 1).reshape(768)
+                         for x, y in zip(px, py)])
+    patches = patchify(img)
     # learned position embedding, bilinear with align corners from S x S to pw x ph
     sf0 = (pw - 1) / (S - 1) if pw > 1 else pw / S
     sf1 = (ph - 1) / (S - 1) if ph > 1 else ph / S
@@ -72,7 +79,10 @@ def encode(img, tw, th):
     dy = np.clip(sy - y0, 0, 1)[:, None]
     pemb = (pos[y0, x0] * (1 - dx) * (1 - dy) + pos[y0, x1] * dx * (1 - dy) + pos[y1, x0] * (1 - dx) * dy
             + pos[y1, x1] * dx * dy)
-    x = patches @ Wp.T + bp + pemb
+    if img2 is None:
+        x = patches @ Wp.T + bp + pemb
+    else:
+        x = patches @ Wt0.T + patchify(img2) @ Wt1.T + bp + pemb
     # vision RoPE: pairs (i, i + 36); i < 18 by row (py), i >= 18 by column (px)
     i = np.arange(36)
     freq = 10000.0 ** (-2.0 * (i % 18) / 36)
@@ -117,9 +127,11 @@ for i in sys.argv[3:]:
     p = f"{prefix}.{i}"
     tw, th, nt, ne = map(int, open(p + ".txt").read().split())
     img = np.fromfile(p + ".img.f32", np.float32)
+    img2 = np.fromfile(p + ".img2.f32", np.float32) if os.path.exists(p + ".img2.f32") else None
     t0 = time.time()
-    ref = encode(img, tw, th)
-    print(f"image {i}: {tw} x {th}, {nt} tokens, fp64 reference in {time.time() - t0:.0f} s", flush=True)
+    ref = encode(img, tw, th, img2)
+    print(f"{'frame pair' if img2 is not None else 'image'} {i}: {tw} x {th}, {nt} tokens, fp64 reference in "
+          f"{time.time() - t0:.0f} s", flush=True)
     ref.astype(np.float32).tofile(p + ".f64.f32")  # (the reference rows, rounded to fp32)
     for name in ("mtmd", "vit"):
         cmp(name, ref, np.fromfile(f"{p}.{name}.f32", np.float32).reshape(nt, ne).astype(np.float64))

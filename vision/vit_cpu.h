@@ -30,14 +30,21 @@ class Vit {
     Vit(const std::string & mmproj, const Params & p);
     ~Vit();
 
-    // llama.cpp's smart resize: the size an image of w x h is resized to (multiples of 32)
-    void target_size(int w, int h, int & tw, int & th) const;
+    // llama.cpp's smart resize: the size an image of w x h is resized to (multiples of 32); max_tokens > 0: that limit
+    // instead of Params::max_tokens (video frames)
+    void target_size(int w, int h, int & tw, int & th, int max_tokens = 0) const;
     // RGB8 (nx * ny * 3, as stb_image decodes it) -> llama.cpp's preprocessed image: bilinear resize to target_size,
-    // u8, then (x / 255 - mean) / std; fp32, HWC
+    // u8, then (x / 255 - mean) / std; fp32, HWC. preprocess = resize, then normalize.
     void preprocess(const uint8_t * rgb, int nx, int ny, std::vector<float> & img, int & tw, int & th) const;
+    void resize(const uint8_t * rgb, int nx, int ny, std::vector<uint8_t> & dst, int & tw, int & th, int max_tokens = 0) const;
+    void normalize(const uint8_t * px, size_t n, float * img) const;
     // preprocessed image (HWC, tw and th multiples of 32) -> (tw / 32) * (th / 32) rows of n_embd(), raster order of the
     // merged 2x2 patch groups (row-major, tw / 32 per row)
     void encode(const float * img, int tw, int th, float * out);
+    // two video frames of the same size as one grid (Qwen-VL's temporal patch of 2, llama.cpp's merged frame pair):
+    // the first through the patch embedding's first temporal kernel, the second through the other (a still image is
+    // a pair of equal frames: encode() runs it with the kernels' sum); the same rows as encode() otherwise
+    void encode_pair(const float * img0, const float * img1, int tw, int th, float * out);
 
     int n_embd() const;    // projection size (the text model's embedding size)
     int n_threads() const;
@@ -45,6 +52,7 @@ class Vit {
     double ms[5] = {};
 
   private:
+    void encode_(const float * img0, const float * img1, int tw, int th, float * out);
     struct Impl;
     std::unique_ptr<Impl> p_;
 };

@@ -488,7 +488,7 @@ struct Vit::Impl {
         std::vector<float> ln1w, ln1b, ln2w, ln2b;
     };
     std::vector<Layer> L;
-    PW patch_w, mm0, mm2;
+    PW patch_w, patch_w2, mm0, mm2; // patch_w2: video frame pairs, the two temporal kernels side by side (K = 2 x 768)
     std::vector<float> pos_embd, post_w, post_b;
     // scratch
     Buf x, qkv, ap0, ap1, kp, vp, rope;
@@ -615,12 +615,22 @@ Vit::Vit(const std::string & mmproj, const Params & prm) {
         pack_w(pool, vec(n, (size_t) N * K), N, K, out);
         out.b = vec(bias, (size_t) N);
     };
-    // patch embedding: the two temporal kernels act on the same frame for a still image, so their sum is the kernel
+    // patch embedding: the two temporal kernels act on the same frame for a still image, so their sum is the kernel;
+    // a video frame pair has one frame per kernel: [w0 | w1] on the two frames' patches side by side
     {
         std::vector<float> w0 = vec("v.patch_embd.weight", (size_t) D * 3 * 256), w1 = vec("v.patch_embd.weight.1", w0.size());
+        {
+            std::vector<float> w2(2 * w0.size());
+            for (int o = 0; o < D; o++) {
+                memcpy(w2.data() + (size_t) o * 2 * 768, w0.data() + (size_t) o * 768, 768 * sizeof(float));
+                memcpy(w2.data() + (size_t) o * 2 * 768 + 768, w1.data() + (size_t) o * 768, 768 * sizeof(float));
+            }
+            pack_w(pool, w2, D, 2 * 3 * 256, I.patch_w2); // [out][frame][c][ky][kx]
+        }
         for (size_t i = 0; i < w0.size(); i++) w0[i] += w1[i];
         pack_w(pool, w0, D, 3 * 256, I.patch_w); // [out][c][ky][kx]
         I.patch_w.b = vec("v.patch_embd.bias", D);
+        I.patch_w2.b = I.patch_w.b;
     }
     {
         std::vector<float> pe = gg.get("v.position_embd.weight");
@@ -649,16 +659,17 @@ Vit::~Vit() = default;
 int Vit::n_embd() const { return p_->n_embd; }
 int Vit::n_threads() const { return p_->pool.size(); }
 
-void Vit::target_size(int width, int height, int & tw, int & th) const {
+void Vit::target_size(int width, int height, int & tw, int & th, int max_tokens) const {
     // mtmd-image.cpp calc_size_preserved_ratio (smart resize), float arithmetic as there
     const int f = p_->patch * p_->merge;
+    const int max_pixels = max_tokens > 0 ? max_tokens * f * f : p_->max_pixels;
     auto round_by = [f](float x) { return static_cast<int>(std::round(x / static_cast<float>(f))) * f; };
     auto ceil_by = [f](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
     auto floor_by = [f](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
     int h_bar = std::max(f, round_by((float) height));
     int w_bar = std::max(f, round_by((float) width));
-    if (h_bar * w_bar > p_->max_pixels) {
-        const auto beta = std::sqrt(static_cast<float>(height * width) / p_->max_pixels);
+    if (h_bar * w_bar > max_pixels) {
+        const auto beta = std::sqrt(static_cast<float>(height * width) / max_pixels);
         h_bar = std::max(f, floor_by(height / beta));
         w_bar = std::max(f, floor_by(width / beta));
     } else if (h_bar * w_bar < p_->min_pixels) {
@@ -671,10 +682,24 @@ void Vit::target_size(int width, int height, int & tw, int & th) const {
 }
 
 void Vit::preprocess(const uint8_t * rgb, int nx, int ny, std::vector<float> & img, int & tw, int & th) const {
-    target_size(nx, ny, tw, th);
+    std::vector<uint8_t> dst;
+    resize(rgb, nx, ny, dst, tw, th);
+    img.resize(dst.size());
+    normalize(dst.data(), dst.size(), img.data());
+}
+
+void Vit::normalize(const uint8_t * px, size_t n, float * img) const {
+    for (size_t i = 0; i < n; i++) {
+        const int c = (int) (i % 3);
+        img[i] = ((float) px[i] / 255.0f - p_->mean[c]) / p_->stdv[c];
+    }
+}
+
+void Vit::resize(const uint8_t * rgb, int nx, int ny, std::vector<uint8_t> & dst, int & tw, int & th, int max_tokens) const {
+    target_size(nx, ny, tw, th, max_tokens);
     // mtmd-image.cpp img_tool::resize with PAD_CEIL (the projector's default): an aspect-preserving bilinear resize,
     // centred on black; the same size: a copy
-    std::vector<uint8_t> dst((size_t) tw * th * 3, 0);
+    dst.assign((size_t) tw * th * 3, 0);
     if (nx == tw && ny == th) {
         memcpy(dst.data(), rgb, dst.size());
     } else {
@@ -700,14 +725,16 @@ void Vit::preprocess(const uint8_t * rgb, int nx, int ny, std::vector<float> & i
                 }
             }
     }
-    img.resize(dst.size());
-    for (size_t i = 0; i < dst.size(); i++) {
-        const int c = (int) (i % 3);
-        img[i] = ((float) dst[i] / 255.0f - p_->mean[c]) / p_->stdv[c];
-    }
 }
 
-void Vit::encode(const float * img, int tw, int th, float * out) {
+void Vit::encode(const float * img, int tw, int th, float * out) { encode_(img, nullptr, tw, th, out); }
+
+void Vit::encode_pair(const float * img0, const float * img1, int tw, int th, float * out) {
+    if (!img1) throw std::runtime_error("vit: a frame pair needs two frames");
+    encode_(img0, img1, tw, th, out);
+}
+
+void Vit::encode_(const float * img, const float * img1, int tw, int th, float * out) {
     Impl & I = *p_;
     Pool & pool = I.pool;
     const double t0 = now_ms();
@@ -758,24 +785,29 @@ void Vit::encode(const float * img, int tw, int th, float * out) {
             }
         });
     }
-    // patch embedding (+ bias) added to it: im2col rows [c][ky][kx] of each 16 x 16 patch, packed
+    // patch embedding (+ bias) added to it: im2col rows [c][ky][kx] of each 16 x 16 patch, packed (a frame pair: the
+    // two frames' rows side by side, [frame][c][ky][kx], against patch_w2)
+    const int nf = img1 ? 2 : 1, KP = nf * 768;
     pool.run((M + MR - 1) / MR, [&](int p) {
         for (int rr = 0; rr < MR; rr++) {
             const int t = p * MR + rr;
-            float * d = ap0 + (size_t) p * 768 * MR + rr;
+            float * d = ap0 + (size_t) p * KP * MR + rr;
             if (t >= M) {
-                for (int j = 0; j < 768; j++) d[(size_t) j * MR] = 0.f;
+                for (int j = 0; j < KP; j++) d[(size_t) j * MR] = 0.f;
                 continue;
             }
             int px, py;
             patch_xy(t, px, py);
-            for (int c = 0; c < 3; c++)
-                for (int ky = 0; ky < ps; ky++)
-                    for (int kx = 0; kx < ps; kx++)
-                        d[(size_t) (c * 256 + ky * 16 + kx) * MR] = img[((size_t) (py * ps + ky) * tw + (px * ps + kx)) * 3 + c];
+            for (int f = 0; f < nf; f++) {
+                const float * im = f ? img1 : img;
+                for (int c = 0; c < 3; c++)
+                    for (int ky = 0; ky < ps; ky++)
+                        for (int kx = 0; kx < ps; kx++)
+                            d[(size_t) (f * 768 + c * 256 + ky * 16 + kx) * MR] = im[((size_t) (py * ps + ky) * tw + (px * ps + kx)) * 3 + c];
+            }
         }
     });
-    gemm(pool, ap0, M, I.patch_w, x, D, ADD);
+    gemm(pool, ap0, M, img1 ? I.patch_w2 : I.patch_w, x, D, ADD);
     const double t1 = now_ms();
     double t_att = 0, t_ln = 0, t_gemm = 0;
     auto timed = [](double & acc, auto && f) {

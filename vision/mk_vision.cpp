@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,6 +87,7 @@ struct mkv_image {
     int nx = 0, ny = 0, n = 0;
     mtmd_input_chunk * chunk = nullptr; // mtmd: the image chunk of mtmd_tokenize (owned copy)
     std::vector<float> pix;             // cpu: the preprocessed image (HWC)
+    std::vector<uint8_t> f0, f1;        // cpu, video: the resized frame(s), u8 HWC (normalized at encode: 1/4 the memory)
     int tw = 0, th = 0;
     std::vector<float> rows;
     double encode_ms = 0;
@@ -268,6 +270,82 @@ mkv_image * mkv_image_load(mkv_ctx * c, const unsigned char * data, size_t len) 
     return im;
 }
 
+// mtmd backend: libmtmd's own merge of consecutive same-size bitmaps (mtmd_tokenize, [QWEN_VIDEO]) into one image chunk
+static mkv_image * frames_mtmd(mkv_ctx * c, const unsigned char * rgb0, const unsigned char * rgb1, int nx, int ny) {
+    mtmd_bitmap * bm[2] = {mtmd_bitmap_init((uint32_t) nx, (uint32_t) ny, rgb0), rgb1 ? mtmd_bitmap_init((uint32_t) nx, (uint32_t) ny, rgb1) : nullptr};
+    const int nb = rgb1 ? 2 : 1;
+    std::string text;
+    for (int i = 0; i < nb; i++) text += mtmd_default_marker();
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    mtmd_input_text txt = {text.c_str(), text.size(), false, true};
+    const mtmd_bitmap * bms[2] = {bm[0], bm[1]};
+    const int32_t r = mtmd_tokenize(c->mt, chunks, &txt, bms, (size_t) nb);
+    for (mtmd_bitmap * b : bm)
+        if (b) mtmd_bitmap_free(b);
+    mkv_image * im = nullptr;
+    size_t n_img = 0;
+    if (r != 0) g_err = "frame preprocessing failed (mtmd_tokenize " + std::to_string(r) + ")";
+    for (size_t i = 0; r == 0 && i < mtmd_input_chunks_size(chunks); i++) {
+        const mtmd_input_chunk * ch = mtmd_input_chunks_get(chunks, i);
+        if (mtmd_input_chunk_get_type(ch) != MTMD_INPUT_CHUNK_TYPE_IMAGE) continue;
+        if (n_img++) break; // (two chunks: libmtmd did not merge the frames)
+        const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(ch);
+        const size_t n = mtmd_image_tokens_get_n_tokens(it);
+        const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, n - 1);
+        im = new mkv_image;
+        im->chunk = mtmd_input_chunk_copy(ch);
+        im->nx = (int) last.x + 1;
+        im->ny = (int) last.y + 1;
+        im->n = (int) n;
+    }
+    mtmd_input_chunks_free(chunks);
+    if (im && (n_img != 1 || (size_t) im->nx * im->ny != (size_t) im->n)) {
+        g_err = n_img != 1 ? "libmtmd did not merge the frame pair" : "unexpected frame token layout";
+        mkv_image_free(im);
+        im = nullptr;
+    }
+    if (!im && g_err.empty()) g_err = "no image chunk";
+    return im;
+}
+
+mkv_image * mkv_frames_load(mkv_ctx * c, const unsigned char * rgb0, const unsigned char * rgb1, int nx, int ny, int max_tokens) {
+    g_err.clear();
+    if (!rgb0 || nx <= 0 || ny <= 0 || (long long) nx * ny > c->max_pixels) {
+        g_err = !rgb0 || nx <= 0 || ny <= 0 ? "no frame"
+                                           : "frame of " + std::to_string(nx) + " x " + std::to_string(ny) + " pixels: over the limit of " +
+                                                 std::to_string(c->max_pixels) + " pixels (MK_IMAGE_MAX_PIXELS)";
+        return nullptr;
+    }
+#ifndef MKV_NO_VIT
+    if (c->backend == MKV_BACKEND_CPU) {
+        auto * im = new mkv_image;
+        try {
+            int tw1 = 0, th1 = 0;
+            c->vit->resize(rgb0, nx, ny, im->f0, im->tw, im->th, max_tokens);
+            if (rgb1) c->vit->resize(rgb1, nx, ny, im->f1, tw1, th1, max_tokens);
+        } catch (const std::exception & e) {
+            g_err = e.what();
+            delete im;
+            return nullptr;
+        }
+        im->nx = im->tw / 32;
+        im->ny = im->th / 32;
+        im->n = im->nx * im->ny;
+        return im;
+    }
+#endif
+    if (max_tokens > 0) {
+        g_err = "the mtmd backend resizes video frames with the image token limit only (no per-frame max_tokens)";
+        return nullptr;
+    }
+    try {
+        return frames_mtmd(c, rgb0, rgb1, nx, ny);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return nullptr;
+    }
+}
+
 int mkv_image_grid(const mkv_image * im, int * nx, int * ny) {
     if (nx) *nx = im ? im->nx : 0;
     if (ny) *ny = im ? im->ny : 0;
@@ -286,13 +364,26 @@ int mkv_image_encode(mkv_ctx * c, mkv_image * im) {
     if (c->backend == MKV_BACKEND_CPU) {
         try {
             im->rows.resize((size_t) im->n * c->n_embd);
-            c->vit->encode(im->pix.data(), im->tw, im->th, im->rows.data());
+            if (!im->f0.empty()) { // video: the frame(s) normalized now (as preprocess does)
+                std::vector<float> p0(im->f0.size()), p1(im->f1.size());
+                c->vit->normalize(im->f0.data(), im->f0.size(), p0.data());
+                if (!im->f1.empty()) {
+                    c->vit->normalize(im->f1.data(), im->f1.size(), p1.data());
+                    c->vit->encode_pair(p0.data(), p1.data(), im->tw, im->th, im->rows.data());
+                } else {
+                    c->vit->encode(p0.data(), im->tw, im->th, im->rows.data());
+                }
+            } else {
+                c->vit->encode(im->pix.data(), im->tw, im->th, im->rows.data());
+            }
         } catch (const std::exception & e) {
             im->rows.clear();
             g_err = e.what();
             return -1;
         }
         std::vector<float>().swap(im->pix); // (not needed again)
+        std::vector<uint8_t>().swap(im->f0);
+        std::vector<uint8_t>().swap(im->f1);
         im->encode_ms = now_ms() - t0;
         return 0;
     }
