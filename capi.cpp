@@ -199,6 +199,9 @@ template <class F> int guarded(void * hp, F f) {
             g_err += std::string(" (reset after it failed too: ") + e2.what() + ")";
         }
         return -1;
+    } catch (const MKCancelled & e) { // (mk_cancel; the engine put its state back itself)
+        g_err = e.what();
+        return -2;
     } catch (const std::exception & e) {
         g_err = e.what();
         return -1;
@@ -336,6 +339,14 @@ int mk_prefill_img(void * hp, const int * toks, int n, const int * cks, int ncks
 
 // width of an image row (the model's embedding size)
 int mk_n_embd() { return MKEngine::n_embd(); }
+
+// on 1: a prefill running on another thread (or the next one) stops at its next chunk boundary and returns -2, with the
+// sequence back at the last checkpoint before it (MKEngine::cancel; a host flag, no GPU work, never waits); 0 clears it
+// (every prefill clears it when it returns). The server calls it when the client disconnects during a long prompt.
+int mk_cancel(void * hp, int on) {
+    static_cast<Handle *>(hp)->eng->cancel(on != 0);
+    return 0;
+}
 
 // one decode cycle; writes 1..n_draft+1 tokens; returns the count (negative on error)
 int mk_step(void * hp, int * out, int cap) {

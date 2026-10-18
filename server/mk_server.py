@@ -17,12 +17,13 @@ GET /health, GET /v1/models.  One request at a time.  After each request the eng
 clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
 Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32);
 the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
-whose client disconnects stops generating at the next engine cycle.
+whose client disconnects stops at the next prefill chunk (2048 tokens) or engine cycle.
 """
 import argparse
 import base64
 import binascii
 import codecs
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -115,6 +116,10 @@ class Engine:
         self._warm = hasattr(L, "mk_keep_warm")
         if self._warm:
             L.mk_keep_warm.restype, L.mk_keep_warm.argtypes = ctypes.c_double, [vp, ctypes.c_int]
+        # prefill cancel (libraries before it: a disconnect during a prefill is noticed when it ends)
+        self._cancel = hasattr(L, "mk_cancel")
+        if self._cancel:
+            L.mk_cancel.restype, L.mk_cancel.argtypes = ctypes.c_int, [vp, ctypes.c_int]
 
     def _err(self, what):
         return RuntimeError(f"{what}: {self.L.mk_last_error().decode()}")
@@ -152,6 +157,31 @@ class Engine:
         GPU work); off: stop now. Returns the window in seconds (0: off)."""
         return self.L.mk_keep_warm(self.h, 1 if on else 0) if self._warm else 0.0
 
+    @contextlib.contextmanager
+    def cancel_when(self, gone, every=0.05):
+        """runs the block (a prefill call) next to a watcher thread that polls gone() every `every` seconds: once it
+        returns True, the engine stops the prefill at its next chunk boundary (mk_cancel: a host flag) and the call
+        raises PrefillCancelled, with the engine back at its last checkpoint before the prefill"""
+        if not self._cancel or gone is None:
+            yield
+            return
+        self.L.mk_cancel(self.h, 0)
+        done = threading.Event()
+
+        def watch():
+            while not done.wait(every):
+                if gone():
+                    self.L.mk_cancel(self.h, 1)
+                    return
+        th = threading.Thread(target=watch, name="mk-cancel-watch", daemon=True)
+        th.start()
+        try:
+            yield
+        finally:
+            done.set()
+            th.join()
+            self.L.mk_cancel(self.h, 0)
+
     def set_sampling(self, temp, top_p, top_k, min_p, seed):
         if self.L.mk_set_sampling(self.h, temp, top_p, top_k, min_p, seed) < 0:
             raise self._err("sampling")
@@ -170,14 +200,13 @@ class Engine:
             pos, nx, ny = ((ctypes.c_int * k)(*[im[j] for im in images]) for j in range(3))
             rows = (ctypes.c_void_p * k)(*[im[3] for im in images])
             r = self.L.mk_prefill_img(self.h, arr, len(toks), ca, len(cks), ck_at, pos, nx, ny, rows, k)
-            if r < 0:
-                raise self._err("prefill")
-            return r
-        if self.pool and cks:
+        elif self.pool and cks:
             ca = (ctypes.c_int * len(cks))(*cks)
             r = self.L.mk_prefill_cks(self.h, arr, len(toks), ca, len(cks), ck_at)
         else:
             r = self.L.mk_prefill_ck(self.h, arr, len(toks), ck_at)
+        if r == -2:  # (mk_cancel)
+            raise PrefillCancelled(self.L.mk_last_error().decode())
         if r < 0:
             raise self._err("prefill")
         return r
@@ -361,6 +390,10 @@ class BadRequest(Exception):
 
 class ClientGone(Exception):
     """the client closed its connection: the request stops, nothing is sent"""
+
+
+class PrefillCancelled(Exception):
+    """the engine stopped a prefill at a chunk boundary (Engine.cancel_when); nothing of it was kept"""
 
 
 MEDIA_MARKER = "<__media__>"  # llama-server's (mtmd_default_marker)
@@ -642,9 +675,10 @@ class Server:
             cks.update(k for k in range(start + 1, len(toks) - 1) if toks[k] == self.im_start)
         return sorted(cks)
 
-    def load_prompt(self, toks, images=()):
+    def load_prompt(self, toks, images=(), gone=None):
         """brings the engine to `toks` processed, reusing what it has; returns (first token, reused count).
-        images: [(pos, Vision.Image)] of the prompt"""
+        images: [(pos, Vision.Image)] of the prompt. gone (the client left: () -> bool) is watched during the prefill,
+        which then stops at a chunk boundary with PrefillCancelled (Engine.cancel_when)"""
         eng = self.eng
         seq = eng.sequence()
         lcp = 0
@@ -669,9 +703,10 @@ class Server:
 
         def feed(start):  # prefill toks[start:] with the images it overlaps (encoded now, each once: Vision's cache)
             imgs = [(p, im.nx, im.ny, im.rows()) for p, im in images if p + im.n > start]
-            if imgs:
-                return eng.prefill(toks[start:], gen, self.ck_positions(toks, start), imgs), start
-            return eng.prefill(toks[start:], gen, self.ck_positions(toks, start)), start
+            with eng.cancel_when(gone):
+                if imgs:
+                    return eng.prefill(toks[start:], gen, self.ck_positions(toks, start), imgs), start
+                return eng.prefill(toks[start:], gen, self.ck_positions(toks, start)), start
 
         self.img_spans = []  # (until the prefill succeeds)
         # exact reuse (an MK_EXACT engine, --exact-reuse): never append to the sequence. Its last prompt row and the
@@ -727,7 +762,8 @@ class Server:
     def generate(self, body, emit, gone=lambda: False):
         """runs one chat completion; emit(kind, payload) is called with ('reasoning'|'content', text) deltas.
         Returns (finish_reason, tool_calls, usage, timings). emit returning False, or gone() returning True (the client
-        closed its connection; asked before the prefill and before each engine cycle) stops it with ClientGone."""
+        closed its connection; asked before the prefill, during it by a watcher thread (the prefill stops at its next
+        chunk) and before each engine cycle) stops it with ClientGone."""
         text, thinking, media = self.render(body)
         toks, images = self.tokenize_prompt(text, media)
         try:
@@ -750,7 +786,11 @@ class Server:
             raise ClientGone()
         t0 = time.time()
         enc0 = [im.encode_s for _, im in images]
-        tok, reused = self.load_prompt(toks, images)
+        try:
+            tok, reused = self.load_prompt(toks, images, gone)
+        except PrefillCancelled as e:  # (the engine kept nothing of it)
+            log(f"prompt {len(toks)} tok: the client disconnected during its prefill, stopped after {time.time() - t0:.2f} s ({e})")
+            raise ClientGone()
         t1 = time.time()
         enc = [im.encode_s for (_, im), e in zip(images, enc0) if e is None and im.encode_s is not None]
         if images:

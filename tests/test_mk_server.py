@@ -1,6 +1,7 @@
 """Tests of server/mk_server.py without a GPU: request parsing, prompt reuse and image handling against fake engines.
 (Moved from open-jet's tests/test_megakernel_backend.py with the server itself.)"""
 import base64
+import contextlib
 import http.client
 import importlib.util
 import json
@@ -8,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+import types
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -118,6 +120,10 @@ class _FakeEngine:
         self.calls.append(("prefill", n0, len(toks), ck_at, tuple(cks)))
         self.seq.append(7)  # the first generated token
         return 7
+
+    @contextlib.contextmanager
+    def cancel_when(self, gone):  # (Engine.cancel_when; _ChunkedEngine runs the real one)
+        yield
 
 
 class MegakernelPromptReuseTests(unittest.TestCase):
@@ -666,6 +672,79 @@ class BodyLimitTests(_HttpCase):
             body = json.dumps({"messages": [{"role": "user", "content": "x" * 1000}], "max_tokens": 2}).encode()
             raw = http_.raw(self.HEAD + b"Content-Length: %d\r\n\r\n" % len(body) + body, until=b"}")
             self.assertEqual(self._status(raw), 200, raw[:200])
+
+
+# === srv: disconnect during a long prefill ===
+class _ChunkedEngine(_ScriptEngine):
+    """_ScriptEngine whose prefill takes n_chunks chunks of chunk_s seconds and, as the engine does, stops between two
+    of them once mk_cancel(h, 1) was called (the real Engine.cancel_when over a fake library): nothing of the prefill is
+    kept and PrefillCancelled is raised"""
+
+    def __init__(self, mk, pieces, n_chunks=20, chunk_s=0.1, **kw):
+        super().__init__(pieces, **kw)
+        self.mk, self.n_chunks, self.chunk_s = mk, n_chunks, chunk_s
+        self.flag, self.chunks_run, self.cancelled = 0, 0, 0
+        self._cancel, self.h = True, None
+        self.L = types.SimpleNamespace(mk_cancel=self._mk_cancel)
+
+    def _mk_cancel(self, h, on):
+        self.flag = on
+        return 0
+
+    def cancel_when(self, gone, every=0.05):
+        return self.mk.Engine.cancel_when(self, gone, every)
+
+    def prefill(self, toks, ck_at=-1, cks=(), images=()):
+        for c in range(self.n_chunks):
+            if c and self.flag:
+                self.cancelled += 1
+                self.calls.append(("cancelled", len(self.seq), c))
+                raise self.mk.PrefillCancelled("test")
+            time.sleep(self.chunk_s)
+            self.chunks_run += 1
+        return super().prefill(toks, ck_at, cks, images)
+
+
+class PrefillDisconnectTests(_HttpCase):
+    """a client that leaves during a long prefill stops it at the next chunk; nothing of it is kept"""
+
+    def _abandon(self, stream):
+        eng = _ChunkedEngine(self.mk, ["a", "b"])
+        srv, http_ = self.serve(eng)
+        body = {"messages": [{"role": "user", "content": "long prompt"}], "max_tokens": 8, "stream": stream}
+        s = socket.create_connection(("127.0.0.1", http_.port))
+        s.sendall(_request(body))
+        time.sleep(0.35)  # (3-4 chunks of 20 in)
+        s.close()
+        t0 = time.time()
+        while not eng.cancelled and time.time() - t0 < 3:
+            time.sleep(0.01)
+        self.assertEqual(eng.cancelled, 1, "the prefill ran on after the client left")
+        self.assertLess(time.time() - t0, 0.5)  # (watcher 50 ms + the chunk in progress)
+        self.assertLess(eng.chunks_run, 10)
+        self.assertEqual(eng.sequence(), [])  # (nothing of it kept)
+        eng.n_chunks = 1
+        t = time.time()
+        status, data = http_.post({**body, "stream": False})
+        self.assertEqual(status, 200, data[:300])
+        self.assertLess(time.time() - t, 1.0)
+        self.assertEqual(json.loads(data)["choices"][0]["message"]["content"], "ab")
+        prefills = [c for c in eng.calls if c[0] == "prefill"]
+        self.assertEqual(prefills[-1][1], 0)  # (the next prompt from position 0: no reuse of the abandoned one)
+        self.assertEqual(eng.flag, 0)  # (cleared after the call)
+
+    def test_non_streaming(self) -> None:
+        self._abandon(False)
+
+    def test_streaming(self) -> None:
+        self._abandon(True)
+
+    def test_a_client_that_stays_is_not_cancelled(self) -> None:
+        eng = _ChunkedEngine(self.mk, ["a", "b"], n_chunks=6, chunk_s=0.05)
+        srv, http_ = self.serve(eng)
+        status, data = http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})
+        self.assertEqual((status, eng.cancelled, eng.chunks_run, eng.flag), (200, 0, 6, 0), data[:300])
+
 
 
 if __name__ == "__main__":

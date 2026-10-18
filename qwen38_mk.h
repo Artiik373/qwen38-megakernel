@@ -12,6 +12,11 @@ struct MKCudaError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// prefill() stopped by MKEngine::cancel(). The engine is consistent (see cancel()): no reset needed.
+struct MKCancelled : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // An image in a prompt (vision input, e.g. an mmproj encoder's output): positions pos .. pos + nx * ny - 1 take these
 // input-embedding rows instead of their tokens' embeddings (the tokens there are placeholders, e.g. <|image_pad|>),
 // with llama.cpp's M-RoPE positions for Qwen-VL: the grid's rows in raster order, nx merged patches per row.
@@ -85,6 +90,12 @@ class MKEngine {
     bool rewind_to(int pos);
     int checkpoint_pos() const;
     bool rewind_to_checkpoint();
+    // Asks a batched prefill running on another thread (or the next one) to stop at its next chunk boundary: a host flag
+    // read between chunks, no GPU work, callable from any thread. That prefill() then waits for the chunks already on
+    // the GPU and throws MKCancelled, with nothing of it kept: the sequence, the recurrent state and the checkpoints go
+    // back to the last checkpoint that existed before the call (or to a reset when there is none), the draft vocabulary
+    // and the image spans to what they were. Each prefill() clears the flag when it returns; cancel(false) clears it too.
+    void cancel(bool on = true);
     // Runs one verify+draft cycle; appends 1..n_draft+1 accepted tokens to `out`.
     int step(std::vector<int> & out);
     // Debug helper: copy of the last main-model logits row selection (argmax ids) is not kept;

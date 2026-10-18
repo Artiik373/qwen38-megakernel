@@ -6030,12 +6030,14 @@ struct MKEngine::Impl {
         m.N = (int) dv_ids.size();
         CK(cudaMemcpyToSymbol(cW, &m.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
-    void dv_reset() {
-        if (dv_in.empty() || (int) dv_ids.size() == dv_base) return;
-        for (size_t i = dv_base; i < dv_ids.size(); i++) dv_in[dv_ids[i]] = 0;
-        for (int i = 0; i < dv_base; i++) dv_in[dv_ids[i]] = 1; // a padding duplicate may have been cleared
-        dv_ids.resize(dv_base);
-        hw.head_d.N = dv_base;
+    void dv_reset() { dv_truncate(dv_base); }
+    // back to the first n ids (n >= dv_base, even: the size after a dv_add; a cancelled prefill's additions)
+    void dv_truncate(size_t n) {
+        if (dv_in.empty() || dv_ids.size() <= n) return;
+        for (size_t i = n; i < dv_ids.size(); i++) dv_in[dv_ids[i]] = 0;
+        for (size_t i = 0; i < n; i++) dv_in[dv_ids[i]] = 1; // a padding duplicate may have been cleared
+        dv_ids.resize(n);
+        hw.head_d.N = (int) n;
         CK(cudaMemcpyToSymbol(cW, &hw.head_d.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
     Ctl hctl{};
@@ -7681,6 +7683,10 @@ struct MKEngine::Impl {
     // chunk is synchronous and the host waits for each chunk's trunk before its MTP part (the GPU idles for the host's wake-up
     // and launches at both points). MK_PF_GAPS=1: report the GPU's idle time at those points per prefill run.
     bool pf_sync = false, pf_gaps = false;
+    // MKEngine::cancel: pf_run reads pf_cancel (set from any thread) at each chunk boundary and stops there (pf_cancelled)
+    std::atomic<int> pf_cancel{0};
+    bool pf_cancelled = false;
+    int pf_stop = 0; // (the position it stopped at)
     cudaEvent_t pf_cev[2] = {};
     std::vector<cudaEvent_t> pf_gev; // MK_PF_GAPS: timing events, 4 per chunk (start, trunk end, MTP part start, end)
 
@@ -8267,7 +8273,9 @@ struct MKEngine::Impl {
     void pf_run(const std::vector<int> & toks, int n0, std::vector<int> * pred, const MKEngine::LogitSink * sink = nullptr,
                 int first = 0, const std::vector<Snap> * snaps = nullptr, const int * erow = nullptr) {
         pf_init();
+        const int kv_top0 = kv_top;
         kv_top = std::max(kv_top, n0 + (int) toks.size()); // (ring_rewind)
+        pf_cancelled = false;
         ck_scr_guard(); // the scratch may still be the source of an end save's copy
         ck_guard_state();
         const int N = (int) toks.size(), cap = hp.cap;
@@ -8285,6 +8293,14 @@ struct MKEngine::Impl {
             if (pf_gaps) CK(cudaEventRecord(pf_gev[4 * c + k], 0));
         };
         for (int c0 = 0; c0 < N; c0 += cap) {
+            // MKEngine::cancel: stop at this chunk boundary (a host flag, no device sync; the chunks already enqueued finish
+            // in the tail wait below). The caller (MKEngine::prefill) discards what they computed.
+            if (c0 > 0 && !pred && !sink && pf_cancel.load(std::memory_order_relaxed)) {
+                pf_cancelled = true;
+                pf_stop = n0 + c0;
+                kv_top = std::max(kv_top0, n0 + c0); // (rows of the chunks never enqueued were not written)
+                break;
+            }
 #if MK_KV_EMU
             kv_demote_to(n0 + c0 - hb.kvemu_win); // recent-window emulation: rows older than the window before this chunk
 #endif
@@ -8476,7 +8492,7 @@ struct MKEngine::Impl {
         CK(cudaGetLastError());
         wait_device("the prefill tail", std::max(wd_limit, 120.0));
         if (memlog && pf_runs_seen++ == 0) mem_mark("first prefill run");
-        if (pf_gaps && !pred && !sink) { // GPU idle at the host's points: before a chunk's first kernel, before its MTP part
+        if (pf_gaps && !pred && !sink && !pf_cancelled) { // GPU idle at the host's points: before a chunk's first kernel, before its MTP part
             double g0 = 0, g1 = 0, wall = 0;
             float ms;
             for (int c = 0; c < nch; c++) {
@@ -8985,6 +9001,8 @@ void MKEngine::reset() {
     stats = MKStats();
 }
 
+void MKEngine::cancel(bool on) { p_->pf_cancel.store(on ? 1 : 0); }
+
 int MKEngine::position() const { return p_->hctl.n; }
 
 void MKEngine::set_n_draft(int n) {
@@ -9080,6 +9098,39 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
             r += n;
         }
     }
+    // MKEngine::cancel: a batched part stopped at a chunk boundary leaves a partial prefill in the KV rows, the recurrent
+    // state and its checkpoint slots, so nothing of this call may count as processed. The checkpoints this call saved or
+    // evicted are dropped, the last earlier one is restored (KV rows before it were never rewritten; without one: a
+    // reset), the draft vocabulary and the image spans go back to their state before the call.
+    struct ClearCancel {
+        Impl * p;
+        ~ClearCancel() { p->pf_cancel.store(0); }
+    } clear_cancel{p_};
+    const std::vector<Span> spans0 = p_->spans;
+    const size_t dv0 = p_->dv_ids.size();
+    std::vector<int> ck0;
+    for (const auto & k : p_->ck) ck0.push_back(k.pos);
+    auto stop_if_cancelled = [&] {
+        if (!p_->pf_cancelled) return;
+        p_->pf_cancelled = false;
+        int best = -1;
+        for (size_t k = 0; k < p_->ck.size(); k++) {
+            Impl::CkSlot & s = p_->ck[k];
+            if (s.pos != ck0[k]) s.pos = -1;
+            else if (s.pos >= 0 && (best < 0 || s.pos > p_->ck[best].pos)) best = (int) k;
+        }
+        p_->spans = spans0;
+        p_->dv_truncate(dv0);
+        const int back = best >= 0 ? p_->ck[best].pos : 0;
+        if (best >= 0) {
+            p_->ck_restore(best);
+            p_->spans_cut(back);
+        } else {
+            reset();
+        }
+        throw MKCancelled("prefill of positions " + std::to_string(n0) + ".." + std::to_string(end - 1) + " cancelled at " +
+                          std::to_string(p_->pf_stop) + "; the sequence is back at position " + std::to_string(back));
+    };
     p_->pcnt_clear(); // a new response: the penalties count its generated tokens only
     if (p_->fault_at && ++p_->fault_seen == p_->fault_at) p_->fault_now = true;
     seq.insert(seq.end(), tokens.begin(), tokens.end());
@@ -9117,6 +9168,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         if (p_->stg_n < 2) { // too few staging slots (MK_PF_CAP below ~340): two pf_runs around ck_exact, other positions ignored
             if (!end_save) {
                 p_->pf_run(std::vector<int>(head.begin(), head.begin() + (ck_exact - n0)), n0, nullptr, nullptr, 0, nullptr, er);
+                stop_if_cancelled();
                 c.dn_c = ck_exact;
                 c.mtp_valid = c.dn_c;
                 CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
@@ -9124,8 +9176,10 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
                 if (si >= 0) p_->ck_save_end(si);
                 p_->pf_run(std::vector<int>(head.begin() + (ck_exact - n0), head.end()), ck_exact, nullptr, nullptr, 0, nullptr,
                            er ? er + (ck_exact - n0) : nullptr);
+                stop_if_cancelled();
             } else {
                 p_->pf_run(head, n0, nullptr, nullptr, 0, nullptr, er);
+                stop_if_cancelled();
             }
         } else {
             const std::vector<int> want = p_->ck_positions(cks, ck_exact, n0, hend);
@@ -9135,6 +9189,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
                 if (slot[k] >= 0) snaps.push_back({want[k], slot[k]});
             const auto t0 = std::chrono::steady_clock::now();
             p_->pf_run(head, n0, nullptr, nullptr, 0, &snaps, er);
+            stop_if_cancelled();
             for (const auto & q : snaps) { // (the state after position q.pos - 1)
                 Impl::CkSlot & k = p_->ck[q.slot];
                 k.ctl = c;

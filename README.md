@@ -192,7 +192,8 @@ What the API supports:
   `finish_reason` "length".
 - **Limits:** request bodies up to 128 MB (`MK_MAX_BODY_MB`), 32 images per request (`MK_MAX_IMAGES`), 100 megapixels
   per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded). A request whose client disconnects stops at
-  the next decode cycle; an engine error in a stream ends it with an error event and `data: [DONE]`.
+  the next prefill chunk (2048 tokens) or decode cycle, and a stopped prompt leaves nothing behind; an engine error in a
+  stream ends it with an error event and `data: [DONE]`.
 - **Requests:** one at a time.
 
 [docs/ENGINE.md](docs/ENGINE.md#server) has the details, the server's options and the engine's environment variables.

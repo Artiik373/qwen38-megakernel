@@ -304,8 +304,13 @@ kept between requests].
   without the limit: a 446 KB PNG declaring 12000 x 12000 pixels took 39 s and 0.9 GB of server memory (decode, then
   4096 tokens encoded); a 20000 x 20000 one asks stb_image for ~2.4 GB.
 - Disconnects: before the prefill and before each decode cycle the server checks whether the client closed its
-  connection, and stops (a prefill that is running finishes first). The engine keeps what it generated, as after a
-  reply cut by `max_tokens`, so the next request reuses or rewinds it as usual.
+  connection, and stops. During the prefill a watcher thread checks every 50 ms and asks the engine to stop at its next
+  prefill chunk (`mk_cancel` / `MKEngine::cancel`: a host flag read between chunks of 2048 tokens, no device sync); the
+  chunk running and the one queued behind it finish, so the engine is free 1-2 chunks later. Nothing of a stopped
+  prefill counts: the engine drops the checkpoints it saved and goes back to the last checkpoint from before it (or
+  resets without one), with the draft vocabulary as it was, so the next request answers as on a server that never saw
+  it. After a disconnect during decoding the engine keeps what it generated, as after a reply cut by `max_tokens`, so the
+  next request reuses or rewinds it as usual.
 - Images: see [Images](#images-vision).
 
 ## KV cache
