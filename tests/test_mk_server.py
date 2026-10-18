@@ -11,7 +11,6 @@ import threading
 import time
 import types
 import unittest
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -394,8 +393,7 @@ class _Http:
     """make_handler(srv) on 127.0.0.1:<free port>"""
 
     def __init__(self, mk, srv):
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), mk.make_handler(srv))
-        self.httpd.daemon_threads = True
+        self.httpd = mk.HTTPServer(("127.0.0.1", 0), mk.make_handler(srv))  # (the server's class: lingering close)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
@@ -769,6 +767,59 @@ class PrefillDisconnectTests(_HttpCase):
         status, data = http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})
         self.assertEqual((status, eng.cancelled, eng.chunks_run, eng.flag), (200, 0, 6, 0), data[:300])
 
+
+# === srv: a 4xx while the client is still uploading ===
+class LingerTests(_HttpCase):
+    """after an early 4xx the server half-closes and drains the rest of the upload (bounded) instead of closing with
+    unread data, which resets the connection: the client, sending its whole body first as http.client does, then reads
+    the answer"""
+
+    HEAD = BodyLimitTests.HEAD
+
+    def _upload(self, http_, declared, send, rate=None):
+        """declares `declared` bytes, sends `send` of them (MiB/s rate or as fast as possible), then reads the answer;
+        returns (status line or None, error)"""
+        with socket.create_connection(("127.0.0.1", http_.port), timeout=10) as s:
+            s.sendall(self.HEAD + b"Content-Length: %d\r\n\r\n" % declared)
+            time.sleep(0.2)  # (the 4xx is out before the body starts)
+            chunk, t0 = b"x" * (1 << 20), time.time()
+            try:
+                for i in range(send >> 20):
+                    s.sendall(chunk)
+                    if rate:
+                        time.sleep(max(0.0, t0 + (i + 1) / rate - time.time()))
+                s.shutdown(socket.SHUT_WR)
+                raw = b""
+                while True:
+                    b = s.recv(65536)
+                    if not b:
+                        break
+                    raw += b
+            except OSError as e:  # (a reset: the answer is lost)
+                return None, repr(e)
+            return raw.split(b"\r\n", 1)[0], None
+
+    def test_the_413_survives_the_upload(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        with mock.patch.object(self.mk, "MAX_BODY_MB", 1):
+            line, err = self._upload(http_, 64 << 20, 64 << 20)
+            self.assertEqual(((line or b"")[:12], err), (b"HTTP/1.1 413", None))
+            line, err = self._upload(http_, 24 << 20, 24 << 20, rate=40)  # (slowly: 0.6 s)
+            self.assertEqual(((line or b"")[:12], err), (b"HTTP/1.1 413", None))
+        self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0], 200)
+
+    def test_the_drain_is_bounded(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        with mock.patch.object(self.mk, "MAX_BODY_MB", 1), mock.patch.object(self.mk, "LINGER_BYTES", 4 << 20):
+            t = time.time()
+            line, err = self._upload(http_, 256 << 20, 256 << 20)
+            self.assertIsNone(line)  # (reset after 4 MiB: the client is told by a reset, as before)
+            self.assertLess(time.time() - t, 5.0)
+        with mock.patch.object(self.mk, "MAX_BODY_MB", 1), mock.patch.object(self.mk, "LINGER_S", 0.5):
+            t = time.time()
+            line, err = self._upload(http_, 256 << 20, 256 << 20, rate=8)  # (would take 32 s)
+            self.assertIsNone(line)
+            self.assertLess(time.time() - t, 3.0)
 
 
 if __name__ == "__main__":

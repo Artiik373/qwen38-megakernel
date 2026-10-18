@@ -191,8 +191,9 @@ What the API supports:
 - **Tool calls:** a call counts only when it is complete; one cut by `max_tokens` is returned as text in `content`, with
   `finish_reason` "length".
 - **Limits:** request bodies up to 128 MB (`MK_MAX_BODY_MB`), 32 images per request (`MK_MAX_IMAGES`), 100 megapixels
-  per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded). A request whose client disconnects stops at
-  the next prefill chunk (2048 tokens) or decode cycle, and a stopped prompt leaves nothing behind; an engine error in a
+  per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded). A refused upload still gets its 4xx answer:
+  the server drains the rest of the body (bounded) before it closes. A request whose client disconnects stops at the
+  next prefill chunk (2048 tokens) or decode cycle, and a stopped prompt leaves nothing behind; an engine error in a
   stream ends it with an error event and `data: [DONE]`.
 - **Requests:** one at a time.
 

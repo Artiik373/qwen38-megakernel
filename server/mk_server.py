@@ -17,7 +17,9 @@ GET /health, GET /v1/models.  One request at a time.  After each request the eng
 clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
 Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32);
 the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
-whose client disconnects stops at the next prefill chunk (2048 tokens) or engine cycle.
+whose client disconnects stops at the next prefill chunk (2048 tokens) or engine cycle. A connection the server closes
+while the client is still sending (an early 4xx for a body it does not read) is half-closed and drained first (bounded),
+so the client reads the answer instead of a connection reset.
 """
 import argparse
 import base64
@@ -48,6 +50,9 @@ TOPK_MAX = 32
 # request limits; main() reads them from the environment
 MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64 data: URLs fit)
 MAX_IMAGES = 32  # MK_MAX_IMAGES: images per request
+# lingering close (HTTPServer.shutdown_request): what a client still sends after the server's last answer is read and
+# dropped for at most LINGER_S seconds / LINGER_BYTES bytes, LINGER_IDLE_S seconds without data (nginx's defaults)
+LINGER_S, LINGER_IDLE_S, LINGER_BYTES = 30.0, 5.0, 1 << 30
 # the engine and encoder libraries next to the repo root: qwen38mk.dll / qwen38vision.dll on Windows
 LIB_MK, LIB_VISION = ("qwen38mk.dll", "qwen38vision.dll") if os.name == "nt" else ("libqwen38mk.so", "libqwen38vision.so")
 
@@ -1021,6 +1026,45 @@ def make_handler(srv):
     return H
 
 
+def linger(sock, seconds=None, idle=None, cap=None):
+    """after shutdown(SHUT_WR): reads and drops what the client still sends until it closes, at most `cap` bytes and
+    `seconds` (`idle` seconds without data). Closing a socket with unread data makes the kernel send a reset, which can
+    reach the client before it has read the answer."""
+    end = time.monotonic() + (LINGER_S if seconds is None else seconds)
+    left = LINGER_BYTES if cap is None else cap
+    idle = LINGER_IDLE_S if idle is None else idle
+    buf = bytearray(1 << 16)
+    try:
+        while left > 0:
+            t = end - time.monotonic()
+            if t <= 0:
+                break
+            sock.settimeout(min(t, idle))
+            n = sock.recv_into(buf, min(left, len(buf)))
+            if not n:
+                break
+            left -= n
+    except OSError:  # (timeout, reset)
+        pass
+
+
+class HTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a lingering close: when the server ends a connection (an early 400 / 411 / 413 for a
+    request body it does not read, the base class's errors, Connection: close), it half-closes it (the client reads the
+    whole answer and the end of the stream), then drains what the client still sends (linger) before closing, so the
+    client is not reset in the middle of its upload and gets the answer (the reason) instead of a connection error."""
+    daemon_threads = True
+
+    def shutdown_request(self, request):
+        try:
+            request.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        else:
+            linger(request)
+        self.close_request(request)
+
+
 def env_int(name, default):
     """a positive integer setting from the environment (default when unset or empty)"""
     v = os.environ.get(name, "").strip()
@@ -1068,8 +1112,7 @@ def main():
     srv = Server(args)
     if srv.eng.exact:
         log("exact reuse: on (MK_EXACT)")
-    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(srv))
-    httpd.daemon_threads = True
+    httpd = HTTPServer((args.host, args.port), make_handler(srv))
     log(f"listening on http://{args.host}:{args.port}")
     try:
         httpd.serve_forever()

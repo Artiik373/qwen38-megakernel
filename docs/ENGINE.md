@@ -305,6 +305,11 @@ kept between requests].
   `MK_IMAGE_MAX_PIXELS` pixels (default 100,000,000) from its header, before decoding it. Measured on 2026-10-17
   without the limit: a 446 KB PNG declaring 12000 x 12000 pixels took 39 s and 0.9 GB of server memory (decode, then
   4096 tokens encoded); a 20000 x 20000 one asks stb_image for ~2.4 GB.
+- Closing: when the server ends a connection while the client may still be sending (a 400 / 411 / 413 for a body it
+  does not read, the base class's errors), it shuts down its write side, then reads and drops what the client still
+  sends (at most 1 GiB and 30 s, 5 s without data, as nginx's lingering close) before closing. Closing with unread data
+  makes the kernel send a reset, and a client that sends its whole body before reading (Python's http.client, curl
+  without `Expect: 100-continue`) then sees a connection error instead of the answer.
 - Disconnects: before the prefill and before each decode cycle the server checks whether the client closed its
   connection, and stops. During the prefill a watcher thread checks every 50 ms and asks the engine to stop at its next
   prefill chunk (`mk_cancel` / `MKEngine::cancel`: a host flag read between chunks of 2048 tokens, no device sync); the
