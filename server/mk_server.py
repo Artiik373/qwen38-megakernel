@@ -15,8 +15,9 @@ divergence (saved during earlier prefills: at each generation prompt, each messa
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
 POST /v1/messages (+ /v1/messages/count_tokens): the Anthropic Messages API over the same chat path.
 GET /health (503 "Loading model" until the model is loaded), /v1/models, /props, /slots, /metrics; POST /tokenize,
-/detokenize, /apply-template, /v1/chat/completions/input_tokens (llama-server's shapes).  One request at a time.  After each request the engine keeps the GPU's
-clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
+/detokenize, /apply-template, /v1/chat/completions/input_tokens (llama-server's shapes).  One request at a time.
+After each request the engine keeps the GPU's clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a
+reply after a pause starts at full speed.
 Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32);
 the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
 whose client disconnects stops at the next prefill chunk (2048 tokens) or engine cycle. A connection the server closes
@@ -1283,7 +1284,7 @@ class Server:
                 f"{len(enc)} encoded on the CPU in {sum(enc):.2f} s")
         parser = OutputParser(thinking, tools)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        n_gen, finish, pending, aborted = 0, "length", [tok], False
+        n_gen, finish, pending, aborted, dropped = 0, "length", [tok], False, 0
         while n_gen < max_new and not aborted:
             if not pending:
                 if gone():  # once per engine cycle: a closed connection stops the GPU work here
@@ -1303,7 +1304,7 @@ class Server:
                 # a stop string: the reply ends at it, and the tokens after this one (the rest of the cycle's accepted
                 # drafts) are dropped. The engine's sequence keeps them, as after max_tokens: the next request finds
                 # the divergence (load_prompt) and continues from the reply that was sent.
-                finish = "stop"
+                finish, dropped = "stop", len(pending)
                 break
         if aborted:  # (the engine's state is that of a reply cut by max_tokens: the next request reuses it as usual)
             log(f"prompt {len(toks)} tok ({reused} reused), {n_gen} tok in {time.time() - t1:.2f} s: the client "
@@ -1323,7 +1324,8 @@ class Server:
             finish = "tool_calls"
         t2 = time.time()
         log(f"prompt {len(toks)} tok ({reused} reused) in {t1 - t0:.2f} s, {n_gen} tok in {t2 - t1:.2f} s "
-            f"({n_gen / max(t2 - t1, 1e-9):.1f} tok/s), {finish}" + (" (stop string)" if stopper.word is not None else ""))
+            f"({n_gen / max(t2 - t1, 1e-9):.1f} tok/s), {finish}"
+            + (f" (stop string; {dropped} tokens of the cycle dropped)" if stopper.word is not None else ""))
         self.count(prompt_tokens=len(toks) - reused, prompt_tokens_reused=reused, prompt_seconds=t1 - t0,
                    tokens_predicted=n_gen, predicted_seconds=t2 - t1)
         usage = {"prompt_tokens": len(toks), "completion_tokens": n_gen, "total_tokens": len(toks) + n_gen,
@@ -1542,8 +1544,9 @@ def make_handler(srv):
             parts = {"reasoning": [], "content": []}
             finish, calls, usage, _ = srv.generate(chat, lambda k, t: parts[k].append(t), self.client_gone)
             blocks = []
-            if parts["reasoning"]:
-                blocks.append({"type": "thinking", "thinking": "".join(parts["reasoning"]).strip(), "signature": ""})
+            reasoning = "".join(parts["reasoning"]).strip()
+            if reasoning:
+                blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
             if parts["content"]:
                 blocks.append({"type": "text", "text": "".join(parts["content"])})
             blocks += [anthropic_tool_use(c) for c in calls]
@@ -1555,7 +1558,7 @@ def make_handler(srv):
             """Anthropic's SSE: message_start, ping, content blocks (thinking / text deltas as they come, tool_use blocks
             with their whole input as one input_json_delta at the end), message_delta, message_stop"""
             mid = "msg_" + uuid.uuid4().hex
-            st = {"started": False, "index": -1, "open": None}
+            st = {"started": False, "index": -1, "open": None, "ws": ""}  # ws: the thinking's held trailing whitespace
 
             def send(data, last=False):
                 self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
@@ -1597,10 +1600,17 @@ def make_handler(srv):
             def emit(kind, text):
                 try:
                     start()
-                    if kind == "reasoning":
+                    if kind == "reasoning":  # (trimmed at both ends, as the non-streamed reply's thinking block)
+                        t = st["ws"] + text
                         if st["open"] != "thinking":
+                            t = t.lstrip()
+                            if not t:
+                                return True
                             block({"type": "thinking", "thinking": "", "signature": ""})
-                        delta({"type": "thinking_delta", "thinking": text})
+                        body = t.rstrip()
+                        st["ws"] = t[len(body):]
+                        if body:
+                            delta({"type": "thinking_delta", "thinking": body})
                     else:
                         if st["open"] != "text":
                             block({"type": "text", "text": ""})

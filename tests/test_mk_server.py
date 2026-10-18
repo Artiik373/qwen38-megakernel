@@ -1204,7 +1204,8 @@ class AnthropicTests(_HttpCase):
 
     def test_streaming_events(self) -> None:
         base = {"model": "claude-x", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], "stream": True}
-        _, ev = self._msg(_ScriptEngine(["Hmm", ".</think>", "\n\nLet me look.\n\n"] + [CALL[i:i + 3] for i in range(0, len(CALL), 3)]),
+        _, ev = self._msg(_ScriptEngine(["\n", "Hmm", ".\n", "</think>", "\n\nLet me look.\n\n"]
+                                        + [CALL[i:i + 3] for i in range(0, len(CALL), 3)]),
                           {**base, "thinking": {"type": "enabled", "budget_tokens": 1024},
                            "tools": [{"name": "read_file", "input_schema": TOOLS[0]["function"]["parameters"]}]}, self.THINK)
         names = [n for n, _ in ev]
@@ -1218,7 +1219,7 @@ class AnthropicTests(_HttpCase):
         think = "".join(d["delta"]["thinking"] for n, d in ev if n == "content_block_delta" and d["delta"]["type"] == "thinking_delta")
         text = "".join(d["delta"]["text"] for n, d in ev if n == "content_block_delta" and d["delta"]["type"] == "text_delta")
         js = "".join(d["delta"]["partial_json"] for n, d in ev if n == "content_block_delta" and d["delta"]["type"] == "input_json_delta")
-        self.assertEqual((think.strip(), text, json.loads(js)), ("Hmm.", "Let me look.", {"path": "/etc/hostname"}))
+        self.assertEqual((think, text, json.loads(js)), ("Hmm.", "Let me look.", {"path": "/etc/hostname"}))  # (trimmed)
         md = ev[-2][1]
         self.assertEqual((md["delta"]["stop_reason"], md["usage"]["output_tokens"] > 0), ("tool_use", True))
         self.assertEqual(ev[0][1]["message"]["usage"]["output_tokens"], 0)
