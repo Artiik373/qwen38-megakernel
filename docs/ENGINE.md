@@ -442,7 +442,9 @@ python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj mmproj-BF16.
 - **Encoder** (`vision/mk_vision.h`, `--vision-backend auto|cpu|mtmd`): `cpu` = `vision/vit_cpu.cpp`, the tower in fp32
   with AVX2 / FMA kernels (packed 6x16 FMA GEMM micro-kernel, attention on the same kernel with an online softmax,
   exact tanh-GELU, weights widened from the file's type, a pool of pinned workers that take tasks dynamically;
-  x86-64 with AVX2 + FMA: Zen 2-5, Haswell+; results independent of the thread count); `mtmd` = llama.cpp's libmtmd
+  x86-64 with AVX2 + FMA: Zen 2-5, Haswell+; results independent of the thread count and the same with g++ and MSVC:
+  no C library function whose last bit varies between libraries, the online softmax's e^x being glibc's `expf` algorithm
+  in the encoder's own code, checked equal to glibc's on all 2^32 inputs); `mtmd` = llama.cpp's libmtmd
   encoder (any CPU); `auto` = `cpu` where it runs.
 
 Accuracy against an fp64 forward of the checkpoint (`vision/vit_ref.py`, 5 images of 196 .. 1024 tokens; 2026-10-16):

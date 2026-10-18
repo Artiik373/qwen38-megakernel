@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -226,6 +227,46 @@ inline float hmax(__m256 v) {
     s = _mm_max_ps(s, _mm_movehl_ps(s, s));
     s = _mm_max_ss(s, _mm_movehdup_ps(s));
     return _mm_cvtss_f32(s);
+}
+
+// e^x of one float, bit for bit glibc's expf (2.27 and later: sysdeps/ieee754/flt-32/e_expf.c from Arm's
+// optimized-routines, computed as its x86-64 FMA variant does; checked against glibc 2.39 on all 2^32 inputs). The C
+// libraries' expf differ in the last bit (glibc vs Microsoft's UCRT made the g++ and MSVC builds' rows differ by ~1e-5),
+// so the encoder calls no libm function whose result is not exactly specified (sqrt is); this one keeps the g++ rows.
+inline double fma_sd(double a, double b, double c) {
+    return _mm_cvtsd_f64(_mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(b), _mm_set_sd(c)));
+}
+float expf_glibc(float x) {
+    // T[i] = the bits of 2^(i / 32) minus i << 47 (the part of the exponent that ki << 47 adds back)
+    static const uint64_t T[32] = {
+        0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51, 0x3fef72b83c7d517b, 0x3fef54873168b9aa,
+        0x3fef387a6e756238, 0x3fef1e9df51fdee1, 0x3fef06fe0a31b715, 0x3feef1a7373aa9cb, 0x3feedea64c123422, 0x3feece086061892d,
+        0x3feebfdad5362a27, 0x3feeb42b569d4f82, 0x3feeab07dd485429, 0x3feea47eb03a5585, 0x3feea09e667f3bcd, 0x3fee9f75e8ec5f74,
+        0x3feea11473eb0187, 0x3feea589994cce13, 0x3feeace5422aa0db, 0x3feeb737b0cdc5e5, 0x3feec49182a3f090, 0x3feed503b23e255d,
+        0x3feee89f995ad3ad, 0x3feeff76f2fb5e47, 0x3fef199bdd85529c, 0x3fef3720dcef9069, 0x3fef5818dcfba487, 0x3fef7c97337b9b5f,
+        0x3fefa4afa2a490da, 0x3fefd0765b6e4540,
+    };
+    const double shift = 0x1.8p+52, inv_ln2_n = 0x1.71547652b82fep+0 * 32;
+    const double c0 = 0x1.c6af84b912394p-5 / 32 / 32 / 32, c1 = 0x1.ebfce50fac4f3p-3 / 32 / 32, c2 = 0x1.62e42ff0c52d6p-1 / 32;
+    uint32_t ux;
+    memcpy(&ux, &x, sizeof ux);
+    const uint32_t abstop = ux >> 20 & 0x7ff;
+    if (abstop >= 0x42b) { // |x| >= 88 or nan
+        if (ux == 0xff800000u) return 0.0f;     // -inf
+        if (abstop >= 0x7f8) return x + x;      // nan, +inf
+        if (x > 0x1.62e42ep6f) return INFINITY; // overflow
+        if (x < -0x1.9fe368p6f) return 0.0f;    // underflow
+    }
+    // x * 32 / ln 2 = k + r, k an integer (rounded to nearest even in the low bits of kd0), |r| <= 1/2
+    const double xd = x, kd0 = fma_sd(inv_ln2_n, xd, shift), kd = kd0 - shift, r = fma_sd(inv_ln2_n, xd, -kd);
+    uint64_t ki;
+    memcpy(&ki, &kd0, sizeof ki);
+    const uint64_t t = T[ki % 32] + (ki << 47);
+    double s; // 2^(k / 32)
+    memcpy(&s, &t, sizeof s);
+    // e^x = 2^(k / 32) * 2^(r / 32) ~= s * (c0 r^3 + c1 r^2 + c2 r + 1)
+    const double y = fma_sd(fma_sd(c0, r, c1), r * r, fma_sd(c2, r, 1.0));
+    return (float) (y * s);
 }
 
 // e^x, Cephes expf's reduction and polynomial (~1 ulp); x clamped to [-87.3, 88]
@@ -446,7 +487,7 @@ void attn_block(const float * qa, int rows, const float * kp, const float * vb, 
             __m256 mx = _mm256_set1_ps(-INFINITY);
             for (int j = 0; j < nkp; j += 8) mx = _mm256_max_ps(mx, _mm256_load_ps(s + j));
             const float mn = std::max(m[r], hmax(mx));
-            const float alpha = std::exp(m[r] - mn); // (0 on the first block)
+            const float alpha = expf_glibc(m[r] - mn); // (0 on the first block)
             const __m256 vmn = _mm256_set1_ps(mn), va = _mm256_set1_ps(alpha);
             __m256 sum = _mm256_setzero_ps();
             for (int j = 0; j < nkp; j += 8) {

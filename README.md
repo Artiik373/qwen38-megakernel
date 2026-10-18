@@ -264,10 +264,14 @@ of the same source (fdad907), on the same model file, on 2026-10-16:
 | image encode, 196 / 300 / 1024 tokens | 0.59 / 0.81 / 3.56 s vs 0.50 / 0.80 / 3.95 s |
 
 The first chat prompt after the model load decoded faster on Windows: 220 vs 132-145 tok/s, with the same tokens. The
-likely cause is that the GPU's clocks ramp up faster there. The Windows encoder's image rows differ from the Linux
-encoder's at fp32 rounding level (relative 2e-6 to 1.3e-5). That is smaller than either's error against an fp64 forward
-of the tower, and the image replies above were identical. The Windows build of 147054b (2026-10-17) passed the same
+likely cause is that the GPU's clocks ramp up faster there. The Windows build of 147054b (2026-10-17) passed the same
 identity checks (ids, `--kld` report, server replies) against the Linux references.
+
+The image encoder's rows used to differ between the two builds at fp32 rounding level (relative 2e-6 to 1.3e-5, below
+either's error against an fp64 forward of the tower): its attention took e^x from the C library, and glibc's and
+Microsoft's `expf` differ in the last bit for some inputs. Since 2026-10-18 the encoder computes it itself, with glibc's
+algorithm, so the Linux rows stayed as they were and the Windows rows now equal them bit for bit (stills and video frame
+pairs, at any thread count).
 
 Requirements:
 - **Driver:** an NVIDIA driver that supports CUDA 13.2.
