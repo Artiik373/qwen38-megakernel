@@ -288,6 +288,8 @@ kept between requests].
   `MK_KEEP_WARM_S` seconds (default 120, 0 = off), each launch ending itself after 50 ms; the next request stops it and
   waits a few microseconds. The driver keys the P-state to utilization, so only a continuous load holds full clocks.
   Measured on 2026-10-17 (RTX 3090): ~165 W while warm vs 30-35 W idle; from idle the clocks take 2.2-2.7 s to come up.
+  An image the request encodes on the CPU (up to ~3.5 s for 1024 tokens, after the engine calls that stopped the load)
+  re-arms it first, so the GPU stays warm until the prefill's first launch.
   `MK_KEEP_WARM_LOAD=blocks,threads,on_ms,off_ms,spin` changes the load (for measurements).
 - Sampling: temperature [0.8], top_p [0.95], top_k (1..32; absent or <= 0 means 32, the engine's maximum; above 32 is
   clamped with a one-time warning), min_p [0.05], seed, presence_penalty / frequency_penalty (-2..2, vLLM's semantics:

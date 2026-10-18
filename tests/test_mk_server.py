@@ -217,14 +217,23 @@ class _FakeVisionEngine(_FakeEngine):
         self.calls.append(("images", tuple((p, nx, ny) for p, nx, ny, _ in images)))
         return super().prefill(toks, ck_at, cks)
 
+    def keep_warm(self, on=True):
+        self.calls.append(("warm",))
+        return 120.0
+
 
 class _FakeImage:
     def __init__(self, key, nx, ny):
         self.key, self.nx, self.ny, self.n = key, nx, ny, nx * ny
         self.encoded = 0
+        self.encode_s = None  # (Vision.Image: seconds of its CPU encode, None until encoded)
+        self.log = None
 
     def rows(self):
         self.encoded += 1
+        if self.encode_s is None and self.log is not None:
+            self.log.append(("encode", self.key))
+        self.encode_s = 0.5
         return 0  # (an address)
 
 
@@ -299,6 +308,21 @@ class MegakernelVisionTests(unittest.TestCase):
         _, reused = srv.load_prompt(toks2, images2)
         self.assertEqual(reused, 10)
         self.assertEqual(srv.eng.calls[-3:-1], [("rewind", 10), ("images", ((2, 4, 4),))])
+
+    def test_the_gpu_is_kept_warm_across_an_image_encode(self) -> None:
+        """the engine stops its keep-warm load at the request's first GPU call; an image encoded on the CPU afterwards
+        re-arms it first, so the GPU's clocks are up when the prefill launches (and only then: a cached image does not)"""
+        a = _FakeImage("a", 2, 2)
+        srv = self._server({b"A": a})
+        a.log = srv.eng.calls
+        m = self.mk.MEDIA_MARKER
+        toks, images = srv.tokenize_prompt(f"x{m}yz", [b"A"])
+        srv.load_prompt(toks, images)
+        self.assertEqual([c[0] for c in srv.eng.calls], ["reset", "warm", "encode", "images", "prefill"])
+        srv.eng.calls.clear()
+        srv.eng.reset()  # (the image's rows are needed again; it is encoded already)
+        srv.load_prompt(toks, images)
+        self.assertEqual([c[0] for c in srv.eng.calls], ["reset", "reset", "images", "prefill"])
 
 
 # === sec:harness ===

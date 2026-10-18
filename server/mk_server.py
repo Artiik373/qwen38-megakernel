@@ -702,7 +702,11 @@ class Server:
             lcp = min(lcp, p)
 
         def feed(start):  # prefill toks[start:] with the images it overlaps (encoded now, each once: Vision's cache)
-            imgs = [(p, im.nx, im.ny, im.rows()) for p, im in images if p + im.n > start]
+            fed = [(p, im) for p, im in images if p + im.n > start]
+            if any(im.encode_s is None for _, im in fed):
+                # the CPU encodes leave the GPU idle (up to seconds): keep its clocks up until the prefill's first launch
+                eng.keep_warm()
+            imgs = [(p, im.nx, im.ny, im.rows()) for p, im in fed]
             with eng.cancel_when(gone):
                 if imgs:
                     return eng.prefill(toks[start:], gen, self.ck_positions(toks, start), imgs), start
