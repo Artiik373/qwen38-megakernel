@@ -59,6 +59,16 @@ long long max_pixels_env() {
     return v;
 }
 
+// the encoder's default thread count: every logical CPU but two (8 or more; else all but one). The cpu backend's workers
+// are pinned and meet at a barrier after every step, so a single other busy thread on one of their CPUs doubles the
+// encode time: next to the server's keep-warm load, a 220-token video frame pair took 1.14-1.17 s with 32 threads and
+// 0.63-0.68 s with 30 on a 16-core / 32-thread Ryzen (2026-10-18), while an idle machine encodes as fast with 30 as with
+// 32 (0.57 vs 0.60 s). The rows do not depend on the thread count.
+int default_threads() {
+    const int hw = (int) std::max(1u, std::thread::hardware_concurrency());
+    return hw >= 8 ? hw - 2 : std::max(1, hw - 1);
+}
+
 bool cpu_has_avx2_fma() {
 #if defined(_WIN32) && defined(_M_X64)
     return mkv_win::avx2_fma();
@@ -114,7 +124,7 @@ mkv_ctx * mkv_new(const char * mmproj, const char * text_model, struct mkv_param
     try {
         c->max_pixels = max_pixels_env();
         g_verbose = params.verbose != 0;
-        const int threads = params.n_threads > 0 ? params.n_threads : (int) std::max(1u, std::thread::hardware_concurrency());
+        const int threads = params.n_threads > 0 ? params.n_threads : default_threads();
         std::string why_not_cpu;
 #ifndef MKV_NO_VIT
         if (params.backend != MKV_BACKEND_MTMD) {
@@ -123,7 +133,7 @@ mkv_ctx * mkv_new(const char * mmproj, const char * text_model, struct mkv_param
             } else {
                 try {
                     mkv::Vit::Params vp;
-                    vp.n_threads = threads; // (one per logical CPU: SMT siblings hide the kernels' latencies)
+                    vp.n_threads = threads; // (logical CPUs: SMT siblings hide the kernels' latencies)
                     vp.min_tokens = params.min_tokens;
                     vp.max_tokens = params.max_tokens;
                     c->vit.reset(new mkv::Vit(mmproj, vp));

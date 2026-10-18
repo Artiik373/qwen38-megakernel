@@ -2168,7 +2168,8 @@ def main():
     ap.add_argument("--mmproj", default=None,
                     help="vision projector GGUF (e.g. mmproj-*.gguf): image_url inputs, encoded on the CPU (no VRAM)")
     ap.add_argument("--vision-lib", default=os.path.join(os.path.dirname(HERE), LIB_VISION))
-    ap.add_argument("--vision-threads", type=int, default=0, help="CPU threads of the image encoder (0: all)")
+    ap.add_argument("--vision-threads", type=int, default=0,
+                    help="CPU threads of the image encoder (0: every logical CPU but two)")
     ap.add_argument("--vision-backend", choices=["auto", "cpu", "mtmd"], default="auto",
                     help="image encoder: cpu (AVX2 / FMA fp32 kernels), mtmd (llama.cpp's), auto (cpu if the CPU has AVX2 + FMA)")
     ap.add_argument("--image-min-tokens", type=int, default=0, help="minimum tokens per image (0: the mmproj's default)")

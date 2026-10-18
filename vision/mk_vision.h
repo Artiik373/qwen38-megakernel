@@ -26,7 +26,8 @@ typedef struct mkv_image mkv_image;
 enum { MKV_BACKEND_AUTO = 0, MKV_BACKEND_MTMD = 1, MKV_BACKEND_CPU = 2 };
 
 struct mkv_params {
-    int n_threads;   // encoder threads (<= 0: one per logical CPU, which is fastest on Zen 3 with SMT on)
+    int n_threads;   // encoder threads (<= 0: every logical CPU but two: SMT siblings help on Zen 3, and the two left
+                     // free keep another busy thread, e.g. the server's GPU keep-warm, from stalling the pinned workers)
     int min_tokens;  // image-token limits of the resize (<= 0: the projector's defaults, as llama-server: 8 / 4096)
     int max_tokens;
     int flash_attn;  // mtmd backend: -1 auto (llama-server's default), 0 off, 1 on
