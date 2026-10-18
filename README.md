@@ -68,6 +68,10 @@ one session:
 - **Keep-warm**, new: on native Windows at 147054b, a 255-token reply after 65 s of idle started in ~65 ms instead of
   391-397 ms and decoded at 80.2 instead of 61-63 tok/s (2026-10-17). Holding the clocks costs power: ~165 W instead of
   30-35 W at idle on this card.
+- **Draft head from a Q4_K copy** (on by default after 147054b; `MK_DRAFT_Q4=0` turns it off): greedy decode +2.1% on
+  the short bench prompts, no measurable change at 38k and 101.6k, +90 MiB of VRAM (2026-10-17, Linux). Greedy output
+  is unchanged; sampled replies keep the same distribution but differ from earlier builds for the same seed, because
+  the drafts' probabilities changed (docs/ENGINE.md, "The GGUF").
 
 **Q4_K_M:** unsloth's plain file runs on the same engine. Its last full run was on 2026-10-14 (commit b3be928, one
 session with UD-Q4_K_XL, q8_0 KV, 7 drafts): short prompts 148.1 vs UD's 144.7 tok/s, 145.7 vs 128.6 at 11.6k, 109.4 vs

@@ -212,11 +212,12 @@ output distribution stay exact. When it went in (2026-10-12, before wide verify)
 UD-Q4_K_XL, sped greedy decode up 1.5% and moved acceptance by under a point. `MK_MTP_Q4=0` keeps the stored types
 (`MK_MTP_Q4=ab` loads both and the policy key `mtpq=0|1` switches between them, for A/B tests).
 
-`MK_DRAFT_Q4=1` (off by default: it costs 90 MiB of VRAM) does the same for the draft head: the 32,768 rows of the
-draft vocabulary are re-quantized from `output`'s Q6_K to a Q4_K copy at load (0.8 s), which every draft pass reads
-instead of the shared lm_head rows (0.69x the bytes, contiguous). Tokens added to the draft vocabulary on the fly still
-come from lm_head. Greedy output and the sampled distribution are unchanged (the main head verifies); the policy key
-`dq4=0|1` switches it at run time.
+The draft head gets the same treatment (`MK_DRAFT_Q4`, on by default; `MK_DRAFT_Q4=0` turns it off and saves its 90 MiB
+of VRAM): the 32,768 rows of the draft vocabulary are re-quantized from `output`'s Q6_K to a Q4_K copy at load (0.8 s),
+which every draft pass reads instead of the shared lm_head rows (0.69x the bytes, contiguous). Tokens added to the draft
+vocabulary on the fly still come from lm_head. Greedy output and the sampled distribution are unchanged (the main head
+verifies); the policy key `dq4=0|1` switches it at run time. Measured on 2026-10-17: +2.1% greedy decode on the short
+bench prompts (4 x 512 tokens, 7 drafts; cycles and accepted drafts identical), no measurable change at 38k and 101.6k.
 
 Gate and up projections of different types (25 of the 65 layers of UD-Q4_K_XL) are read each in its own type over the
 shared activations in decode. In prefill one mixed-type fused GEMM computes both (warps 0-3 gate rows, warps 4-7 up

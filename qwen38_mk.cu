@@ -6190,14 +6190,15 @@ struct MKEngine::Impl {
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
     }
 
-    // MK_DRAFT_Q4=1: the draft head's base rows (the draft vocabulary, --draft-vocab) re-quantised from lm_head's Q6_K to a
-    // Q4_K copy at load (ggml_quantize_chunk, no imatrix; +94 MB of VRAM): each draft streams 0.69x the head's bytes.
-    // Lossy, but only the drafts can change (they are verified by the exact main head), so the output (greedy ids, the
-    // sampled distribution) is unchanged and only acceptance moves. 0 / unset: off. Policy key dq4=0|1 switches it.
-    bool draft_q4 = false;
+    // MK_DRAFT_Q4 (default 1): the draft head's base rows (the draft vocabulary, --draft-vocab) re-quantised from lm_head's
+    // Q6_K to a Q4_K copy at load (ggml_quantize_chunk, no imatrix; +94 MB of VRAM): each draft streams 0.69x the head's
+    // bytes. Lossy, but only the drafts can change (they are verified by the exact main head), so the output (greedy ids,
+    // the sampled distribution) is unchanged and only acceptance moves. MK_DRAFT_Q4=0: off. Policy key dq4=0|1 switches it.
+    bool draft_q4 = true;
+    bool draft_q4_env = false; // MK_DRAFT_Q4 given explicitly (only then is a missing draft vocabulary worth a note)
     int dq4_rows = 0; // rows of the copy (0: none)
     void set_draft_q4(int on) {
-        if (!dq4_rows) throw std::runtime_error("policy dq4 needs MK_DRAFT_Q4=1 and a draft vocabulary");
+        if (!dq4_rows) throw std::runtime_error("policy dq4 needs the draft head's Q4_K copy (MK_DRAFT_Q4, on by default) and a draft vocabulary");
         hw.dq4_n = on ? dq4_rows : 0;
         CK(cudaMemcpyToSymbol(cW, &hw.dq4_n, sizeof(int), offsetof(ModelW, dq4_n)));
     }
@@ -6781,6 +6782,7 @@ struct MKEngine::Impl {
         if (const char * e = getenv("MK_DRAFT_Q4")) {
             if (strcmp(e, "0") && strcmp(e, "1")) throw std::runtime_error("MK_DRAFT_Q4: 0 or 1");
             draft_q4 = e[0] == '1';
+            draft_q4_env = true;
         }
         rq_start();
         wrec_on = true; // (MK_WDIGEST: the weight allocations from here to token_embd, without the draft ids)
@@ -6972,7 +6974,7 @@ struct MKEngine::Impl {
                 fprintf(stderr, "[mk] draft head: %d rows re-quantised to Q4_K in %.2f s (%.1f MiB; drafts only, MK_DRAFT_Q4=0: off)\n",
                         dq4_rows, lsec(t0), (double) rs_to * dq4_rows / 1048576.0);
             }
-        } else if (draft_q4) {
+        } else if (draft_q4 && draft_q4_env) {
             fprintf(stderr, "[mk] MK_DRAFT_Q4 ignored: it needs a draft vocabulary (--draft-vocab)\n");
         }
         mem_mark("draft head copy");

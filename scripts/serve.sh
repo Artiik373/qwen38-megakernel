@@ -13,9 +13,10 @@
 #                       (faster follow-up turns, but not bit-identical to the same request sent fresh)
 #   MK_PF_CAP           prefill chunk tokens (default 2048; 1024 above 96k context: 0.34 GB less VRAM, prefill ~4.5% slower)
 #   MK_KV, MK_KV_WIN    low-bit KV cache (opt-in), preset D': MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048 (6-bit K, 5-bit V,
-#                       8-bit MTP layer and recent window: 1.1 GB less VRAM at 120k, ~162k context in the same VRAM,
+#                       8-bit MTP layer and recent window: ~1.0 GB less VRAM at 120k, ~162k context in the same VRAM,
 #                       up to 262,144 tokens on 24 GB; near-lossless, see README)
 #   MK_KEEP_WARM_S      seconds the engine keeps the GPU's clocks up after each request (default 120, 0 = off)
+#   MK_DRAFT_Q4=0       the draft head reads lm_head instead of its Q4_K copy (saves 90 MiB; the copy is on by default)
 #   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS
 #                       request limits: body size (default 128 MB), images per request (32), pixels per image
 #                       (100,000,000; checked before decoding)
