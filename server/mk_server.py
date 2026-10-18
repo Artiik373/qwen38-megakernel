@@ -13,8 +13,9 @@ matched against the sequence so far and only the rest is prefilled. When the new
 what the engine already processed, it rewinds to the last DeltaNet checkpoint at or before the
 divergence (saved during earlier prefills: at each generation prompt, each message start and every
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
-GET /health (503 "Loading model" until the model is loaded), /v1/models, /props, /slots, /metrics (llama-server's
-shapes).  One request at a time.  After each request the engine keeps the GPU's
+POST /v1/messages (+ /v1/messages/count_tokens): the Anthropic Messages API over the same chat path.
+GET /health (503 "Loading model" until the model is loaded), /v1/models, /props, /slots, /metrics; POST /tokenize,
+/detokenize, /apply-template, /v1/chat/completions/input_tokens (llama-server's shapes).  One request at a time.  After each request the engine keeps the GPU's
 clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
 Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32);
 the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
@@ -147,6 +148,10 @@ class Engine:
         if self._stats:
             lp = ctypes.POINTER(ctypes.c_long)
             L.mk_stats.restype, L.mk_stats.argtypes = None, [vp, lp, lp, lp]
+        self.n_vocab = 0  # (libraries before mk_n_vocab: unknown)
+        if hasattr(L, "mk_n_vocab"):
+            L.mk_n_vocab.restype, L.mk_n_vocab.argtypes = ctypes.c_int, [vp]
+            self.n_vocab = L.mk_n_vocab(self.h)
         self.build = None
         if hasattr(L, "mk_build_info"):
             L.mk_build_info.restype, L.mk_build_info.argtypes = ctypes.c_char_p, []
@@ -720,12 +725,173 @@ class OutputParser:
 
 
 # ---------------------------------------------------------------------------------------------
+# Anthropic Messages API (POST /v1/messages, /v1/messages/count_tokens): translated to the chat request above and back,
+# so one code path generates for both (as llama-server's server_chat_convert_anthropic_to_oai)
+
+# Claude Code's system prompt starts with a billing header whose cch= value changes on every request: normalized (as
+# llama-server does), or the prompt would differ from its first tokens on and no prefix could be reused
+BILLING_RE = re.compile(r"^(x-anthropic-billing-header:.*?cch=)[^;\s]{5};")
+
+
+def _anthropic_image(src):
+    if not isinstance(src, dict):
+        raise BadRequest("image: a source object is required")
+    if src.get("type") == "base64":
+        return f"data:{src.get('media_type') or 'image/jpeg'};base64,{src.get('data') or ''}"
+    if src.get("type") == "url":
+        return str(src.get("url") or "")  # (refused by image_bytes: only data: URLs)
+    raise BadRequest(f"image source type {src.get('type')!r} is not supported (base64)")
+
+
+def _tool_result(content):
+    """a tool_result block's content as an OpenAI tool message's: a string, or parts when it has images"""
+    if content is None or isinstance(content, str):
+        return content or ""
+    if not isinstance(content, list):
+        raise BadRequest("tool_result content: a string or an array of blocks")
+    parts = []
+    for c in content:
+        t = c.get("type") if isinstance(c, dict) else None
+        if t == "text":
+            parts.append({"type": "text", "text": str(c.get("text") or "")})
+        elif t == "image":
+            parts.append({"type": "image_url", "image_url": {"url": _anthropic_image(c.get("source"))}})
+        else:
+            raise BadRequest(f"tool_result content block type {t!r} is not supported (text, image)")
+    if any(p["type"] == "image_url" for p in parts):
+        return parts
+    return "\n".join(p["text"] for p in parts)
+
+
+def anthropic_to_chat(body):
+    """an Anthropic Messages request as the server's chat request. system: a string or text blocks (joined by blank
+    lines); content blocks text / image / thinking (-> reasoning_content) / tool_use (-> tool_calls) / tool_result (->
+    tool messages, before the rest of their message: they answer the previous turn's calls); tools input_schema ->
+    parameters; tool_choice auto / none / any / tool; stop_sequences -> stop; thinking enabled / adaptive -> thinking on,
+    disabled or absent -> off (Anthropic's default; chat_template_kwargs win)"""
+    if not isinstance(body.get("messages"), list):
+        raise BadRequest("messages: an array of messages is required")
+    msgs = []
+    system = body.get("system")
+    if system is not None:
+        if isinstance(system, str):
+            texts = [system]
+        elif isinstance(system, list) and all(isinstance(b, dict) and b.get("type") == "text" for b in system):
+            texts = [str(b.get("text") or "") for b in system]
+        else:
+            raise BadRequest("system: a string or an array of text blocks")
+        msgs.append({"role": "system", "content": "\n\n".join(BILLING_RE.sub(r"\1fffff;", t) for t in texts)})
+    for m in body["messages"]:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            raise BadRequest("messages: each message needs the role user or assistant")
+        role, content = m["role"], m.get("content")
+        if isinstance(content, str):
+            msgs.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            raise BadRequest("message content: a string or an array of content blocks")
+        parts, calls, results, thinking = [], [], [], ""
+        for b in content:
+            t = b.get("type") if isinstance(b, dict) else None
+            if t == "text":
+                parts.append({"type": "text", "text": str(b.get("text") or "")})
+            elif t == "image":
+                parts.append({"type": "image_url", "image_url": {"url": _anthropic_image(b.get("source"))}})
+            elif t == "thinking":
+                thinking += str(b.get("thinking") or "")
+            elif t == "redacted_thinking":
+                pass
+            elif t == "tool_use":
+                calls.append({"id": str(b.get("id") or ""), "type": "function", "function": {
+                    "name": str(b.get("name") or ""), "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False)}})
+            elif t == "tool_result":
+                results.append({"role": "tool", "tool_call_id": str(b.get("tool_use_id") or ""),
+                                "content": _tool_result(b.get("content"))})
+            else:
+                raise BadRequest(f"content block type {t!r} is not supported (text, image, thinking, tool_use, tool_result)")
+        msgs += results
+        if parts or calls or thinking:
+            nm = {"role": role, "content": parts[0]["text"] if len(parts) == 1 and parts[0]["type"] == "text"
+                  else (parts or "")}
+            if calls:
+                nm["tool_calls"] = calls
+            if thinking:
+                nm["reasoning_content"] = thinking
+            msgs.append(nm)
+    out = {"messages": msgs, "stream": bool(body.get("stream"))}
+    out["max_tokens"] = body.get("max_tokens") if body.get("max_tokens") is not None else 4096  # (llama-server's)
+    for k in ("temperature", "top_p", "top_k"):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    if body.get("stop_sequences") is not None:
+        out["stop"] = stop_strings(body["stop_sequences"], "stop_sequences")
+    tools = body.get("tools")
+    if tools:
+        if not isinstance(tools, list):
+            raise BadRequest("tools: an array of tools")
+        out["tools"] = []
+        for t in tools:
+            if not isinstance(t, dict) or t.get("type") not in (None, "custom") or not t.get("name"):
+                raise BadRequest(f"tools: only custom tools (name, input_schema), not {str(t)[:80]!r}")
+            out["tools"].append({"type": "function", "function": {
+                "name": t["name"], "description": t.get("description") or "", "parameters": t.get("input_schema") or {}}})
+    tc = body.get("tool_choice")
+    if tc is not None:
+        kind = tc.get("type") if isinstance(tc, dict) else None
+        if kind in ("any", "tool"):
+            raise BadRequest(f"tool_choice {kind}: forcing a tool call needs constrained sampling, which the megakernel "
+                             "does not have (auto, none)")
+        if kind not in ("auto", "none"):
+            raise BadRequest("tool_choice: {\"type\": \"auto\"} or {\"type\": \"none\"}")
+        out["tool_choice"] = kind
+        if tc.get("disable_parallel_tool_use"):
+            out["parallel_tool_calls"] = False
+    if body.get("mcp_servers"):
+        raise BadRequest("mcp_servers: not supported (the client runs its tools)")
+    think = body.get("thinking")
+    kw = dict(body.get("chat_template_kwargs") or {})
+    if think is not None and not (isinstance(think, dict) and think.get("type") in ("enabled", "adaptive", "disabled")):
+        raise BadRequest("thinking: {\"type\": \"enabled\" | \"adaptive\" | \"disabled\"}")
+    kw.setdefault("enable_thinking", bool(think) and think["type"] != "disabled")
+    out["chat_template_kwargs"] = kw
+    return out
+
+
+def anthropic_stop_reason(finish, stop_word):
+    if finish == "length":
+        return "max_tokens"
+    if finish == "tool_calls":
+        return "tool_use"
+    return "stop_sequence" if stop_word is not None else "end_turn"
+
+
+def anthropic_usage(usage):
+    reused = usage["prompt_tokens_details"]["cached_tokens"]
+    return {"input_tokens": usage["prompt_tokens"] - reused, "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": reused, "output_tokens": usage["completion_tokens"]}
+
+
+def anthropic_tool_use(call):
+    try:
+        args = json.loads(call["function"]["arguments"])
+    except ValueError:
+        args = {}
+    return {"type": "tool_use", "id": "toolu_" + call["id"].removeprefix("call_"), "name": call["function"]["name"],
+            "input": args if isinstance(args, dict) else {}}
+
+
+ANTHROPIC_ERRORS = {400: "invalid_request_error", 404: "not_found_error", 413: "request_too_large",
+                    500: "api_error", 501: "api_error", 503: "overloaded_error"}
+
+
+# ---------------------------------------------------------------------------------------------
 
 
 class Server:
     vision = None   # Vision (--mmproj), else text only
     img_spans = ()  # the images of the engine's sequence: (pos, n, key); replaced, never mutated
     stop_word = None  # the stop string that ended the last reply (None: it ended otherwise)
+    last_prompt = (0, 0)  # the running request's prompt: (tokens, reused tokens), once it is processed
 
     def __init__(self, args):
         self.args = args
@@ -804,6 +970,20 @@ class Server:
     def busy(self):
         return self.lock.locked()
 
+    def n_vocab(self):
+        return getattr(self.eng, "n_vocab", 0)
+
+    def prompt_tokens(self, body):
+        """the token count of the request's prompt (rendered with the chat template, images as their tokens), without
+        generating: /v1/messages/count_tokens, /v1/chat/completions/input_tokens"""
+        text, _, media = self.render(body)
+        if not media:
+            return len(self.eng.tokenize(text))
+        with self.lock:  # (the image cache belongs to the running request too)
+            toks, images = self.tokenize_prompt(text, media)
+            self.vision.release([im for _, im in images])
+        return len(toks)
+
     def engine_info(self):
         """what the server knows for sure about its engine: arguments, environment, the library's own answers"""
         a, e, v = self.args, self.eng, self.vision
@@ -854,6 +1034,8 @@ class Server:
             pass
         if getattr(self.eng, "images", False):
             meta["n_embd"] = self.eng.L.mk_n_embd()
+        if self.n_vocab():
+            meta["n_vocab"] = self.n_vocab()
         caps = ["completion"] + (["multimodal"] if self.vision is not None else [])
         return {"object": "list",
                 "data": [{"id": self.model_id, "object": "model", "created": int(self.t_start), "owned_by": "openjet",
@@ -1094,6 +1276,7 @@ class Server:
             log(f"prompt {len(toks)} tok: the client disconnected during its prefill, stopped after {time.time() - t0:.2f} s ({e})")
             raise ClientGone()
         t1 = time.time()
+        self.last_prompt = (len(toks), reused)  # (an Anthropic stream's message_start reports it)
         enc = [im.encode_s for (_, im), e in zip(images, enc0) if e is None and im.encode_s is not None]
         if images:
             log(f"images: {len(images)} ({', '.join(f'{im.nx}x{im.ny}' for _, im in images)} tokens), "
@@ -1148,6 +1331,17 @@ class Server:
         timings = {"prompt_n": len(toks) - reused, "prompt_ms": (t1 - t0) * 1e3, "predicted_n": n_gen,
                    "predicted_ms": (t2 - t1) * 1e3, "predicted_per_second": n_gen / max(t2 - t1, 1e-9)}
         return finish, calls, usage, timings
+
+
+POST_ROUTES = {"/v1/chat/completions": "chat", "/chat/completions": "chat", "/v1/messages": "messages",
+               "/v1/messages/count_tokens": "count_tokens", "/tokenize": "tokenize", "/detokenize": "detokenize",
+               "/apply-template": "apply_template", "/v1/chat/completions/input_tokens": "input_tokens",
+               "/chat/completions/input_tokens": "input_tokens"}
+# llama-server's other POST routes: 501 (not supported here) instead of 404
+UNSUPPORTED = {"/completion", "/completions", "/v1/completions", "/v1/responses", "/responses", "/v1/responses/input_tokens",
+               "/responses/input_tokens", "/infill", "/embedding", "/embeddings", "/v1/embeddings", "/rerank", "/reranking",
+               "/v1/rerank", "/v1/reranking", "/v1/audio/transcriptions", "/audio/transcriptions", "/lora-adapters",
+               "/v1/chat/completions/control", "/models", "/v1/streams/lookup", "/tools", "/cors-proxy"}
 
 
 def make_handler(srv):
@@ -1245,28 +1439,38 @@ def make_handler(srv):
             if len(raw) < n:  # (the client closed the connection mid-body)
                 self.close_connection = True
                 return
-            if path not in ("/v1/chat/completions", "/chat/completions"):
-                self._json(404 if not path.startswith(("/slots", "/props")) else 501,
-                           {"error": {"message": f"{path} is not supported by the megakernel server", "type": "not_supported"}})
+            route = POST_ROUTES.get(path)
+            anth = path.startswith("/v1/messages")  # (errors in Anthropic's shape)
+            if route is None:
+                known = path in UNSUPPORTED or path.startswith(("/slots", "/props", "/models/"))
+                self._error(501 if known else 404, f"{path} is not supported by the megakernel server", anth)
                 return
             try:
                 body = json.loads(raw or b"{}")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 body = None
             if not isinstance(body, dict):
-                self._json(400, {"error": {"message": "the request body must be a JSON object", "type": "invalid_request_error"}})
+                self._error(400, "the request body must be a JSON object", anth)
+                return
+            if route in ("tokenize", "detokenize", "apply_template", "input_tokens", "count_tokens"):
+                try:  # (no generation: the tokenizer, from this thread; images take the engine's lock)
+                    self._json(200, getattr(self, "_" + route)(body))
+                except BadRequest as e:
+                    self._error(400, str(e), anth)
                 return
             srv.count(requests=1, deferred=1)  # (deferred: waiting for the engine)
             with srv.lock:
                 srv.count(deferred=-1)
                 try:
-                    if body.get("stream"):
+                    if route == "messages":
+                        self._anthropic(body)
+                    elif body.get("stream"):
                         self._stream(body)
                     else:
                         self._complete(body)
                 except BadRequest as e:
                     srv.count(requests_bad=1)
-                    self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
+                    self._error(400, str(e), anth)
                 except (BrokenPipeError, ConnectionResetError, ClientGone):
                     srv.count(requests_cancelled=1)
                     self.close_connection = True
@@ -1274,11 +1478,161 @@ def make_handler(srv):
                     srv.count(requests_failed=1)
                     log("error:", repr(e))
                     try:
-                        self._json(500, {"error": {"message": str(e), "type": "server_error"}})
+                        self._error(500, str(e), anth)
                     except Exception:
                         pass
                 finally:
                     srv.eng.keep_warm()  # (MK_KEEP_WARM_S: the window restarts after every request)
+
+        def _error(self, code, message, anthropic=False):
+            if anthropic:
+                self._json(code, {"type": "error", "error": {"type": ANTHROPIC_ERRORS.get(code, "api_error"), "message": message}})
+            else:
+                kind = {400: "invalid_request_error", 404: "not_found_error", 501: "not_supported"}.get(code, "server_error")
+                self._json(code, {"error": {"message": message, "type": kind}})
+
+        # ---- routes without generation (llama-server's) ----
+        def _tokenize(self, body):
+            content = body.get("content")
+            if body.get("parse_special") is False:
+                raise BadRequest("parse_special: false is not supported (special tokens are always parsed)")
+            if isinstance(content, str):
+                content = [content]
+            if not isinstance(content, list) or not all(isinstance(c, (str, int)) and not isinstance(c, bool) for c in content):
+                raise BadRequest("content: a string, or an array of strings and token ids")
+            # (ids of the tokenizer's own, or ids given in the content: those only within the vocabulary get a piece)
+            toks = [(t, isinstance(c, str)) for c in content for t in (srv.eng.tokenize(c) if isinstance(c, str) else [c])]
+            if not body.get("with_pieces"):
+                return {"tokens": [t for t, _ in toks]}
+            out = []
+            for t, own in toks:
+                p = srv.eng.piece(t) if own or 0 <= t < srv.n_vocab() else b""
+                try:
+                    out.append({"id": t, "piece": p.decode()})
+                except UnicodeDecodeError:
+                    out.append({"id": t, "piece": list(p)})
+            return {"tokens": out}
+
+        def _detokenize(self, body):
+            toks = body.get("tokens") or []
+            nv = srv.n_vocab()
+            if not nv:
+                raise BadRequest("/detokenize needs a newer libqwen38mk (mk_n_vocab)")
+            if not isinstance(toks, list) or not all(isinstance(t, int) and not isinstance(t, bool) and 0 <= t < nv for t in toks):
+                raise BadRequest(f"tokens: an array of token ids in [0, {nv})")
+            return {"content": b"".join(srv.eng.piece(t) for t in toks).decode(errors="replace")}
+
+        def _apply_template(self, body):
+            check_params(body)
+            return {"prompt": srv.render(body)[0]}
+
+        def _input_tokens(self, body):
+            check_params(body)
+            return {"input_tokens": srv.prompt_tokens(body), "object": "response.input_tokens"}
+
+        def _count_tokens(self, body):
+            return {"input_tokens": srv.prompt_tokens(anthropic_to_chat(body))}
+
+        # ---- Anthropic Messages ----
+        def _anthropic(self, body):
+            chat = anthropic_to_chat(body)
+            model = body.get("model") if isinstance(body.get("model"), str) and body.get("model") else srv.model_id
+            if chat["stream"]:
+                return self._anthropic_stream(chat, model)
+            parts = {"reasoning": [], "content": []}
+            finish, calls, usage, _ = srv.generate(chat, lambda k, t: parts[k].append(t), self.client_gone)
+            blocks = []
+            if parts["reasoning"]:
+                blocks.append({"type": "thinking", "thinking": "".join(parts["reasoning"]).strip(), "signature": ""})
+            if parts["content"]:
+                blocks.append({"type": "text", "text": "".join(parts["content"])})
+            blocks += [anthropic_tool_use(c) for c in calls]
+            self._json(200, {"id": "msg_" + uuid.uuid4().hex, "type": "message", "role": "assistant", "model": model,
+                             "content": blocks, "stop_reason": anthropic_stop_reason(finish, srv.stop_word),
+                             "stop_sequence": srv.stop_word, "usage": anthropic_usage(usage)})
+
+        def _anthropic_stream(self, chat, model):
+            """Anthropic's SSE: message_start, ping, content blocks (thinking / text deltas as they come, tool_use blocks
+            with their whole input as one input_json_delta at the end), message_delta, message_stop"""
+            mid = "msg_" + uuid.uuid4().hex
+            st = {"started": False, "index": -1, "open": None}
+
+            def send(data, last=False):
+                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
+                self.wfile.flush()
+
+            def event(name, obj, last=False):
+                send(f"event: {name}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n".encode(), last)
+
+            def start():
+                if st["started"]:
+                    return
+                st["started"] = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                n, reused = srv.last_prompt
+                event("message_start", {"type": "message_start", "message": {
+                    "id": mid, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None,
+                    "stop_sequence": None, "usage": {"input_tokens": n - reused, "cache_creation_input_tokens": 0,
+                                                     "cache_read_input_tokens": reused, "output_tokens": 0}}})
+                event("ping", {"type": "ping"})
+
+            def close():
+                if st["open"]:
+                    event("content_block_stop", {"type": "content_block_stop", "index": st["index"]})
+                    st["open"] = None
+
+            def block(cb):
+                close()
+                st["index"] += 1
+                st["open"] = cb["type"]
+                event("content_block_start", {"type": "content_block_start", "index": st["index"], "content_block": cb})
+
+            def delta(d):
+                event("content_block_delta", {"type": "content_block_delta", "index": st["index"], "delta": d})
+
+            def emit(kind, text):
+                try:
+                    start()
+                    if kind == "reasoning":
+                        if st["open"] != "thinking":
+                            block({"type": "thinking", "thinking": "", "signature": ""})
+                        delta({"type": "thinking_delta", "thinking": text})
+                    else:
+                        if st["open"] != "text":
+                            block({"type": "text", "text": ""})
+                        delta({"type": "text_delta", "text": text})
+                except (BrokenPipeError, ConnectionResetError):
+                    return False
+                return True
+
+            check_params(chat)  # (parameter / render errors: a 400 before the stream starts)
+            srv.render(chat)
+            try:
+                finish, calls, usage, _ = srv.generate(chat, emit, self.client_gone)
+            except Exception as e:
+                if not st["started"] or isinstance(e, (BrokenPipeError, ConnectionResetError, ClientGone)):
+                    raise
+                bad = isinstance(e, BadRequest)
+                if not bad:
+                    log("error:", repr(e))
+                event("error", {"type": "error", "error": {"type": "invalid_request_error" if bad else "api_error",
+                                                         "message": str(e)}}, last=True)
+                return
+            start()
+            close()
+            for c in calls:
+                tu = anthropic_tool_use(c)
+                block({**tu, "input": {}})
+                delta({"type": "input_json_delta", "partial_json": json.dumps(tu["input"], ensure_ascii=False)})
+            close()
+            event("message_delta", {"type": "message_delta", "delta": {
+                "stop_reason": anthropic_stop_reason(finish, srv.stop_word), "stop_sequence": srv.stop_word},
+                "usage": anthropic_usage(usage)})
+            event("message_stop", {"type": "message_stop"}, last=True)
 
         def _complete(self, body):
             parts = {"reasoning": [], "content": []}

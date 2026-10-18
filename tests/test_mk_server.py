@@ -1094,5 +1094,195 @@ class RequestParamTests(_HttpCase):
         self.assertEqual(r({"reasoning_effort": "high", "chat_template_kwargs": {"reasoning_effort": "medium"}}), "medium|-")
 
 
+# === api: Anthropic Messages ===
+def _sse_events(raw):
+    """(event name, data object) of a chunked Anthropic SSE response"""
+    head, payloads = b"", []
+    head, _, body = raw.partition(b"\r\n\r\n")
+    text, pos = b"", 0
+    while True:
+        eol = body.index(b"\r\n", pos)
+        n = int(body[pos:eol], 16)
+        if n == 0:
+            break
+        text += body[eol + 2:eol + 2 + n]
+        pos = eol + 4 + n
+    for ev in text.decode().split("\n\n"):
+        if ev.strip():
+            lines = dict(ln.split(": ", 1) for ln in ev.split("\n"))
+            payloads.append((lines["event"], json.loads(lines["data"])))
+    return head, payloads
+
+
+class AnthropicTests(_HttpCase):
+    """POST /v1/messages (+ stream) and /v1/messages/count_tokens over the chat path"""
+
+    def test_request_translation(self) -> None:
+        a2c = self.mk.anthropic_to_chat
+        body = {"model": "claude-x", "max_tokens": 100, "stop_sequences": ["END"], "temperature": 0.2, "top_k": 5,
+                "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1; cch=a5145;You are X."},
+                           {"type": "text", "text": "Be brief.", "cache_control": {"type": "ephemeral"}}],
+                "tools": [{"name": "read_file", "description": "reads", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": ""},
+                                                      {"type": "text", "text": "Let me look."},
+                                                      {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+                                                       "input": {"path": "/x"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                                                  "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
+                                                 {"type": "text", "text": "and?"}]},
+                    {"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                                         "data": "iVBO"}}]}]}
+        c = a2c(body)
+        m = c["messages"]
+        self.assertEqual(m[0], {"role": "system", "content": "x-anthropic-billing-header: cc_version=2.1; cch=fffff;You are X."
+                                                                "\n\nBe brief."})
+        self.assertEqual(m[1], {"role": "user", "content": "hi"})
+        self.assertEqual((m[2]["content"], m[2]["reasoning_content"], m[2]["tool_calls"][0]["function"]),
+                         ("Let me look.", "hmm", {"name": "read_file", "arguments": '{"path": "/x"}'}))
+        self.assertEqual(m[3], {"role": "tool", "tool_call_id": "toolu_1", "content": "a\nb"})  # (results first)
+        self.assertEqual(m[4], {"role": "user", "content": "and?"})
+        self.assertEqual(m[5]["content"], [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBO"}}])
+        self.assertEqual((c["max_tokens"], c["stop"], c["temperature"], c["top_k"], c["tool_choice"],
+                          c["parallel_tool_calls"], c["chat_template_kwargs"]),
+                         (100, ["END"], 0.2, 5, "auto", False, {"enable_thinking": True}))
+        self.assertEqual(c["tools"][0]["function"], {"name": "read_file", "description": "reads",
+                                                     "parameters": {"type": "object"}})
+        self.assertEqual(a2c({"messages": []})["chat_template_kwargs"], {"enable_thinking": False})  # (absent: off)
+        self.assertEqual(a2c({"messages": [], "thinking": {"type": "disabled"}})["chat_template_kwargs"],
+                         {"enable_thinking": False})
+        self.assertEqual(a2c({"messages": [], "chat_template_kwargs": {"enable_thinking": True}})["chat_template_kwargs"],
+                         {"enable_thinking": True})
+        for bad in ({"messages": "x"}, {"messages": [{"role": "system", "content": "x"}]},
+                    {"messages": [{"role": "user", "content": [{"type": "document", "source": {}}]}]},
+                    {"messages": [], "tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+                    {"messages": [], "tool_choice": {"type": "any"}}, {"messages": [], "thinking": {"type": "on"}},
+                    {"messages": [], "stop_sequences": "x" * 2000}):
+            with self.assertRaises(self.mk.BadRequest, msg=str(bad)):
+                a2c(bad)
+
+    def _msg(self, eng, body, template=None):
+        srv, http_ = self.serve(eng)
+        if template:
+            srv.template = self.mk.make_template(template)
+        if body.get("stream"):
+            raw = http_.raw(_request(body).replace(b"/v1/chat/completions", b"/v1/messages"), until=b"0\r\n\r\n")
+            return int(raw.split()[1]), _sse_events(raw)[1]
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=20)
+        c.request("POST", "/v1/messages", json.dumps(body), {"Content-Type": "application/json", "x-api-key": "k",
+                                                              "anthropic-version": "2023-06-01"})
+        r = c.getresponse()
+        return r.status, json.loads(r.read())
+
+    THINK = TEMPLATE.replace("assistant\n{% endif %}",
+                             "assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}")
+
+    def test_non_streaming_replies(self) -> None:
+        base = {"model": "claude-x", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}
+        status, o = self._msg(_ScriptEngine(["Hello", " there", "."]), base)
+        self.assertEqual(status, 200, o)
+        self.assertEqual((o["type"], o["role"], o["model"], o["content"], o["stop_reason"], o["stop_sequence"]),
+                         ("message", "assistant", "claude-x", [{"type": "text", "text": "Hello there."}], "end_turn", None))
+        self.assertEqual(o["usage"]["output_tokens"], 4)  # (3 pieces + the end of generation)
+        self.assertEqual((o["usage"]["cache_read_input_tokens"], o["usage"]["input_tokens"] > 0), (0, True))
+        _, o = self._msg(_ScriptEngine(["a"] * 20, eog=False), {**base, "max_tokens": 5})
+        self.assertEqual((o["stop_reason"], o["usage"]["output_tokens"]), ("max_tokens", 5))
+        _, o = self._msg(_ScriptEngine(["Hello", " there", "."]), {**base, "stop_sequences": ["ere"]})
+        self.assertEqual((o["content"][0]["text"], o["stop_reason"], o["stop_sequence"]), ("Hello th", "stop_sequence", "ere"))
+        _, o = self._msg(_ScriptEngine(ToolCallCutTests.PIECES),
+                         {**base, "tools": [{"name": "read_file", "input_schema": TOOLS[0]["function"]["parameters"]}]})
+        self.assertEqual(o["stop_reason"], "tool_use")
+        self.assertEqual(o["content"][0], {"type": "text", "text": "Let me look."})
+        tu = o["content"][1]
+        self.assertEqual((tu["type"], tu["name"], tu["input"], tu["id"][:6]), ("tool_use", "read_file", {"path": "/etc/hostname"}, "toolu_"))
+        _, o = self._msg(_ScriptEngine(["Hmm", ".</think>", "\n\nFour"]), {**base, "thinking": {"type": "enabled", "budget_tokens": 1024}},
+                         self.THINK)
+        self.assertEqual(o["content"], [{"type": "thinking", "thinking": "Hmm.", "signature": ""}, {"type": "text", "text": "Four"}])
+
+    def test_streaming_events(self) -> None:
+        base = {"model": "claude-x", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], "stream": True}
+        _, ev = self._msg(_ScriptEngine(["Hmm", ".</think>", "\n\nLet me look.\n\n"] + [CALL[i:i + 3] for i in range(0, len(CALL), 3)]),
+                          {**base, "thinking": {"type": "enabled", "budget_tokens": 1024},
+                           "tools": [{"name": "read_file", "input_schema": TOOLS[0]["function"]["parameters"]}]}, self.THINK)
+        names = [n for n, _ in ev]
+        self.assertEqual(names[:3], ["message_start", "ping", "content_block_start"])
+        self.assertEqual(names[-2:], ["message_delta", "message_stop"])
+        starts = [d["content_block"]["type"] for n, d in ev if n == "content_block_start"]
+        self.assertEqual(starts, ["thinking", "text", "tool_use"])
+        self.assertEqual(names.count("content_block_stop"), 3)
+        idx = [d["index"] for n, d in ev if n.startswith("content_block")]
+        self.assertEqual(sorted(set(idx)), [0, 1, 2])
+        think = "".join(d["delta"]["thinking"] for n, d in ev if n == "content_block_delta" and d["delta"]["type"] == "thinking_delta")
+        text = "".join(d["delta"]["text"] for n, d in ev if n == "content_block_delta" and d["delta"]["type"] == "text_delta")
+        js = "".join(d["delta"]["partial_json"] for n, d in ev if n == "content_block_delta" and d["delta"]["type"] == "input_json_delta")
+        self.assertEqual((think.strip(), text, json.loads(js)), ("Hmm.", "Let me look.", {"path": "/etc/hostname"}))
+        md = ev[-2][1]
+        self.assertEqual((md["delta"]["stop_reason"], md["usage"]["output_tokens"] > 0), ("tool_use", True))
+        self.assertEqual(ev[0][1]["message"]["usage"]["output_tokens"], 0)
+
+    def test_errors_and_count_tokens(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+
+        def post(path, body):
+            c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+            c.request("POST", path, json.dumps(body) if not isinstance(body, bytes) else body)
+            r = c.getresponse()
+            return r.status, json.loads(r.read())
+        for body in ({"messages": "x"}, {"max_tokens": 5, "messages": [], "tool_choice": {"type": "any"}},
+                     {"max_tokens": "x", "messages": []}, b"[1]"):
+            for stream in (False, True):
+                if isinstance(body, dict):
+                    body = {**body, "stream": stream}
+                status, o = post("/v1/messages", body)
+                self.assertEqual((status, o["type"], o["error"]["type"]), (400, "error", "invalid_request_error"), body)
+        msgs = {"system": "Be brief.", "messages": [{"role": "user", "content": "How many tokens?"}]}
+        status, o = post("/v1/messages/count_tokens", msgs)
+        want = len(srv.render(self.mk.anthropic_to_chat(msgs))[0])  # (a character tokenizer)
+        self.assertEqual((status, o), (200, {"input_tokens": want}))
+        status, o = post("/v1/messages/batches", {})
+        self.assertEqual((status, o["type"]), (404, "error"))
+
+
+# === api: routes without generation, unsupported routes ===
+class ExtraRouteTests(_HttpCase):
+    def _post(self, http_, path, body):
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+        c.request("POST", path, json.dumps(body))
+        r = c.getresponse()
+        return r.status, json.loads(r.read())
+
+    def test_tokenize_detokenize_template_input_tokens(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        srv.eng.n_vocab = 200
+        srv.eng.piece = lambda t: bytes([t]) if t < 128 else b"\xff"
+        self.assertEqual(self._post(http_, "/tokenize", {"content": "hi"}), (200, {"tokens": [104, 105]}))
+        self.assertEqual(self._post(http_, "/tokenize", {"content": ["h", 5, 300], "with_pieces": True})[1]["tokens"],
+                         [{"id": 104, "piece": "h"}, {"id": 5, "piece": "\x05"}, {"id": 300, "piece": ""}])
+        self.assertEqual(self._post(http_, "/tokenize", {"content": [150], "with_pieces": True})[1]["tokens"],
+                         [{"id": 150, "piece": [255]}])
+        self.assertEqual(self._post(http_, "/tokenize", {"content": "x", "parse_special": False})[0], 400)
+        self.assertEqual(self._post(http_, "/detokenize", {"tokens": [104, 105]}), (200, {"content": "hi"}))
+        self.assertEqual(self._post(http_, "/detokenize", {"tokens": [104, 999]})[0], 400)
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        prompt = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        self.assertEqual(self._post(http_, "/apply-template", body), (200, {"prompt": prompt}))
+        self.assertEqual(self._post(http_, "/v1/chat/completions/input_tokens", body),
+                         (200, {"input_tokens": len(prompt), "object": "response.input_tokens"}))
+        srv.eng.n_vocab = 0  # (a library without mk_n_vocab)
+        self.assertEqual(self._post(http_, "/detokenize", {"tokens": [104]})[0], 400)
+
+    def test_unsupported_routes_are_501_unknown_404(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        for path in ("/v1/completions", "/completion", "/v1/embeddings", "/infill", "/v1/rerank", "/v1/responses",
+                     "/slots/0?action=save"):
+            status, o = self._post(http_, path, {})
+            self.assertEqual(status, 501, path)
+            self.assertIn(path.split("?")[0], o["error"]["message"])
+        self.assertEqual(self._post(http_, "/nope", {})[0], 404)
+
+
 if __name__ == "__main__":
     unittest.main()

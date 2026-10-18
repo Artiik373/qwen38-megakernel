@@ -10,8 +10,10 @@ server around it, with image input. It contains:
 - **Exact output.** Greedy output is the same at every draft depth, so speculation never changes it, and sampled output
   has the same distribution as without drafts. With exact reuse (the launcher's default), a follow-up turn or an edited
   conversation answers bit for bit like the same request sent fresh.
-- **The server** (`server/mk_server.py`): `/v1/chat/completions` (streaming, tools, `reasoning_content`), `/v1/models`,
-  `/health` and `/props`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints. After each
+- **The server** (`server/mk_server.py`): `/v1/chat/completions` (streaming, tools, `reasoning_content`, stop
+  strings), the Anthropic Messages API (`/v1/messages`, streaming, `/v1/messages/count_tokens`: Anthropic SDK clients
+  such as Claude Code), llama-server's `/health`, `/props`, `/v1/models`, `/slots`, `/metrics`, `/tokenize`,
+  `/detokenize`, `/apply-template`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints. After each
   request the engine keeps the GPU's clocks up for a while (keep-warm), so a reply after a pause starts at full speed.
 - **The vision encoder** turns OpenAI `image_url` parts into model input. It runs **on the CPU** (fp32 AVX2 / FMA), so
   images cost no VRAM and the full context stays available.

@@ -300,6 +300,9 @@ int mk_piece(void * hp, int tok, char * buf, int cap) {
 
 int mk_is_eog(void * hp, int tok) { return llama_vocab_is_eog(static_cast<Handle *>(hp)->vocab, tok) ? 1 : 0; }
 
+// the vocabulary's size: valid token ids are 0 .. n - 1 (mk_piece of another id is undefined)
+int mk_n_vocab(void * hp) { return llama_vocab_n_tokens(static_cast<Handle *>(hp)->vocab); }
+
 int mk_set_sampling(void * hp, float temp, float top_p, int top_k, float min_p, unsigned long long seed) {
     try {
         static_cast<Handle *>(hp)->eng->set_sampling(temp, top_p, top_k, min_p, seed);
