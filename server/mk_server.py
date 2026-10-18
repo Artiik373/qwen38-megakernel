@@ -18,7 +18,8 @@ GET /health (503 "Loading model" until the model is loaded), /v1/models, /props,
 /detokenize, /apply-template, /v1/chat/completions/input_tokens (llama-server's shapes).  One request at a time.
 After each request the engine keeps the GPU's clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a
 reply after a pause starts at full speed.
-Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32);
+Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32),
+MK_MAX_VIDEO_FRAMES (video frames per request, default 256);
 the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
 whose client disconnects stops at the next prefill chunk (2048 tokens) or engine cycle. A connection the server closes
 while the client is still sending (an early 4xx for a body it does not read) is half-closed and drained first (bounded),
@@ -36,9 +37,12 @@ import os
 import random
 import re
 import select
+import shutil
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -57,6 +61,9 @@ DEF_TEMP, DEF_TOP_P, DEF_MIN_P = 0.8, 0.95, 0.05  # sampling defaults (a request
 MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64 data: URLs fit)
 MAX_IMAGES = 32  # MK_MAX_IMAGES: images per request
 MAX_STOP, MAX_STOP_LEN = 64, 1024  # stop strings per request, characters per stop string
+MAX_VIDEO_FRAMES = 256  # MK_MAX_VIDEO_FRAMES: video frames per request (all of its videos; 64 s at 4 fps)
+VIDEO_DECODE_S = 300  # a video's ffmpeg decode is stopped after this many seconds (400)
+VIDEO_TS_MS = 5000  # llama.cpp's video timestamp interval (mtmd_helper_video_init_params_default)
 # lingering close (HTTPServer.shutdown_request): what a client still sends after the server's last answer is read and
 # dropped for at most LINGER_S seconds / LINGER_BYTES bytes, LINGER_IDLE_S seconds without data (nginx's defaults)
 LINGER_S, LINGER_IDLE_S, LINGER_BYTES = 30.0, 5.0, 1 << 30
@@ -335,13 +342,28 @@ class Vision:
                 self.v.L.mkv_image_free(self.h)
                 self.h = None
 
+    class Video:
+        """a decoded video in llama.cpp's layout: parts [str | Image], each Image one frame or a frame pair (Qwen-VL's
+        temporal patch of 2: one grid of tokens); owned by Vision.videos (its images are pinned like images)"""
+
+        def __init__(self, key, parts, n_frames):
+            self.key, self.parts, self.n_frames = key, parts, n_frames
+            self.images = [p for p in parts if not isinstance(p, str)]
+
+        def free(self):
+            for im in self.images:
+                im.free()
+
     class Params(ctypes.Structure):
         _fields_ = [("n_threads", ctypes.c_int), ("min_tokens", ctypes.c_int), ("max_tokens", ctypes.c_int),
                     ("flash_attn", ctypes.c_int), ("verbose", ctypes.c_int), ("backend", ctypes.c_int)]
 
     BACKENDS = {"auto": 0, "mtmd": 1, "cpu": 2}
+    frames_ok = False  # the library has video frames (mkv_frames_load)
+    videos = None      # key -> Video, least recently used first (__init__)
+    video_cache_max = 0
 
-    def __init__(self, lib, mmproj, model, threads=0, min_tokens=0, max_tokens=0, cache=8, backend="auto"):
+    def __init__(self, lib, mmproj, model, threads=0, min_tokens=0, max_tokens=0, cache=8, backend="auto", video_cache=2):
         L = self.L = ctypes.CDLL(lib)
         vp, cp = ctypes.c_void_p, ctypes.c_char_p
         for name, res, args in (
@@ -354,6 +376,11 @@ class Vision:
                 ("mkv_image_encode_ms", ctypes.c_double, [vp]), ("mkv_image_free", None, [vp])):
             f = getattr(L, name)
             f.restype, f.argtypes = res, args
+        # video frames (libraries before it: images only)
+        self.frames_ok = hasattr(L, "mkv_frames_load")
+        if self.frames_ok:
+            L.mkv_frames_load.restype = vp
+            L.mkv_frames_load.argtypes = [vp, cp, cp, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         p = L.mkv_params_default()
         p.n_threads, p.min_tokens, p.max_tokens, p.backend = threads, min_tokens, max_tokens, Vision.BACKENDS[backend]
         self.ctx = L.mkv_new(mmproj.encode(), model.encode(), p)
@@ -364,6 +391,8 @@ class Vision:
         self.backend = {1: "libmtmd", 2: "vit_cpu"}.get(L.mkv_backend(self.ctx), "?")
         self.cache = {}  # key -> Image, least recently used first
         self.cache_max = max(1, cache)
+        self.videos = {}  # key -> Video, least recently used first
+        self.video_cache_max = max(0, video_cache)
 
     def image(self, data):
         """the Image of these file bytes (decoded and preprocessed; encoded lazily by rows()), pinned: the caller
@@ -379,14 +408,51 @@ class Vision:
         im.pins += 1
         return im
 
+    def video(self, data, decoder, fps, max_tokens, max_frames):
+        """the Video of these file bytes (decoded by decoder (VideoDecoder) at fps, frames resized to at most max_tokens
+        tokens (0: the image limit); its images are preprocessed, encoded lazily by rows()), pinned like image(). A
+        video of more than max_frames frames is refused (BadRequest) while it decodes."""
+        key = f"{hashlib.sha256(data).hexdigest()}/{fps!r}/{max_tokens}"
+        v = self.videos.pop(key, None)
+        if v is not None and v.n_frames > max_frames:
+            self.videos[key] = v
+            raise BadRequest(f"video of {v.n_frames} frames at {fps:g} fps: over the {max_frames} frames left for this "
+                             f"request (MK_MAX_VIDEO_FRAMES {MAX_VIDEO_FRAMES})")
+        if v is None:
+            parts, n = [], 0
+            try:
+                for kind, x in video_parts(decoder.frames(data, fps, max_frames), fps):
+                    if kind == "text":
+                        parts.append(x)
+                        continue
+                    (w, h, a), b = x[0], x[1]
+                    n += 2 if b else 1
+                    hd = self.L.mkv_frames_load(self.ctx, a, b[2] if b else None, w, h, max_tokens)
+                    if not hd:
+                        raise BadRequest(f"video frame: {self.L.mkv_last_error().decode()}")
+                    parts.append(Vision.Image(self, hd, f"{key}/{len(parts)}"))
+            except BaseException:
+                for im in parts:
+                    if not isinstance(im, str):
+                        im.free()
+                raise
+            v = Vision.Video(key, parts, n)
+        self.videos[key] = v
+        for im in v.images:
+            im.pins += 1
+        return v
+
     def release(self, images):
-        """unpins the images of a request (image() once per pin), then frees the least recently used unpinned images
-        beyond --image-cache"""
+        """unpins the images of a request (image() / video() once per pin), then frees the least recently used unpinned
+        images beyond --image-cache and videos beyond --video-cache"""
         for im in images:
             im.pins -= 1
         extra = len(self.cache) - self.cache_max
         for key in [k for k, im in self.cache.items() if im.pins <= 0][:max(extra, 0)]:
             self.cache.pop(key).free()
+        extra = len(self.videos or ()) - self.video_cache_max
+        for key in [k for k, v in (self.videos or {}).items() if all(im.pins <= 0 for im in v.images)][:max(extra, 0)]:
+            self.videos.pop(key).free()
 
     def warm_up(self):
         """one encode of a 64 x 64 grey PNG (not cached): the first encode after the engine's load pays ~0.5 s once
@@ -415,6 +481,218 @@ def image_bytes(url):
         return base64.b64decode(payload, validate=False)
     except (binascii.Error, ValueError) as e:
         raise BadRequest(f"image_url: bad base64 ({e})")
+
+
+# ---------------------------------------------------------------------------------------------
+# video: frames from ffmpeg, laid out as llama.cpp's mtmd does (mtmd-helper.cpp video helpers + mtmd_tokenize)
+
+
+class VideoBytes(bytes):
+    """the file bytes of a video content part (normalize_messages' media list holds images as plain bytes)"""
+
+
+VIDEO_PARTS = ("input_video", "video_url")  # llama-server's / vLLM's content part types
+
+
+def video_bytes(part):
+    """the file bytes of a video content part: llama-server's {"type": "input_video", "input_video": {"data": base64}}
+    (or {"url": ...}), or {"type": "video_url", "video_url": {"url": ...}}; raw base64 or a base64 data: URL (no remote
+    or file URLs)"""
+    t = part.get("type")
+    v = part.get(t)
+    s = (v.get("data") or v.get("url")) if isinstance(v, dict) else v
+    if not isinstance(s, str) or not s:
+        raise BadRequest(f"{t}: expected base64 data")
+    if s.startswith("data:"):
+        head, sep, s = s.partition(",")
+        if not sep or ";base64" not in head:
+            raise BadRequest(f"{t}: expected a base64 data: URL")
+    elif re.match(r"[a-zA-Z][a-zA-Z0-9+.-]*://", s):
+        raise BadRequest(f"{t}: only base64 data (or a base64 data: URL) is supported, not {s.split(':')[0]}:// URLs")
+    try:
+        data = base64.b64decode(s, validate=False)
+    except (binascii.Error, ValueError) as e:
+        raise BadRequest(f"{t}: bad base64 ({e})")
+    if not data:
+        raise BadRequest(f"{t}: empty video")
+    return VideoBytes(data)
+
+
+def f32(x):
+    """x rounded to float32 (llama.cpp computes the video timestamps in float)"""
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def video_timestamp(k, fps, nxt):
+    """mtmd-helper's timestamp text after frame k (0-based) at fps (float32) given the next threshold nxt (ms):
+    (text or None, the next threshold); float32 arithmetic as there"""
+    elapsed = f32(f32(f32(k) / fps) * 1000.0)
+    if elapsed < nxt:
+        return None, nxt
+    s = f32(elapsed / 1000.0)
+    minutes = int(f32(s / 60.0))
+    sec = f32(s - f32(minutes * 60.0))
+    return f"[{minutes}m{sec:.2f}s]", f32(nxt + VIDEO_TS_MS)
+
+
+def video_parts(frames, fps):
+    """a video's parts as llama.cpp lays them out: ("text", "Video:"), then each frame with a timestamp text
+    ("[0m5.00s]") after every frame that reaches the next 5 s mark (frame 0 included); consecutive frames of one size
+    (no text between) merge in pairs ("frames", (a, b)), a run's odd last frame stays alone ("frames", (a, None)).
+    frames: (width, height, rgb bytes) in order; fps: the sampling rate (float32 in the timestamps)."""
+    fps = f32(fps)
+    yield "text", "Video:"
+    nxt, pend = 0.0, None
+    for k, fr in enumerate(frames):
+        if pend is not None and pend[:2] != fr[:2]:  # (frames of different sizes do not merge)
+            yield "frames", (pend, None)
+            pend = None
+        if pend is None:
+            pend = fr
+        else:
+            yield "frames", (pend, fr)
+            pend = None
+        ts, nxt = video_timestamp(k, fps, nxt)
+        if ts:
+            if pend is not None:
+                yield "frames", (pend, None)
+                pend = None
+            yield "text", ts
+    if pend is not None:
+        yield "frames", (pend, None)
+
+
+def read_ppm(f):
+    """the next binary PPM (P6, maxval 255) of a stream: (width, height, rgb bytes), None at its end"""
+    def token():
+        t = b""
+        while True:
+            c = f.read(1)
+            if not c:
+                return t or None
+            if c == b"#" and not t:  # (a comment line)
+                while c and c not in b"\r\n":
+                    c = f.read(1)
+                continue
+            if c.isspace():
+                if t:
+                    return t
+                continue
+            t += c
+            if len(t) > 16:
+                raise ValueError("bad PPM header")
+    magic = token()
+    if magic is None:
+        return None
+    w, h, mx = token(), token(), token()
+    if magic != b"P6" or not (w and h and mx) or not (w.isdigit() and h.isdigit()) or mx != b"255":
+        raise ValueError("bad PPM header")
+    w, h = int(w), int(h)
+    if not (0 < w <= 65535 and 0 < h <= 65535):
+        raise ValueError(f"bad PPM size {w} x {h}")
+    data = f.read(w * h * 3)
+    if len(data) != w * h * 3:
+        raise ValueError("truncated frame")
+    return w, h, data
+
+
+def find_ffmpeg(explicit=None):
+    """the ffmpeg executable for video input: explicit (--ffmpeg) or MK_FFMPEG (a file, or a directory with it), else
+    ffmpeg on PATH, else the imageio-ffmpeg package's bundled binary (pip install imageio-ffmpeg); None: none found"""
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    p = explicit or os.environ.get("MK_FFMPEG")
+    if p:
+        p = os.path.join(p, exe) if os.path.isdir(p) else p
+        return p if os.path.isfile(p) else None
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    try:
+        import imageio_ffmpeg  # optional
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        return p if p and os.path.isfile(p) else None
+    except Exception:  # (not installed, or no binary for this platform)
+        return None
+
+
+class VideoDecoder:
+    """video file bytes -> RGB24 frames through an ffmpeg executable, sampled by ffmpeg's fps filter as llama.cpp's
+    mtmd-helper does (`-vf fps=F`, rgb24), but read as a PPM stream (each frame carries its size: no ffprobe needed)"""
+
+    def __init__(self, exe):
+        self.exe = exe
+        self.version = ""
+
+    def check(self, timeout=20):
+        """runs `ffmpeg -version`; the first line of its output (RuntimeError if it does not run)"""
+        try:
+            r = subprocess.run([self.exe, "-hide_banner", "-version"], stdin=subprocess.DEVNULL, capture_output=True,
+                               timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError) as e:
+            raise RuntimeError(f"{self.exe}: {e}")
+        if r.returncode != 0:
+            raise RuntimeError(f"{self.exe} -version: exit {r.returncode}")
+        self.version = (r.stdout.decode(errors="replace").splitlines() or ["?"])[0]
+        return self.version
+
+    def frames(self, data, fps, max_frames, timeout=None):
+        """yields (width, height, rgb bytes) per frame; BadRequest for a video ffmpeg cannot decode, one of more than
+        max_frames frames (when the next frame arrives) or a decode over `timeout` seconds"""
+        timeout = VIDEO_DECODE_S if timeout is None else timeout
+        with tempfile.TemporaryDirectory(prefix="mkvideo") as d:
+            path = os.path.join(d, "input")
+            with open(path, "wb") as f:
+                f.write(data)
+            cmd = [self.exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", path, "-an", "-sn",
+                   "-vf", f"fps={fps:.6f}", "-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "pipe:1"]
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except OSError as e:
+                raise BadRequest(f"video: cannot run ffmpeg ({e})")
+            err = bytearray()
+
+            def drain():  # (stderr in a thread: a chatty ffmpeg must not block on a full pipe)
+                for line in p.stderr:
+                    err.extend(line)
+                    del err[:-4096]
+            th = threading.Thread(target=drain, name="mk-ffmpeg-stderr", daemon=True)
+            th.start()
+            killed = threading.Event()
+
+            def kill():
+                killed.set()
+                p.kill()
+            timer = threading.Timer(timeout, kill)
+            timer.start()
+            n = 0
+            try:
+                while True:
+                    try:
+                        fr = read_ppm(p.stdout)
+                    except ValueError as e:
+                        if killed.is_set():
+                            break
+                        raise BadRequest(f"video: bad frame stream from ffmpeg ({e})")
+                    if fr is None:
+                        break
+                    n += 1
+                    if n > max_frames:
+                        raise BadRequest(f"video of more than {max_frames} frames at {fps:g} fps (MK_MAX_VIDEO_FRAMES "
+                                         f"{MAX_VIDEO_FRAMES} per request)")
+                    yield fr
+            finally:
+                timer.cancel()
+                if p.poll() is None:
+                    p.kill()
+                p.stdout.close()
+                p.wait()
+                th.join(5)
+            if killed.is_set():
+                raise BadRequest(f"video: decoding took over {timeout} s")
+            if n == 0:
+                msg = err.decode(errors="replace").strip().splitlines()
+                raise BadRequest("video: no frames decoded" + (f" ({msg[-1][:300]})" if msg else ""))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -449,23 +727,31 @@ MEDIA_MARKER = "<__media__>"  # llama-server's (mtmd_default_marker)
 
 
 def normalize_messages(messages, media=None):
-    """media (a list: the server has a vision encoder): image_url parts become MEDIA_MARKER and their file bytes are
-    appended to media in order. A message with images is flattened to one string as llama-server does (text parts
-    joined by newlines, no newline next to an image), so the prompt around each image is llama-server's."""
+    """media (a list: the server has a vision encoder): image_url parts and video parts (input_video / video_url)
+    become MEDIA_MARKER and their file bytes are appended to media in order (videos as VideoBytes). A message with
+    media is flattened to one string as llama-server does (text parts joined by newlines, no newline next to an image
+    or video), so the prompt around each is llama-server's."""
     out = []
     for m in messages:
         m = dict(m)
         content = m.get("content")
         if isinstance(content, list):
             for part in content:
-                if isinstance(part, dict) and part.get("type") not in (None, "text", "image_url"):
-                    raise BadRequest(f"unsupported content part type {part.get('type')!r} (text and image_url only)")
-            if any(isinstance(p, dict) and p.get("type") == "image_url" for p in content):
+                if isinstance(part, dict) and part.get("type") not in (None, "text", "image_url", *VIDEO_PARTS):
+                    raise BadRequest(f"unsupported content part type {part.get('type')!r} (text, image_url, "
+                                     f"input_video and video_url only)")
+            kinds = {p.get("type") for p in content if isinstance(p, dict)}
+            if kinds & {"image_url", *VIDEO_PARTS}:
                 if media is None:
-                    raise BadRequest("image input is not supported: start the server with --mmproj")
+                    what = "image" if "image_url" in kinds else "video"
+                    raise BadRequest(f"{what} input is not supported: start the server with --mmproj")
                 text, after_media = "", False
                 for part in content:
-                    if part.get("type") == "image_url":
+                    if part.get("type") in VIDEO_PARTS:
+                        media.append(video_bytes(part))
+                        text += MEDIA_MARKER
+                        after_media = True
+                    elif part.get("type") == "image_url":
                         iu = part.get("image_url")
                         media.append(image_bytes(iu.get("url") if isinstance(iu, dict) else iu))
                         text += MEDIA_MARKER
@@ -890,6 +1176,8 @@ ANTHROPIC_ERRORS = {400: "invalid_request_error", 404: "not_found_error", 413: "
 
 class Server:
     vision = None   # Vision (--mmproj), else text only
+    decoder = None  # VideoDecoder (an ffmpeg was found): video input with the vision encoder
+    video_ok = False  # video input works in this process (mmproj loaded, frame-pair encoder, ffmpeg): /props
     img_spans = ()  # the images of the engine's sequence: (pos, n, key); replaced, never mutated
     stop_word = None  # the stop string that ended the last reply (None: it ended otherwise)
     last_prompt = (0, 0)  # the running request's prompt: (tokens, reused tokens), once it is processed
@@ -909,13 +1197,14 @@ class Server:
             if not self.eng.images:
                 raise RuntimeError(f"{args.lib} has no image input (mk_prefill_img): rebuild it")
             self.vision = Vision(args.vision_lib, args.mmproj, args.model, args.vision_threads, args.image_min_tokens,
-                                 args.image_max_tokens, args.image_cache, args.vision_backend)
+                                 args.image_max_tokens, args.image_cache, args.vision_backend, args.video_cache)
             if self.vision.n_embd != self.eng.L.mk_n_embd():
                 raise RuntimeError(f"mmproj rows of {self.vision.n_embd} for a model of {self.eng.L.mk_n_embd()}")
             ids = [self.eng.tokenize(t) for t in ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>")]
             if any(len(i) != 1 for i in ids):
                 raise RuntimeError("the vocabulary has no <|vision_start|> / <|vision_end|> / <|image_pad|> tokens")
             self.vis_start, self.vis_end, self.img_pad = (i[0] for i in ids)
+            self.setup_video(args)
         self.warm_up()
         self.model_id = os.path.basename(args.model)
         self.lock = threading.Lock()
@@ -943,6 +1232,30 @@ class Server:
         self.eng.reset()
         if self.vision:
             self.vision.warm_up()
+
+    def setup_video(self, args):
+        """video input (input_video / video_url parts): needs the vision library's frame pairs (mkv_frames_load) and an
+        ffmpeg (find_ffmpeg); without them video requests get a 400 and video_ok stays False"""
+        if args.video_max_tokens and self.vision.backend != "vit_cpu":
+            raise RuntimeError("--video-max-tokens needs the cpu vision backend (libmtmd resizes frames as images)")
+        if not self.vision.frames_ok:
+            log(f"video input off: {args.vision_lib} has no video frames (mkv_frames_load): rebuild it")
+            return
+        exe = find_ffmpeg(args.ffmpeg)
+        if not exe:
+            log("video input off: no ffmpeg (--ffmpeg / MK_FFMPEG, ffmpeg on PATH, or pip install imageio-ffmpeg)"
+                if not (args.ffmpeg or os.environ.get("MK_FFMPEG")) else
+                f"video input off: ffmpeg not found at {args.ffmpeg or os.environ.get('MK_FFMPEG')}")
+            return
+        dec = VideoDecoder(exe)
+        try:
+            dec.check()
+        except RuntimeError as e:
+            log(f"video input off: {e}")
+            return
+        self.decoder, self.video_ok = dec, True
+        log(f"video input: {exe} ({dec.version}), {args.video_fps:g} fps, frames of at most "
+            f"{args.video_max_tokens or args.image_max_tokens or 'the default'} tokens, {MAX_VIDEO_FRAMES} frames per request")
 
     def warn_once(self, key, msg):
         if key not in self.warned:
@@ -1102,30 +1415,57 @@ class Server:
         except jinja2.exceptions.TemplateError as e:
             raise BadRequest(f"chat template: {e}")
         thinking = text.endswith("<think>\n")
-        if media and len(media) > MAX_IMAGES:
-            raise BadRequest(f"{len(media)} images in one request: at most {MAX_IMAGES} (MK_MAX_IMAGES)")
+        n_img = sum(1 for d in media or [] if not isinstance(d, VideoBytes))
+        if n_img > MAX_IMAGES:
+            raise BadRequest(f"{n_img} images in one request: at most {MAX_IMAGES} (MK_MAX_IMAGES)")
+        if n_img < len(media or []) and not self.video_ok:
+            raise BadRequest("video input is not available: " + (
+                "the server found no ffmpeg (--ffmpeg / MK_FFMPEG, ffmpeg on PATH, or pip install imageio-ffmpeg)"
+                if self.vision is not None and self.vision.frames_ok else "the vision library has no video frames"))
         if media and text.count(MEDIA_MARKER) != len(media):
-            raise BadRequest(f"the rendered prompt has {text.count(MEDIA_MARKER)} image markers for {len(media)} images")
+            raise BadRequest(f"the rendered prompt has {text.count(MEDIA_MARKER)} media markers for {len(media)} images / videos")
         return text, thinking, media or []
 
     def tokenize_prompt(self, text, media):
         """the prompt's token ids and its images [(pos, Vision.Image)]: each MEDIA_MARKER becomes <|vision_start|>, the
         image's rows (<|image_pad|> placeholders, nx * ny of them), <|vision_end|>; the text between is tokenized piece
-        by piece, as mtmd_tokenize does. The images are pinned (Vision.image): the caller releases them."""
+        by piece, as mtmd_tokenize does. A video's marker becomes its parts (Vision.video: texts, and frames / frame
+        pairs each like an image). The images are pinned (Vision.image / video): the caller releases them."""
         if not media:
             return self.eng.tokenize(text), []
         toks, images = [], []
         segs = text.split(MEDIA_MARKER)
+        frames_left = MAX_VIDEO_FRAMES
+
+        def add_image(im, j=None):  # (j: its slot in images, else appended)
+            toks.append(self.vis_start)
+            if j is None:
+                images.append((len(toks), im))
+            else:
+                images[j] = (len(toks), im)
+            toks.extend([self.img_pad] * im.n)
+            toks.append(self.vis_end)
         try:
             for i, seg in enumerate(segs):
                 if seg:
                     toks += self.eng.tokenize(seg)
                 if i < len(media):
-                    im = self.vision.image(media[i])
-                    toks.append(self.vis_start)
-                    images.append((len(toks), im))
-                    toks += [self.img_pad] * im.n
-                    toks.append(self.vis_end)
+                    if isinstance(media[i], VideoBytes):
+                        # llama.cpp's layout: "Video:", frames / frame pairs as images, timestamp texts between (each
+                        # text tokenized on its own, as mtmd_tokenize does)
+                        v = self.vision.video(media[i], self.decoder, self.args.video_fps, self.args.video_max_tokens,
+                                              frames_left)
+                        j = len(images)
+                        images.extend((None, im) for im in v.images)  # (all pinned now: released below on an error)
+                        frames_left -= v.n_frames
+                        for part in v.parts:
+                            if isinstance(part, str):
+                                toks += self.eng.tokenize(part)
+                            else:
+                                add_image(part, j)
+                                j += 1
+                    else:
+                        add_image(self.vision.image(media[i]))
                     if len(toks) + 16 >= self.args.ctx:  # (no more images decoded for a prompt that cannot run)
                         raise BadRequest(f"prompt of at least {len(toks)} tokens does not fit the context of {self.args.ctx}")
         except BaseException:
@@ -1175,7 +1515,15 @@ class Server:
             if any(im.encode_s is None for _, im in fed):
                 # the CPU encodes leave the GPU idle (up to seconds): keep its clocks up until the prefill's first launch
                 eng.keep_warm()
-            imgs = [(p, im.nx, im.ny, im.rows()) for p, im in fed]
+            imgs, armed = [], time.monotonic()
+            for p, im in fed:  # (a video's frame pairs encode for seconds to minutes: a client that left stops them)
+                if imgs and im.encode_s is None:
+                    if gone is not None and gone():
+                        raise PrefillCancelled(f"the client left during the image encodes ({len(imgs)} of {len(fed)} done)")
+                    if time.monotonic() - armed > 30:  # (keep-warm re-armed through long encodes)
+                        eng.keep_warm()
+                        armed = time.monotonic()
+                imgs.append((p, im.nx, im.ny, im.rows()))
             with eng.cancel_when(gone):
                 if imgs:
                     return eng.prefill(toks[start:], gen, self.ck_positions(toks, start), imgs), start
@@ -1797,7 +2145,7 @@ def env_int(name, default):
 
 
 def main():
-    global MAX_BODY_MB, MAX_IMAGES
+    global MAX_BODY_MB, MAX_IMAGES, MAX_VIDEO_FRAMES
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
@@ -1828,9 +2176,25 @@ def main():
                     help="maximum tokens per image (0: the mmproj's default, 4096 for Qwen3.x; fewer encode faster)")
     ap.add_argument("--image-cache", type=int, default=8,
                     help="images kept decoded / encoded for reuse (a request holds all of its own while it runs)")
+    ap.add_argument("--video-fps", type=float, default=4.0,
+                    help="video input (input_video / video_url parts; --mmproj and ffmpeg): frames sampled per second "
+                         "(llama.cpp's default 4); every two frames are one grid of tokens")
+    ap.add_argument("--video-max-tokens", type=int, default=0,
+                    help="maximum tokens per video frame (pair) (0: --image-max-tokens, as llama.cpp; fewer encode faster "
+                         "and fit longer clips; cpu vision backend)")
+    ap.add_argument("--video-cache", type=int, default=2,
+                    help="videos kept decoded / encoded for reuse by the next requests of a conversation")
+    ap.add_argument("--ffmpeg", default=None,
+                    help="ffmpeg executable (or its directory) for video input (env MK_FFMPEG; default: ffmpeg on PATH, "
+                         "else the imageio-ffmpeg package's)")
     args = ap.parse_args()
+    if not 0 < args.video_fps <= 30:
+        ap.error("--video-fps: expected a rate in (0, 30]")
+    if args.video_max_tokens and args.video_max_tokens < max(8, args.image_min_tokens):
+        ap.error("--video-max-tokens: expected 0 or at least 8 (and --image-min-tokens)")
     MAX_BODY_MB = env_int("MK_MAX_BODY_MB", MAX_BODY_MB)
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
+    MAX_VIDEO_FRAMES = env_int("MK_MAX_VIDEO_FRAMES", MAX_VIDEO_FRAMES)
     if args.exact_reuse:
         os.environ["MK_EXACT"] = "1"  # read by the engine at construction
     # the port opens first (a busy port fails before the model loads); until the load is done every request gets a 503
