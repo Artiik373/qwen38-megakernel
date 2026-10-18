@@ -1308,6 +1308,16 @@ __device__ __forceinline__ const uint8_t * stage_embd_row(int tok, uint8_t * dst
 // serial per-unit quantise chain while the grid waited (the row fetch itself is ~free, MK_EMBD_DEVICE A/B)
 constexpr int EMB_UB = 16; // units per embed block
 static_assert(U_D % EMB_UB == 0 && EMB_UB == NW, "embed_prologue: one unit per warp");
+// Grid size (one block per SM): phases that hand one block to each item (embed_prologue U_D / EMB_UB blocks per row,
+// dn_core one per DeltaNet head, the MTP M0 MTP_M0_NB per catch-up row, up to 5 rows) skip items silently on a smaller
+// grid, so the engine refuses a GPU with fewer SMs than mk_min_grid(rows per launch) at load. lm_head's per-block
+// (max, sum) table (SM_LSE) and the MK_PROFILE stamps hold MK_MAX_GRID blocks: a larger GPU runs that many.
+constexpr int MTP_M0_NB = 10;
+constexpr int MK_MAX_GRID = 128;
+constexpr int mk_min_grid(int rows) {
+    return rows * (U_D / EMB_UB) > NVH && rows * (U_D / EMB_UB) > 5 * MTP_M0_NB ? rows * (U_D / EMB_UB) : NVH > 5 * MTP_M0_NB ? NVH : 5 * MTP_M0_NB;
+}
+static_assert(mk_min_grid(MAXT) <= MK_MAX_GRID, "grid size");
 __device__ __forceinline__ void stage_embd_part(int tok, int b0, int nbytes, uint8_t * dst) {
     if (threadIdx.x < nbytes / 16)
         reinterpret_cast<uint4 *>(dst)[threadIdx.x] = reinterpret_cast<const uint4 *>(cW.embd + (size_t) tok * EMBD_RB + b0)[threadIdx.x];
@@ -4025,7 +4035,7 @@ __device__ __noinline__ void tk_grid_chain(int t, float * tv, int * ti, int * ts
 constexpr int SM_CAND = MAXT * 16 * 32 * 12 > 32768 ? MAXT * 16 * 32 * 12 : 32768;
 constexpr int SM_DQ = SM_CAND + MAXT * 32 * 8; // and the drafts' proposals q' staged for sample_targets
 constexpr int SM_LSE = SM_DQ + MAXT * 32 * 8;   // the draft lm_head's per-block (max, sum of exp), [gridDim.x]
-static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + 128 * 8 <= SM_MISC, "top-k merge shared memory");
+static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + MK_MAX_GRID * 8 <= SM_MISC, "top-k merge shared memory");
 
 // lm_head over TL rows (qn rows t0..t0+TL-1) with greedy argmax; returns true in the single
 // block that finished last, which holds the reduced argmax in s_tok.  TOPK: additionally keeps the
@@ -4692,7 +4702,7 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
     // M0: concat(enorm(embed(tok)), hnorm(h_prev)) -> qe.  M0_NB blocks per row: each computes the row's two norms
     // (the same sums in the same order in every block) and quantises its share of the 2 U_D units (was: one block per
     // row doing all 320 units, ~20 us while the grid waited)
-    constexpr int M0_NB = 10;
+    constexpr int M0_NB = MTP_M0_NB;
     if (blockIdx.x < R * M0_NB) {
         const int r = blockIdx.x / M0_NB, s = blockIdx.x - r * M0_NB;
         const int pos = pos0 + r;
@@ -4809,7 +4819,7 @@ __device__ __noinline__ void mtp_kv_pass(int row0, unsigned & epoch) {
     volatile Ctl * vc = cB.ctl;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int pos0 = vc->mtp_pos[row0];
-    constexpr int M0_NB = 10; // (M0 of mtp_pass, catch-up rows)
+    constexpr int M0_NB = MTP_M0_NB; // (M0 of mtp_pass, catch-up rows)
     if (blockIdx.x < R * M0_NB) {
         const int r = blockIdx.x / M0_NB, s = blockIdx.x - r * M0_NB;
         const int pos = pos0 + r;
@@ -6664,6 +6674,14 @@ struct MKEngine::Impl {
             CK(cudaGetDeviceProperties(&prop, 0));
             CK(cudaFree(0));
         }
+        { // the persistent kernel runs one block per SM (mk_min_grid: launches of up to MAXT rows when n_draft > 4)
+            const int rows = ndraft_ + 1 > MAXT_PF ? MAXT : MAXT_PF, need = mk_min_grid(rows);
+            if (prop.multiProcessorCount < need)
+                throw std::runtime_error(std::string(prop.name) + " has " + std::to_string(prop.multiProcessorCount) +
+                                         " SMs; the megakernel runs one block per SM and needs at least " + std::to_string(need) +
+                                         " (launches of " + std::to_string(rows) + " rows at n_draft " + std::to_string(ndraft_) +
+                                         "; n_draft <= 4: " + std::to_string(mk_min_grid(MAXT_PF)) + ")");
+        }
         upl.start(!(getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0));
         // token_embd's mapped pinned table (0.7 GB: ~0.8 s under WSL2) allocated by a helper thread while the weights load
         // (MK_LOAD_PINBG=0: at its turn, as before)
@@ -6678,7 +6696,9 @@ struct MKEngine::Impl {
             embd_pin_s = lsec(t0);
         };
         if (!embd_dev && !(getenv("MK_LOAD_PINBG") && atoi(getenv("MK_LOAD_PINBG")) == 0)) embd_th.t = std::thread(embd_alloc);
-        nsm = prop.multiProcessorCount;
+        nsm = std::min(prop.multiProcessorCount, MK_MAX_GRID); // (blocks of the persistent kernel)
+        if (nsm < prop.multiProcessorCount)
+            fprintf(stderr, "[mk] %d SMs: the persistent kernel runs %d blocks (MK_MAX_GRID)\n", prop.multiProcessorCount, nsm);
         CK(cudaEventCreateWithFlags(&wd_ev, cudaEventDisableTiming));
         if (const char * w = getenv("MK_WATCHDOG")) wd_limit = atof(w);
         if (const char * w = getenv("MK_WATCHDOG_SPIN")) wd_spin_s = atof(w);

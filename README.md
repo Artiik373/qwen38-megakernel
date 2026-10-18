@@ -110,7 +110,8 @@ inside: [docs/ENGINE.md](docs/ENGINE.md).
 
 ## Requirements
 
-- **GPU:** NVIDIA Ampere or newer (sm_86 tested; the kernels use sm_80+ features) with 24 GB of VRAM.
+- **GPU:** NVIDIA Ampere or newer (sm_86 tested; the kernels use sm_80+ features) with 24 GB of VRAM and at least 80
+  SMs for more than 4 drafts (50 for up to 4; the engine checks at load).
 - **CUDA:** 13.2 is what we build with; older 12.x versions are untested.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64 ([Windows](#windows) has its own build steps).
 - **RAM:** about 27 GB free to compile the served configuration (ptxas). The lean build needs ~12 GB.

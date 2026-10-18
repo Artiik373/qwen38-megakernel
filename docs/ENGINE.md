@@ -447,6 +447,9 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
   and UD-Q4_K_XL); the loader rejects any other model or type. Tuned and tested on sm_86 (RTX 3090); built for sm_86,
   sm_89 and sm_120 GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
 - More than 4 drafts needs the served build and the q8 KV cache (`--kv q8`; low-bit `MK_KV` presets are fine).
+- The decode kernel runs one block per SM and needs at least 80 SMs for more than 4 drafts (50 for up to 4): the
+  engine refuses a smaller GPU at load, naming the requirement (an RTX 3090 has 82). On a GPU with more than 128 SMs it
+  runs 128 blocks.
 - Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order), and presence / frequency
   penalties on the generated tokens (applied first; greedy too; exact under speculative verification: a verify row also
   counts the drafts before it); no repetition penalty.
