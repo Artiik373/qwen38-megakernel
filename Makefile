@@ -54,9 +54,17 @@ qwen38_mk: qwen38_mk.o main.cu logit_stats.h
 	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -I$(LLAMA)/include -I$(LLAMA)/ggml/include main.cu qwen38_mk.o \
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 
+# the build's commit and engine flags (capi.cpp mk_build_info, the server's /props); rewritten only when they change
+build/mk_build_info.h: FORCE
+	@mkdir -p build
+	@printf '#define MK_BUILD_COMMIT "%s"\n#define MK_BUILD_FLAGS "%s"\n' \
+		"$$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)$$(git diff --quiet HEAD -- 2>/dev/null || echo -dirty)" \
+		"$(strip $(MKFLAGS))" > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
 # engine + tokenizer as a shared library with a C API (capi.cpp), used by server/mk_server.py
-libqwen38mk.so: qwen38_mk.o capi.cpp qwen38_mk.h
-	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk.o \
+libqwen38mk.so: qwen38_mk.o capi.cpp qwen38_mk.h build/mk_build_info.h
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -Ibuild -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk.o \
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 
 tools/vocab_freq: tools/vocab_freq.cpp
@@ -75,4 +83,4 @@ tests/gguf_fuzz: tests/gguf_fuzz.cpp gguf.h
 clean:
 	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz
 
-.PHONY: all vision clean
+.PHONY: all vision clean FORCE

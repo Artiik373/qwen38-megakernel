@@ -83,8 +83,20 @@ if (& $want "engine") {
         Write-Host ("qwen38_mk.cu compiled in {0:n0} s" -f ((Get-Date) - $t0).TotalSeconds)
     }
     Write-Def "capi.cpp" "mk_" "qwen38mk.dll" "build_win\qwen38mk.def"
+    # the build's commit and engine flags for capi.cpp's mk_build_info (the server's /props)
+    $commit = "unknown"
+    try {
+        $c = (& git rev-parse --short=12 HEAD 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $c) {
+            $commit = $c.Trim()
+            & git diff --quiet HEAD -- 2>$null
+            if ($LASTEXITCODE -ne 0) { $commit += "-dirty" }
+        }
+    } catch { }
+    Set-Content -Encoding ascii "build_win\mk_build_info.h" @("#define MK_BUILD_COMMIT `"$commit`"",
+        "#define MK_BUILD_FLAGS `"$(($MkFlags -split '\s+' | Where-Object { $_ }) -join ' ')`"")
     $link = @("-O3", "-std=c++17", "-arch=$Arch", "-Xcompiler", $hostFlags) + $llInc
-    Run $nvcc ($link + @("-shared", "capi.cpp", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") + $llLib +
+    Run $nvcc ($link + @("-shared", "-Ibuild_win", "capi.cpp", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") + $llLib +
                @("-Xlinker", "/DEF:build_win\qwen38mk.def", "-o", "qwen38mk.dll"))
     Run $nvcc ($link + @("main.cu", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") + $llLib + @("-o", "qwen38_mk.exe"))
     Copy-LlamaDlls $PSScriptRoot

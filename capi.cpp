@@ -17,6 +17,22 @@
 #include "llama.h"
 #include "qwen38_mk.h"
 
+// the build's commit and engine flags for mk_build_info: written by the build into its output directory (Makefile:
+// build/, build.ps1: build_win\), which it puts on the include path of this file
+#if defined(__has_include)
+#if __has_include("mk_build_info.h")
+#include "mk_build_info.h"
+#endif
+#endif
+#ifndef MK_BUILD_COMMIT
+#define MK_BUILD_COMMIT "unknown"
+#endif
+#ifndef MK_BUILD_FLAGS
+#define MK_BUILD_FLAGS "unknown"
+#endif
+#define MK_STR2(...) #__VA_ARGS__
+#define MK_STR(...) MK_STR2(__VA_ARGS__)
+
 namespace {
 // ---- keep-warm (MK_KEEP_WARM_S) ----
 // A few seconds without GPU work and the driver drops the clocks (P8); a reply that starts there runs its first ~2 s at
@@ -466,6 +482,21 @@ void mk_last(void * hp, int * T, int * nd, int * acc) {
     *T = s.last_T;
     *nd = s.last_nd;
     *acc = s.last_acc;
+}
+
+// the library's build as JSON: {"commit", "flags" (the engine's MKFLAGS), "cuda" (the runtime it was built against),
+// "arch" (nvcc's GPU architectures, when nvcc says)} for the server's /props; commit and flags are "unknown" when the
+// build did not write mk_build_info.h
+const char * mk_build_info() {
+    static const std::string s = [] {
+        std::string j = "{\"commit\": \"" MK_BUILD_COMMIT "\", \"flags\": \"" MK_BUILD_FLAGS "\", \"cuda\": \"" +
+                        std::to_string(CUDART_VERSION / 1000) + "." + std::to_string(CUDART_VERSION % 1000 / 10) + "\"";
+#ifdef __CUDA_ARCH_LIST__
+        j += ", \"arch\": \"" MK_STR(__CUDA_ARCH_LIST__) "\"";
+#endif
+        return j + "}";
+    }();
+    return s.c_str();
 }
 
 } // extern "C"

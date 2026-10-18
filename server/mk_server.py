@@ -13,7 +13,8 @@ matched against the sequence so far and only the rest is prefilled. When the new
 what the engine already processed, it rewinds to the last DeltaNet checkpoint at or before the
 divergence (saved during earlier prefills: at each generation prompt, each message start and every
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
-GET /health, GET /v1/models.  One request at a time.  After each request the engine keeps the GPU's
+GET /health (503 "Loading model" until the model is loaded), /v1/models, /props, /slots, /metrics (llama-server's
+shapes).  One request at a time.  After each request the engine keeps the GPU's
 clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
 Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32);
 the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
@@ -38,15 +39,18 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import uuid
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOPK_MAX = 32
+DEF_TEMP, DEF_TOP_P, DEF_MIN_P = 0.8, 0.95, 0.05  # sampling defaults (a request's absent / null fields)
 # request limits; main() reads them from the environment
 MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64 data: URLs fit)
 MAX_IMAGES = 32  # MK_MAX_IMAGES: images per request
@@ -138,6 +142,27 @@ class Engine:
         self._cancel = hasattr(L, "mk_cancel")
         if self._cancel:
             L.mk_cancel.restype, L.mk_cancel.argtypes = ctypes.c_int, [vp, ctypes.c_int]
+        # decode statistics; the library's build (commit, engine flags; libraries before it: unknown)
+        self._stats = hasattr(L, "mk_stats")
+        if self._stats:
+            lp = ctypes.POINTER(ctypes.c_long)
+            L.mk_stats.restype, L.mk_stats.argtypes = None, [vp, lp, lp, lp]
+        self.build = None
+        if hasattr(L, "mk_build_info"):
+            L.mk_build_info.restype, L.mk_build_info.argtypes = ctypes.c_char_p, []
+            raw = L.mk_build_info().decode(errors="replace")
+            try:
+                self.build = json.loads(raw)
+            except ValueError:
+                self.build = {"raw": raw}
+
+    def stats(self):
+        """(decode cycles, drafted tokens, accepted drafts) since the load, or None (a library without mk_stats)"""
+        if not self._stats:
+            return None
+        c, d, a = ctypes.c_long(), ctypes.c_long(), ctypes.c_long()
+        self.L.mk_stats(self.h, ctypes.byref(c), ctypes.byref(d), ctypes.byref(a))
+        return c.value, d.value, a.value
 
     def _err(self, what):
         return RuntimeError(f"{what}: {self.L.mk_last_error().decode()}")
@@ -649,7 +674,8 @@ class Server:
                           {"f16": 0, "q8": 1, "auto": -1}[args.kv], "none" if args.no_mtp else args.mtp)
         if not self.eng.has_mtp:
             log("no MTP layer: plain decoding (depth 0)")
-        self.template = make_template(self.eng.chat_template())
+        self.template_src = self.eng.chat_template()
+        self.template = make_template(self.template_src)
         im = self.eng.tokenize("<|im_start|>")
         self.im_start = im[0] if len(im) == 1 else None  # checkpoint at the start of the generation prompt
         if args.mmproj:
@@ -669,8 +695,10 @@ class Server:
         self.warned = set()
         vis = (f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.backend}, {self.vision.n_threads} threads)"
                if self.vision else "")
+        self.stats0 = self.eng.stats()  # (the warm-up's cycle: /metrics counts from here)
+        self.t_start = time.time()
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts{vis}")
-        self.eng.keep_warm()  # (MK_KEEP_WARM_S: the first reply starts at full clocks too)
+        self.warm_s = self.eng.keep_warm()  # (MK_KEEP_WARM_S: the first reply starts at full clocks too)
 
     def warm_up(self):
         """Runs one prefill and one decode cycle before the server listens.
@@ -693,6 +721,122 @@ class Server:
         if key not in self.warned:
             self.warned.add(key)
             log("warning:", msg)
+
+    # ---- reporting: /props, /v1/models, /slots, /metrics ----
+    METRICS = ("requests", "requests_bad", "requests_failed", "requests_cancelled", "deferred", "prompt_tokens",
+               "prompt_tokens_reused", "prompt_seconds", "tokens_predicted", "predicted_seconds")
+    _mlock = threading.Lock()
+    t_start = 0.0
+    warm_s = 0.0
+    stats0 = stats1 = None  # engine (cycles, drafted, accepted) after the warm-up / after the last request
+
+    def count(self, **kw):
+        """adds to the counters of /metrics"""
+        with self._mlock:
+            m = self.__dict__.setdefault("metrics", dict.fromkeys(self.METRICS, 0))
+            for k, v in kw.items():
+                m[k] += v
+
+    def counters(self):
+        with self._mlock:
+            return dict(self.__dict__.get("metrics") or dict.fromkeys(self.METRICS, 0))
+
+    def busy(self):
+        return self.lock.locked()
+
+    def engine_info(self):
+        """what the server knows for sure about its engine: arguments, environment, the library's own answers"""
+        a, e, v = self.args, self.eng, self.vision
+        g = lambda o, k, d=None: getattr(o, k, d)  # noqa: E731 (fake engines in the tests have fewer attributes)
+        return {
+            "build": g(e, "build"), "lib": os.path.basename(str(g(a, "lib", ""))),
+            "n_ctx": a.ctx, "kv": g(a, "kv"),  # (the KV format asked for; "auto" is resolved inside the engine)
+            "mtp": g(e, "has_mtp", True), "mtp_file": g(a, "mtp"),
+            "draft_depth": g(a, "draft") if g(e, "has_mtp", True) else 0,
+            "draft_vocab": os.path.basename(a.draft_vocab) if isinstance(g(a, "draft_vocab"), str) else None,
+            "exact_reuse": bool(g(e, "exact", False)),
+            "checkpoints": {"pool": bool(g(e, "pool", False)), "every": g(a, "ck_every"), "messages": bool(g(a, "ck_msgs")),
+                            "slots": int(os.environ.get("MK_CK_SLOTS") or 8)},
+            "keep_warm_s": self.warm_s, "prefill_cancel": bool(g(e, "_cancel", False)),
+            "vision": None if v is None else {
+                "mmproj": os.path.basename(str(g(a, "mmproj", ""))), "backend": g(v, "backend"),
+                "threads": g(v, "n_threads"), "image_min_tokens": g(a, "image_min_tokens"),
+                "image_max_tokens": g(a, "image_max_tokens"), "image_cache": g(v, "cache_max")},
+            "limits": {"max_body_mb": MAX_BODY_MB, "max_images": MAX_IMAGES, "max_stop": MAX_STOP,
+                       "image_max_pixels": int(os.environ.get("MK_IMAGE_MAX_PIXELS") or 100_000_000)},
+            "env": {k: val for k, val in sorted(os.environ.items()) if k.startswith("MK_")},
+            "busy": self.busy(), "uptime_s": round(time.time() - self.t_start, 1) if self.t_start else 0.0,
+        }
+
+    def props(self):
+        """llama-server's GET /props fields we have, plus `engine` (engine_info)"""
+        b = getattr(self.eng, "build", None) or {}
+        params = {"temperature": DEF_TEMP, "top_k": TOPK_MAX, "top_p": DEF_TOP_P, "min_p": DEF_MIN_P, "seed": -1,
+                  "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": -1, "n_predict": -1, "stop": [],
+                  "stream": False, "n_probs": 0}
+        return {
+            "default_generation_settings": {"n_ctx": self.args.ctx, "params": params},
+            "total_slots": 1, "model_alias": self.model_id, "model_path": getattr(self.args, "model", None),
+            "modalities": {"vision": self.vision is not None, "video": bool(getattr(self, "video_ok", False)),
+                           "audio": False},
+            "media_marker": MEDIA_MARKER, "endpoint_slots": True, "endpoint_props": False, "endpoint_metrics": True,
+            "chat_template": getattr(self, "template_src", None),
+            "build_info": f"{b.get('commit', 'unknown')} {b.get('flags', '')}".strip() if b else "unknown",
+            "is_sleeping": False, "engine": self.engine_info(),
+        }
+
+    def models(self):
+        """GET /v1/models: the one model, with llama-server's meta where we have it"""
+        meta = {"n_ctx": self.args.ctx}
+        try:
+            meta["size"] = os.path.getsize(self.args.model)
+        except (OSError, TypeError):
+            pass
+        if getattr(self.eng, "images", False):
+            meta["n_embd"] = self.eng.L.mk_n_embd()
+        caps = ["completion"] + (["multimodal"] if self.vision is not None else [])
+        return {"object": "list",
+                "data": [{"id": self.model_id, "object": "model", "created": int(self.t_start), "owned_by": "openjet",
+                          "meta": meta}],
+                "models": [{"name": self.model_id, "model": self.model_id, "type": "model", "capabilities": caps,
+                            "details": {"format": "gguf"}}]}
+
+    def slots(self):
+        """GET /slots: the one slot (llama-server's fields we have)"""
+        return [{"id": 0, "n_ctx": self.args.ctx, "is_processing": self.busy(),
+                 "speculative": bool(getattr(self.eng, "has_mtp", True)) and bool(getattr(self.args, "draft", 0))}]
+
+    def metrics_text(self):
+        """GET /metrics: Prometheus text; llama-server's names (llamacpp:) where they mean the same, megakernel: else"""
+        m = self.counters()
+        s0, s1 = self.stats0, self.stats1
+        cyc, drafted, accepted = ((b - a for a, b in zip(s0, s1)) if s0 and s1 else (0, 0, 0))
+        rows = [
+            ("llamacpp:prompt_tokens_total", "counter", "Number of prompt tokens processed (prefilled; reused ones not).",
+             m["prompt_tokens"]),
+            ("llamacpp:prompt_seconds_total", "counter", "Prompt process time", m["prompt_seconds"]),
+            ("llamacpp:tokens_predicted_total", "counter", "Number of generation tokens processed.", m["tokens_predicted"]),
+            ("llamacpp:tokens_predicted_seconds_total", "counter", "Predict process time", m["predicted_seconds"]),
+            ("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt throughput in tokens/s.",
+             m["prompt_tokens"] / m["prompt_seconds"] if m["prompt_seconds"] else 0.0),
+            ("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s.",
+             m["tokens_predicted"] / m["predicted_seconds"] if m["predicted_seconds"] else 0.0),
+            ("llamacpp:requests_processing", "gauge", "Number of requests processing.", int(self.busy())),
+            ("llamacpp:requests_deferred", "gauge", "Number of requests deferred.", m["deferred"]),
+            ("megakernel:prompt_tokens_reused_total", "counter", "Prompt tokens reused from the engine's sequence.",
+             m["prompt_tokens_reused"]),
+            ("megakernel:decode_cycles_total", "counter", "Engine decode cycles (one verify + MTP draft each).", cyc),
+            ("megakernel:draft_tokens_total", "counter", "MTP draft tokens produced.", drafted),
+            ("megakernel:draft_tokens_accepted_total", "counter", "MTP draft tokens accepted.", accepted),
+            ("megakernel:requests_total", "counter", "Generation requests received.", m["requests"]),
+            ("megakernel:requests_bad_total", "counter", "Generation requests answered with a 4xx.", m["requests_bad"]),
+            ("megakernel:requests_failed_total", "counter", "Generation requests that failed (5xx).",
+             m["requests_failed"]),
+            ("megakernel:requests_cancelled_total", "counter", "Generation requests whose client disconnected.",
+             m["requests_cancelled"]),
+        ]
+        return "".join(f"# HELP {n} {h}\n# TYPE {n} {t}\n{n} {v:g}\n" if isinstance(v, float) else
+                       f"# HELP {n} {h}\n# TYPE {n} {t}\n{n} {v}\n" for n, t, h, v in rows)
 
     def render(self, body):
         """(prompt text, thinking, image file bytes in prompt order: one MEDIA_MARKER in the text each)"""
@@ -810,10 +954,10 @@ class Server:
     def sampling(self, body):
         """top_k: absent or <= 0 ("off" for llama.cpp / OpenAI-style clients) -> TOPK_MAX, the engine's maximum;
         above TOPK_MAX -> TOPK_MAX with a one-time warning"""
-        temp = float(body.get("temperature", 0.8) if body.get("temperature") is not None else 0.8)
-        top_p = float(body.get("top_p", 0.95) if body.get("top_p") is not None else 0.95)
+        temp = float(body["temperature"] if body.get("temperature") is not None else DEF_TEMP)
+        top_p = float(body["top_p"] if body.get("top_p") is not None else DEF_TOP_P)
         top_k = int(body["top_k"]) if body.get("top_k") is not None else TOPK_MAX
-        min_p = float(body.get("min_p", 0.05) if body.get("min_p") is not None else 0.05)
+        min_p = float(body["min_p"] if body.get("min_p") is not None else DEF_MIN_P)
         seed = body.get("seed")
         seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)
         if top_k <= 0:
@@ -851,6 +995,8 @@ class Server:
         finally:
             if images:  # (the request's images stay pinned until here)
                 self.vision.release([im for _, im in images])
+            if getattr(self.eng, "stats", None) is not None:  # (/metrics: the engine's counters, read while it is idle)
+                self.stats1 = self.eng.stats()
 
     def _generate(self, body, emit, gone, thinking, toks, images):
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
@@ -919,6 +1065,8 @@ class Server:
         t2 = time.time()
         log(f"prompt {len(toks)} tok ({reused} reused) in {t1 - t0:.2f} s, {n_gen} tok in {t2 - t1:.2f} s "
             f"({n_gen / max(t2 - t1, 1e-9):.1f} tok/s), {finish}" + (" (stop string)" if stopper.word is not None else ""))
+        self.count(prompt_tokens=len(toks) - reused, prompt_tokens_reused=reused, prompt_seconds=t1 - t0,
+                   tokens_predicted=n_gen, predicted_seconds=t2 - t1)
         usage = {"prompt_tokens": len(toks), "completion_tokens": n_gen, "total_tokens": len(toks) + n_gen,
                  "prompt_tokens_details": {"cached_tokens": reused}}
         timings = {"prompt_n": len(toks) - reused, "prompt_ms": (t1 - t0) * 1e3, "predicted_n": n_gen,
@@ -983,15 +1131,32 @@ def make_handler(srv):
                 return False
             return super().handle_expect_100()
 
+        def _text(self, code, text, ctype="text/plain; charset=utf-8", headers=()):
+            data = text.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            for k, v in headers:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self):
-            path = self.path.split("?")[0]
+            path, _, query = self.path.partition("?")
             if path in ("/health", "/v1/health"):
                 self._json(200, {"status": "ok"})
             elif path in ("/v1/models", "/models"):
-                self._json(200, {"object": "list", "data": [{"id": srv.model_id, "object": "model", "owned_by": "openjet"}]})
+                self._json(200, srv.models())
             elif path == "/props":
-                self._json(200, {"default_generation_settings": {"n_ctx": srv.args.ctx}, "total_slots": 1,
-                                 "modalities": {"vision": srv.vision is not None, "audio": False}})
+                self._json(200, srv.props())
+            elif path == "/slots":
+                if parse_qs(query).get("fail_on_no_slot", [""])[0] and srv.busy():
+                    self._json(503, {"error": {"code": 503, "message": "no slot available", "type": "unavailable_error"}})
+                else:
+                    self._json(200, srv.slots())
+            elif path == "/metrics":
+                self._text(200, srv.metrics_text(), "text/plain; version=0.0.4",
+                           [("Process-Start-Time-Unix", str(int(srv.t_start)))])
             else:
                 self._json(404, {"error": {"message": "not found", "type": "not_found_error"}})
 
@@ -1005,7 +1170,7 @@ def make_handler(srv):
                 self.close_connection = True
                 return
             if path not in ("/v1/chat/completions", "/chat/completions"):
-                self._json(404 if not path.startswith("/slots") else 501,
+                self._json(404 if not path.startswith(("/slots", "/props")) else 501,
                            {"error": {"message": f"{path} is not supported by the megakernel server", "type": "not_supported"}})
                 return
             try:
@@ -1013,17 +1178,22 @@ def make_handler(srv):
             except json.JSONDecodeError:
                 self._json(400, {"error": {"message": "invalid JSON", "type": "invalid_request_error"}})
                 return
+            srv.count(requests=1, deferred=1)  # (deferred: waiting for the engine)
             with srv.lock:
+                srv.count(deferred=-1)
                 try:
                     if body.get("stream"):
                         self._stream(body)
                     else:
                         self._complete(body)
                 except BadRequest as e:
+                    srv.count(requests_bad=1)
                     self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
                 except (BrokenPipeError, ConnectionResetError, ClientGone):
+                    srv.count(requests_cancelled=1)
                     self.close_connection = True
                 except Exception as e:  # engine failure: report it, keep serving
+                    srv.count(requests_failed=1)
                     log("error:", repr(e))
                     try:
                         self._json(500, {"error": {"message": str(e), "type": "server_error"}})
@@ -1104,6 +1274,34 @@ def make_handler(srv):
             send(b"data: [DONE]\n\n", last=True)
 
     return H
+
+
+def make_loading_handler():
+    """the handler while the model loads (the port opens first, as llama-server's does): every request gets llama-server's
+    503 "Loading model" and the connection closes (a request body is not read: the lingering close drains it)"""
+    class Loading(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _loading(self):
+            data = json.dumps({"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}}).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            self.wfile.write(data)
+
+        def handle_expect_100(self):
+            self._loading()
+            return False
+
+        do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = _loading
+
+    return Loading
 
 
 def linger(sock, seconds=None, idle=None, cap=None):
@@ -1192,17 +1390,35 @@ def main():
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     if args.exact_reuse:
         os.environ["MK_EXACT"] = "1"  # read by the engine at construction
-    srv = Server(args)
-    if srv.eng.exact:
-        log("exact reuse: on (MK_EXACT)")
-    httpd = HTTPServer((args.host, args.port), make_handler(srv))
-    log(f"listening on http://{args.host}:{args.port}")
+    # the port opens first (a busy port fails before the model loads); until the load is done every request gets a 503
+    # (llama-server's "Loading model"), then the handler is swapped for the real one (new connections take it)
+    httpd = HTTPServer((args.host, args.port), make_loading_handler())
+    log(f"listening on http://{args.host}:{args.port} (503 until the model is loaded)")
+    box = {}
+
+    def load():
+        try:
+            srv = Server(args)
+            if srv.eng.exact:
+                log("exact reuse: on (MK_EXACT)")
+            box["srv"] = srv
+            httpd.RequestHandlerClass = make_handler(srv)
+        except BaseException as e:  # (the server exits: serve_forever returns)
+            box["error"] = e
+            traceback.print_exc()
+            httpd.shutdown()
+
+    threading.Thread(target=load, name="mk-load", daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        srv.eng.keep_warm(False)
+        if "srv" in box:
+            box["srv"].eng.keep_warm(False)
+        httpd.server_close()
+    if "error" in box:
+        sys.exit(f"[mk-server] startup failed: {box['error']}")
 
 
 if __name__ == "__main__":

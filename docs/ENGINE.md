@@ -269,7 +269,7 @@ prefill attention and no longer builds against `prefill_attn.cuh`).
 ## Server
 
 `server/mk_server.py` serves the engine (through `libqwen38mk.so`, the C API in `capi.cpp`) with an OpenAI-compatible
-`/v1/chat/completions`, streaming or not, plus `/health`, `/v1/models` and `/props`. `scripts/serve.sh` /
+`/v1/chat/completions`, streaming or not, plus `/health`, `/v1/models`, `/props`, `/slots` and `/metrics`. `scripts/serve.sh` /
 `scripts\serve.bat` start it with our settings (README); directly:
 
 ```sh
@@ -317,10 +317,23 @@ kept between requests].
   it). A stream holds back text that could be the start of a stop string until the next token decides it. Tokens the
   engine accepted in the same cycle after the stop (MTP drafts) are dropped; the next request continues from the
   reply that was sent (the prompt reuse finds the divergence, as after `max_tokens`).
+- Reporting, in llama-server's shapes: the port opens before the model loads, and until the load is done every request
+  gets llama-server's 503 `{"error": {"code": 503, "message": "Loading model", ...}}` (`/health` then answers 200
+  `{"status": "ok"}`; a busy port fails at once instead of after the load). `GET /props`: `default_generation_settings`
+  (`n_ctx`, the sampling defaults), `total_slots` 1, `model_alias`, `model_path`, `modalities` (vision, video, audio),
+  `chat_template`, `build_info` (commit and engine flags of `libqwen38mk`, from `mk_build_info`: the Makefile and
+  `build.ps1` write them into `mk_build_info.h`; "unknown" for libraries built otherwise), plus an `engine` block with
+  what the server knows for sure: context, KV format asked for (`auto` is resolved inside the engine), MTP layer and
+  depth, draft vocabulary, exact reuse, checkpoint settings, keep-warm window, vision encoder settings, limits, the
+  `MK_*` environment, busy, uptime. `GET /v1/models`: the model with `meta` (n_ctx, file size, n_embd). `GET /slots`:
+  one slot with `is_processing` (`?fail_on_no_slot=1`: 503 while busy). `GET /metrics` (always on): Prometheus text
+  with llama-server's `llamacpp:` names where they mean the same (prompt / predicted tokens and seconds, throughput,
+  requests processing / deferred) and `megakernel:` ones (reused prompt tokens, decode cycles, MTP drafted / accepted
+  tokens, requests received / 4xx / 5xx / cancelled by a disconnect).
 - Errors: a CUDA error or non-finite logits make the engine throw; the server answers HTTP 500 and keeps serving. In a
   stream that has started (status 200 sent), the error is the last event, OpenAI style:
-  `data: {"error": {"message": ..., "type": "server_error", "code": 500}}`, then `data: [DONE]`. `/slots` requests get
-  501.
+  `data: {"error": {"message": ..., "type": "server_error", "code": 500}}`, then `data: [DONE]`. `POST /slots` (slot
+  save / restore) and `POST /props` get 501.
 - Limits (environment, read at startup): a request body needs a Content-Length (411 without one, also for chunked
   bodies; 400 when malformed) of at most `MK_MAX_BODY_MB` MB (default 128; 413, refused before the body is read, also
   on `Expect: 100-continue`). At most `MK_MAX_IMAGES` images per request (default 32; 400), and no more images are

@@ -384,7 +384,8 @@ def _chat_server(mk, eng, ctx=4096):
     srv = object.__new__(mk.Server)
     srv.eng, srv.im_start, srv.vision = eng, None, None
     srv.template = mk.make_template(TEMPLATE)
-    srv.args = mock.Mock(ctx=ctx, ck_every=0, ck_msgs=0)
+    srv.args = types.SimpleNamespace(ctx=ctx, ck_every=0, ck_msgs=0, model="test.gguf", lib="libqwen38mk.so", kv="q8",
+                                     draft=4, mtp=None, draft_vocab=None, mmproj=None)
     srv.lock, srv.warned, srv.model_id = threading.Lock(), set(), "test"
     return srv
 
@@ -950,6 +951,81 @@ class StopStringTests(_HttpCase):
             status, data = http_.post({"messages": [{"role": "user", "content": "hi"}], "stop": [1], "stream": stream})
             self.assertEqual(status, 400, data[:200])
             self.assertIn(b"stop must be", data)
+
+
+# === api: reporting ===
+class ReportingTests(_HttpCase):
+    """/health, /props, /v1/models, /slots, /metrics in llama-server's shapes (plus the engine block)"""
+
+    def _get(self, http_, path):
+        c = http_.httpd.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", c, timeout=10)
+        conn.request("GET", path)
+        r = conn.getresponse()
+        data = r.read()
+        conn.close()
+        return r.status, data, r
+
+    def test_props_models_slots(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        self.assertEqual(self._get(http_, "/health")[:2], (200, b'{"status": "ok"}'))
+        status, data, _ = self._get(http_, "/props")
+        p = json.loads(data)
+        self.assertEqual(status, 200)
+        self.assertEqual((p["total_slots"], p["model_alias"], p["default_generation_settings"]["n_ctx"]), (1, "test", 4096))
+        self.assertEqual(p["modalities"], {"vision": False, "video": False, "audio": False})
+        self.assertEqual(p["default_generation_settings"]["params"]["temperature"], self.mk.DEF_TEMP)
+        self.assertEqual((p["build_info"], p["engine"]["busy"], p["engine"]["kv"]), ("unknown", False, "q8"))
+        srv.video_ok = True  # (set by the video track when its decoder works)
+        srv.eng.build = {"commit": "abc1234", "flags": "-DMK_WV=1", "cuda": "12.8"}
+        p = json.loads(self._get(http_, "/props")[1])
+        self.assertEqual((p["modalities"]["video"], p["build_info"]), (True, "abc1234 -DMK_WV=1"))
+        self.assertEqual(p["engine"]["build"]["cuda"], "12.8")
+        m = json.loads(self._get(http_, "/v1/models")[1])
+        self.assertEqual((m["data"][0]["id"], m["data"][0]["meta"]["n_ctx"], m["models"][0]["name"]), ("test", 4096, "test"))
+        self.assertEqual(json.loads(self._get(http_, "/slots")[1])[0]["is_processing"], False)
+        self.assertEqual(self._get(http_, "/slots?fail_on_no_slot=1")[0], 200)
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+        c.request("POST", "/props", b"{}", {"Content-Type": "application/json"})
+        self.assertEqual(c.getresponse().status, 501)
+
+    def test_busy_slot_and_metrics(self) -> None:
+        eng = _ScriptEngine(["a"] * 30, delay=0.05)
+        srv, http_ = self.serve(eng)
+        t = threading.Thread(target=http_.post, args=({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 20},))
+        t.start()
+        t0 = time.time()
+        while not srv.busy() and time.time() - t0 < 5:
+            time.sleep(0.01)
+        self.assertTrue(json.loads(self._get(http_, "/slots")[1])[0]["is_processing"])
+        self.assertEqual(self._get(http_, "/slots?fail_on_no_slot=1")[0], 503)
+        t.join()
+        http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2, "stop": 5})  # (a 400)
+        status, data, r = self._get(http_, "/metrics")
+        self.assertEqual(status, 200)
+        self.assertTrue(r.getheader("Content-Type").startswith("text/plain"))
+        vals = dict(ln.split(" ", 1) for ln in data.decode().splitlines() if ln and not ln.startswith("#"))
+        self.assertEqual(vals["llamacpp:tokens_predicted_total"], "20")
+        self.assertEqual((vals["megakernel:requests_total"], vals["megakernel:requests_bad_total"]), ("2", "1"))
+        self.assertEqual(vals["llamacpp:requests_processing"], "0")
+        self.assertIn("# TYPE llamacpp:prompt_tokens_total counter", data.decode())
+
+    def test_loading_answers_503_until_the_swap(self) -> None:
+        httpd = self.mk.HTTPServer(("127.0.0.1", 0), self.mk.make_loading_handler())
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        port = httpd.server_address[1]
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", "/health")
+        r = c.getresponse()
+        self.assertEqual((r.status, json.loads(r.read())["error"]["message"]), (503, "Loading model"))
+        raw = _Http.raw(types.SimpleNamespace(port=port), _request({"messages": []}))
+        self.assertTrue(raw.startswith(b"HTTP/1.1 503"), raw[:100])
+        httpd.RequestHandlerClass = self.mk.make_handler(_chat_server(self.mk, _ScriptEngine(["ok"])))
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", "/health")
+        self.assertEqual(c.getresponse().status, 200)
 
 
 if __name__ == "__main__":
