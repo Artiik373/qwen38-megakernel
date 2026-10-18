@@ -168,7 +168,9 @@ named in [The GGUF](#the-gguf)), `MK_MEMLOG=1` (device memory per load step). Co
 analysis: `-DMK_SPEC_LOG=1` (with `MK_SPEC_LOG_FILE=path`: one JSON line per decode cycle), `-DMK_TEST_NAN=1` (with
 `MK_TEST_NAN_AT=n`: poisons the first attention layer's K scales before decode launch n; the engine must stop with an
 error and the server answer HTTP 500, or an error event in a started stream, and recover), `-DMK_KV_EMU=1` (scores
-lower-bit KV formats per layer by rounding the q8 cache).
+lower-bit KV formats per layer by rounding the q8 cache), `-DMK_PF_INFCHK=1` (counts, per prefill GEMM and layer, the
+fp16 partial sums that overflow to inf / NaN, non-finite GEMM outputs, and the fp16 GEMM inputs the +-65504 clamps
+saturate or turn from NaN into -65504; printed after each batched prefill; the served build compiles none of it).
 
 ### The GGUF
 

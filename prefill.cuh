@@ -54,7 +54,11 @@ __device__ __forceinline__ float dequant_q4k_ldg(const uint8_t * row, int e) {
 }
 
 // lane i holds element i of a 32-block starting at dst: store it as fp16 in GEMM order (saturating)
-__device__ __forceinline__ void hstore32(float v, __half * dst) {
+// (SITE: MK_PF_INFCHK's input site, 0 norm_quant, 1 the delta net's output, 2 the MTP block's input)
+template <int SITE = 0> __device__ __forceinline__ void hstore32(float v, __half * dst) {
+#if MK_PF_INFCHK
+    pf::chk_clamp(v, pf::CHK_IN_NORM + SITE);
+#endif
     dst[pf::hperm(threadIdx.x & 31)] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
 }
 
@@ -595,7 +599,7 @@ __global__ void __launch_bounds__(256) pk_dn_out(const float * snorm) {
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int c = lane + 32 * i;
-            hstore32(v[i] * rs * __ldg(snorm + c) * silu(__ldg(z + c)), cP.xh + (size_t) t * VD + hh * 128 + 32 * i);
+            hstore32<1>(v[i] * rs * __ldg(snorm + c) * silu(__ldg(z + c)), cP.xh + (size_t) t * VD + hh * 128 + 32 * i);
         }
     }
 }
@@ -657,6 +661,9 @@ __global__ void __launch_bounds__(256) pk_attn_out(int slot) {
         for (int k = 0; k < 8; k++) {
             const int d = lane * 8 + k;
             const float gate = __ldg(cP.y0 + (size_t) t * QG + h * 512 + 256 + d);
+#if MK_PF_INFCHK
+            pf::chk_clamp(v[k] / (1.0f + expf(-gate)), pf::CHK_IN_ATTN);
+#endif
             dst[pf::hperm(d)] = __float2half_rn(fminf(fmaxf(v[k] / (1.0f + expf(-gate)), -65504.f), 65504.f));
         }
     }
@@ -708,7 +715,7 @@ __global__ void __launch_bounds__(256) pk_mtp_in() {
     for (int j = warp; j < 2 * D / 32; j += 8) {
         const int e = 32 * (j % (D / 32)) + lane;
         const float v = j < D / 32 ? se[e] * rse * __ldg(cW.enorm + e) : __ldg(hp + e) * rsh * __ldg(cW.hnorm + e);
-        hstore32(v, cP.xh + (size_t) t * 2 * D + 32 * j);
+        hstore32<2>(v, cP.xh + (size_t) t * 2 * D + 32 * j);
     }
 }
 

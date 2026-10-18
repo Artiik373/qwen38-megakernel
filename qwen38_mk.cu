@@ -5023,6 +5023,9 @@ __global__ void __launch_bounds__(256) pk_glu(const float * __restrict__ g, cons
 #pragma unroll
         for (int e = 0; e < 4; e++) {
             const float v = gv[e] / (1.0f + expf(-gv[e])) * uv[e];
+#if MK_PF_INFCHK
+            pf::chk_clamp(v, pf::CHK_IN_GLU);
+#endif
             hv[e] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
         }
         __half * og = o + 16 * (k >> 2) + 2 * (k & 3);
@@ -7909,9 +7912,59 @@ struct MKEngine::Impl {
     static_assert(D % pf::BM == 0 && FF % pf::BM == 0 && VD % pf::BM == 0 && QG % pf::BM == 0 && KVD % pf::BM == 0 && QKV % pf::BM == 0 &&
                       VOCAB % pf::BM == 0,
                   "prefill GEMM: N");
+#if MK_PF_INFCHK
+    // MK_PF_INFCHK builds: the (layer, site) the counters charge from the next launch on (stream-ordered; < 0: unchanged)
+    void chk_set(int layer, int site) {
+        if (layer >= 0) CK(cudaMemcpyToSymbolAsync(pf::chk_layer, &layer, sizeof(int), 0, cudaMemcpyHostToDevice, 0));
+        if (site >= 0) CK(cudaMemcpyToSymbolAsync(pf::chk_site, &site, sizeof(int), 0, cudaMemcpyHostToDevice, 0));
+    }
+    void chk_mat(const Mat & m) { // a GEMM's site and layer, from its matrix
+        for (int l = 0; l < NLA; l++) {
+            const LayerW & W = hw.L[l];
+            const Mat * ms[10] = {&W.q, &W.k, &W.v, &W.o, &W.qkv, &W.gate, &W.sout, &W.fg, &W.fu, &W.fd}; // (pf::CHK_Q ..)
+            for (int i = 0; i < 10; i++)
+                if (m.w && ms[i]->w == m.w) return chk_set(l, i);
+        }
+        if (m.w == hw.eh.w) chk_set(NL, pf::CHK_EH);
+        else chk_set(pf::CHK_LAYERS - 1, pf::CHK_HEAD);
+    }
+    // prints the counts of the prefill that just finished (device synchronised) and clears them
+    void chk_report(int npos) {
+        static const char * const nm[pf::CHK_SITES] = {"attn_q", "attn_k", "attn_v", "attn_o", "dn_qkv", "dn_gate", "dn_out", "ffn_gate",
+                                                      "ffn_up", "ffn_down", "mtp_eh", "head", "in norm_quant", "in dn_out",
+                                                      "in mtp_in", "in attn_gate", "in silu*up"};
+        constexpr int NL_ = pf::CHK_LAYERS, NS = pf::CHK_SITES;
+        std::vector<unsigned long long> c((size_t) NL_ * NS * 2);
+        CK(cudaMemcpyFromSymbol(c.data(), pf::chk_cnt, c.size() * sizeof(unsigned long long)));
+        unsigned long long t[2][2] = {{0, 0}, {0, 0}}; // [GEMM | input][kind]
+        for (int l = 0; l < NL_; l++)
+            for (int s = 0; s < NS; s++)
+                for (int k = 0; k < 2; k++) t[s >= pf::CHK_IN_NORM][k] += c[((size_t) l * NS + s) * 2 + k];
+        fprintf(stderr, "[mk] MK_PF_INFCHK prefill of %d positions: GEMM fp16 partial sums inf/NaN %llu, non-finite GEMM outputs %llu;"
+                        " fp16 GEMM inputs clamped (|v| > 65504) %llu, NaN (stored as -65504) %llu\n", npos, t[0][0], t[0][1], t[1][0], t[1][1]);
+        for (int s = 0; s < NS; s++) {
+            unsigned long long a[2] = {0, 0};
+            std::string where;
+            for (int l = 0; l < NL_; l++) {
+                const unsigned long long x = c[((size_t) l * NS + s) * 2], y = c[((size_t) l * NS + s) * 2 + 1];
+                a[0] += x;
+                a[1] += y;
+                if ((x || y) && where.size() < 120) where += " L" + std::to_string(l) + ":" + std::to_string(x) + "/" + std::to_string(y);
+            }
+            if (a[0] || a[1])
+                fprintf(stderr, "[mk]   %-14s %s %llu, %s %llu  (layer:counts%s)\n", nm[s], s < pf::CHK_IN_NORM ? "partials" : "clamped", a[0],
+                        s < pf::CHK_IN_NORM ? "outputs" : "NaN", a[1], where.c_str());
+        }
+        std::fill(c.begin(), c.end(), 0ull);
+        CK(cudaMemcpyToSymbol(pf::chk_cnt, c.data(), c.size() * sizeof(unsigned long long)));
+    }
+#endif
     // y[t][row] (+)= W x_t for the first ntok fp16 rows of xh (token offset t0)
     void gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0 = 0, const __half * xin = nullptr) {
         pf_shape_check(m, pf::BM);
+#if MK_PF_INFCHK
+        chk_mat(m);
+#endif
         const pf::WMat W{m.w, m.d, m.type, m.K, m.N, m.rb, m.nd};
         const __half * X = (xin ? xin : hp.xh) + (size_t) t0 * m.K;
         const pf::Out O{y, ldy, mode, nullptr};
@@ -7957,6 +8010,9 @@ struct MKEngine::Impl {
     void gemm_glu(const Mat & g, const Mat & u, int ntok) {
         pf_shape_check(g, pf::BM / 2);
         pf_shape_check(u, pf::BM / 2);
+#if MK_PF_INFCHK
+        chk_mat(g); // (the fused launches; two GEMMs + pk_glu set their own)
+#endif
         const pf::WMat W{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
         const int nrt = g.N / (pf::BM / 2);
@@ -8179,6 +8235,9 @@ struct MKEngine::Impl {
             int dl = 0;
             for (int L = 0; L < NL; L++) {
                 const LayerW & W = hw.L[L];
+#if MK_PF_INFCHK
+                chk_set(L, -1); // (this layer's input stores; its GEMMs set their own site)
+#endif
                 if (fault_now && L == NL / 2) fault_inject();
                 pf_time("norm_quant", [&] { pf_norm_quant(hp.x, W.attn_norm, T); });
                 if (W.attn) {
@@ -8271,6 +8330,9 @@ struct MKEngine::Impl {
             if (!ahead) wait_device("a prefill chunk", std::max(wd_limit, 120.0));
             gap_mark(ci, 2);
             if (pred || sink) {
+#if MK_PF_INFCHK
+                chk_set(pf::CHK_LAYERS - 1, -1);
+#endif
                 pf_norm_quant(hp.x, hw.onorm, T);
                 std::vector<float> rows;
                 const int tile = std::min(128, cap * FF / VOCAB); // logits rows that fit in y0
@@ -8308,6 +8370,9 @@ struct MKEngine::Impl {
                     const int lo = std::max(n, sp[j] - H_RING);
                     pk_ck_hist<<<sp[j] - lo, 256>>>(lo, n, 0, ck[ss[j]].hdev);
                 }
+#if MK_PF_INFCHK
+                chk_set(NL, -1);
+#endif
                 if (img) pk_mtp_in<true><<<T, 256>>>();
                 else pk_mtp_in<false><<<T, 256>>>();
                 gemm(hw.eh, T, hp.xm, D, pf::OUT_STORE);
@@ -8350,6 +8415,9 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] prefill gaps (%s): %d chunks, %.1f ms on the GPU; idle before chunks %.2f ms, before MTP parts %.2f ms\n",
                     ahead ? "ahead" : "MK_PF_SYNC", nch, wall, g0, g1);
         }
+#if MK_PF_INFCHK
+        chk_report(N);
+#endif
         pf_report();
     }
 

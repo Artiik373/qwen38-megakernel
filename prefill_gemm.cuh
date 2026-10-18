@@ -22,8 +22,31 @@
 #ifndef MK_WV_Q6F
 #define MK_WV_Q6F 0 // (qwen38_mk.cu sets it; FM Q6_K units, see mmh's FM6)
 #endif
+#ifndef MK_PF_INFCHK
+#define MK_PF_INFCHK 0 // debug builds: 1 = count the prefill GEMMs' fp16 overflows (chk_*; the served build has none of it)
+#endif
 
 namespace pf {
+
+#if MK_PF_INFCHK
+// MK_PF_INFCHK=1: event counters per (layer, site, kind), printed and cleared after each batched prefill. GEMM sites
+// (the matrix, set by the host before each launch): kind 0 = fp16 partial sums (two 64-k stages accumulated in fp16 by
+// the MMAs) that are inf / NaN when added to the fp32 accumulators, kind 1 = non-finite fp32 outputs. Input sites (the
+// fp16 stores of GEMM inputs, saturated to +-65504): kind 0 = |v| > 65504 (inf included), kind 1 = NaN (stored as
+// -65504 by the clamp).
+enum { CHK_Q, CHK_K, CHK_V, CHK_O, CHK_QKV, CHK_GATE, CHK_SOUT, CHK_GU, CHK_UP, CHK_DOWN, CHK_EH, CHK_HEAD, // GEMMs
+       CHK_IN_NORM, CHK_IN_DN, CHK_IN_MTP, CHK_IN_ATTN, CHK_IN_GLU, CHK_SITES };                            // inputs
+constexpr int CHK_LAYERS = 66; // 64 trunk layers, 64 = the MTP block, 65 = the output head
+__device__ unsigned long long chk_cnt[CHK_LAYERS][CHK_SITES][2];
+__device__ int chk_layer, chk_site;
+__device__ __forceinline__ void chk_add(int site, int kind, unsigned n) {
+    if (n) atomicAdd(&chk_cnt[min(max(chk_layer, 0), CHK_LAYERS - 1)][site][kind], (unsigned long long) n);
+}
+__device__ __forceinline__ void chk_clamp(float v, int site) { // v: about to be stored as fp16 with the +-65504 clamp
+    if (v != v) chk_add(site, 1, 1);
+    else if (fabsf(v) > 65504.f) chk_add(site, 0, 1);
+}
+#endif
 
 constexpr int BM = 128, BN = 128, BK = 64;
 constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8, TIQ4 = 23, TIQ4NL = 20, TQ3K = 11, TIQ3S = 21;
@@ -698,8 +721,16 @@ __global__ void __launch_bounds__(256, 1)
     for (int mi = 0; mi < HMI; mi++)
 #pragma unroll
         for (int ni = 0; ni < HNI; ni++) ch[mi][ni][0] = ch[mi][ni][1] = 0u;
+#if MK_PF_INFCHK
+    unsigned chk_p = 0, chk_o = 0; // non-finite fp16 partial sums / fp32 outputs of this thread (token columns < ntok)
+#endif
     auto conv = [&](int mi, int ni) {
         const float2 lo = __half22float2(u2h(ch[mi][ni][0])), hi = __half22float2(u2h(ch[mi][ni][1]));
+#if MK_PF_INFCHK
+        const int tc = tok0 + HWT * wn + 8 * ni + 2 * t4; // the columns of lo / hi: tc, tc + 1
+        if (tc < ntok) chk_p += !isfinite(lo.x) + !isfinite(hi.x);
+        if (tc + 1 < ntok) chk_p += !isfinite(lo.y) + !isfinite(hi.y);
+#endif
         acc[mi][ni][0] += lo.x; acc[mi][ni][1] += lo.y; acc[mi][ni][2] += hi.x; acc[mi][ni][3] += hi.y;
     };
     auto step = [&](int st, auto ph, const unsigned (&a)[HMI][2][2][4], unsigned (&an)[HMI][2][2][4]) {
@@ -785,18 +816,29 @@ __global__ void __launch_bounds__(256, 1)
 #pragma unroll
             for (int e = 0; e < 16; e++) {
                 const float gv = gf[e], v = gv / (1.0f + expf(-gv)) * uf[e];
+#if MK_PF_INFCHK
+                chk_o += !isfinite(gv) + !isfinite(uf[e]);
+                chk_clamp(v, CHK_IN_GLU);
+#endif
                 hv[hperm(e)] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
             }
             uint4 * dst = reinterpret_cast<uint4 *>(O.yh + (size_t) (tok0 + tk) * O.ldy + row0 + 16 * q);
             dst[0] = reinterpret_cast<const uint4 *>(hv)[0];
             dst[1] = reinterpret_cast<const uint4 *>(hv)[1];
         }
+#if MK_PF_INFCHK
+        chk_add(chk_site, 0, chk_p);
+        chk_add(chk_site, 1, chk_o);
+#endif
         return;
     }
     for (int i = tid; i < NB * BM / 4; i += 256) {
         const int tk = i / (BM / 4), c = (i % (BM / 4)) * 4;
         if (tok0 + tk >= ntok) continue;
         float4 v = *reinterpret_cast<const float4 *>(se + tk * ELD + c);
+#if MK_PF_INFCHK
+        chk_o += !isfinite(v.x) + !isfinite(v.y) + !isfinite(v.z) + !isfinite(v.w);
+#endif
         float4 * dst = reinterpret_cast<float4 *>(O.y + (size_t) (tok0 + tk) * O.ldy + row0 + c);
         if (O.mode == OUT_ADD) {
             const float4 o = __ldcg(dst);
@@ -804,6 +846,10 @@ __global__ void __launch_bounds__(256, 1)
         }
         *dst = v;
     }
+#if MK_PF_INFCHK
+    chk_add(chk_site, 0, chk_p);
+    chk_add(chk_site, 1, chk_o);
+#endif
 }
 
 } // namespace pf
