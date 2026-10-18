@@ -15,8 +15,8 @@ divergence (saved during earlier prefills: at each generation prompt, each messa
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
 GET /health, GET /v1/models.  One request at a time.  After each request the engine keeps the GPU's
 clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
-Limits (environment): MK_MAX_IMAGES (images per request, default 32). A request whose client disconnects stops
-generating at the next engine cycle.
+Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32).
+A request whose client disconnects stops generating at the next engine cycle.
 """
 import argparse
 import base64
@@ -44,6 +44,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOPK_MAX = 32
 # request limits; main() reads them from the environment
+MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64 data: URLs fit)
 MAX_IMAGES = 32  # MK_MAX_IMAGES: images per request
 # the engine and encoder libraries next to the repo root: qwen38mk.dll / qwen38vision.dll on Windows
 LIB_MK, LIB_VISION = ("qwen38mk.dll", "qwen38vision.dll") if os.name == "nt" else ("libqwen38mk.so", "libqwen38vision.so")
@@ -812,13 +813,45 @@ def make_handler(srv):
             except (OSError, ValueError):
                 return True
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, close=False):
+            """close: then close the connection (a request body that was not read must not be taken for the next request)"""
             data = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            if close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             self.wfile.write(data)
+
+        def _body_length(self):
+            """(the request body's length, None), or (None, (status, message)) when it is not acceptable: chunked or
+            no Content-Length (411), a malformed one (400), over MK_MAX_BODY_MB (413, refused before reading)"""
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                return None, (411, "chunked request bodies are not supported: send a Content-Length")
+            vals = [v.strip() for v in self.headers.get_all("Content-Length") or []]
+            if not vals:
+                return None, (411, "a Content-Length header is required")
+            if len(set(vals)) > 1 or not re.fullmatch(r"[0-9]+", vals[0]):
+                return None, (400, f"bad Content-Length {vals[0][:40]!r}")
+            n = int(vals[0]) if len(vals[0]) <= 18 else 1 << 62
+            if n > MAX_BODY_MB << 20:
+                return None, (413, f"request body of {n} bytes: over the limit of {MAX_BODY_MB} MB (MK_MAX_BODY_MB)")
+            return n, None
+
+        def _refuse_body(self):
+            """answers an unacceptable request body (_body_length) without reading it; True if it did"""
+            refused = self._body_length()[1]
+            if refused:
+                self._json(refused[0], {"error": {"message": refused[1], "type": "invalid_request_error"}}, close=True)
+            return bool(refused)
+
+        def handle_expect_100(self):
+            # (curl sends large bodies after a 100 Continue: a refused one is answered before it is sent)
+            if self.command == "POST" and self._refuse_body():
+                return False
+            return super().handle_expect_100()
 
         def do_GET(self):
             path = self.path.split("?")[0]
@@ -834,8 +867,13 @@ def make_handler(srv):
 
         def do_POST(self):
             path = self.path.split("?")[0]
-            n = int(self.headers.get("Content-Length") or 0)
+            if self._refuse_body():
+                return
+            n = self._body_length()[0]
             raw = self.rfile.read(n) if n else b""
+            if len(raw) < n:  # (the client closed the connection mid-body)
+                self.close_connection = True
+                return
             if path not in ("/v1/chat/completions", "/chat/completions"):
                 self._json(404 if not path.startswith("/slots") else 501,
                            {"error": {"message": f"{path} is not supported by the megakernel server", "type": "not_supported"}})
@@ -949,7 +987,7 @@ def env_int(name, default):
 
 
 def main():
-    global MAX_IMAGES
+    global MAX_BODY_MB, MAX_IMAGES
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
@@ -978,6 +1016,7 @@ def main():
     ap.add_argument("--image-cache", type=int, default=8,
                     help="images kept decoded / encoded for reuse (a request holds all of its own while it runs)")
     args = ap.parse_args()
+    MAX_BODY_MB = env_int("MK_MAX_BODY_MB", MAX_BODY_MB)
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     if args.exact_reuse:
         os.environ["MK_EXACT"] = "1"  # read by the engine at construction

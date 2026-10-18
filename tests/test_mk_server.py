@@ -628,5 +628,45 @@ class DisconnectTests(_HttpCase):
                        "stream": True})
 
 
+# === sec:b5a ===
+class BodyLimitTests(_HttpCase):
+    """Content-Length: required, numeric, at most MK_MAX_BODY_MB; a refused body is not read and the connection closes"""
+
+    HEAD = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+
+    def _status(self, raw):
+        line = raw.split(b"\r\n", 1)[0]
+        return int(line.split()[1]) if line.startswith(b"HTTP/1.1 ") else None
+
+    def test_bad_lengths(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        body = b'{"messages": [{"role": "user", "content": "hi"}]}'
+        for cl, want in ((b"abc", 400), (b"-5", 400), (b"1e3", 400), (b" 12x", 400), (b"99999999999999999999999", 413)):
+            raw = http_.raw(self.HEAD + b"Content-Length: " + cl + b"\r\n\r\n" + body)
+            self.assertEqual(self._status(raw), want, (cl, raw[:200]))
+            self.assertIn(b"Connection: close", raw)
+        raw = http_.raw(self.HEAD + b"\r\n" + body)  # no Content-Length
+        self.assertEqual(self._status(raw), 411, raw[:200])
+        raw = http_.raw(self.HEAD + b"Transfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n" % (len(body), body))
+        self.assertEqual(self._status(raw), 411, raw[:200])
+        raw = http_.raw(self.HEAD + b"Content-Length: 5\r\nContent-Length: 6\r\n\r\n" + body)
+        self.assertEqual(self._status(raw), 400, raw[:200])
+        self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0], 200)
+
+    def test_an_oversized_body_is_refused_unread(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        with mock.patch.object(self.mk, "MAX_BODY_MB", 1):
+            t = time.time()
+            raw = http_.raw(self.HEAD + b"Content-Length: %d\r\n\r\n" % (2 << 20))  # (the body never comes)
+            self.assertEqual(self._status(raw), 413, raw[:200])
+            self.assertIn(b"MK_MAX_BODY_MB", raw)
+            self.assertLess(time.time() - t, 2.0)
+            raw = http_.raw(self.HEAD + b"Content-Length: %d\r\nExpect: 100-continue\r\n\r\n" % (2 << 20))
+            self.assertEqual(self._status(raw), 413, raw[:200])  # (no 100 Continue first)
+            body = json.dumps({"messages": [{"role": "user", "content": "x" * 1000}], "max_tokens": 2}).encode()
+            raw = http_.raw(self.HEAD + b"Content-Length: %d\r\n\r\n" % len(body) + body, until=b"}")
+            self.assertEqual(self._status(raw), 200, raw[:200])
+
+
 if __name__ == "__main__":
     unittest.main()
