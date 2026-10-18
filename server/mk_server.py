@@ -531,6 +531,66 @@ def parse_tool_calls(text, tools):
     return calls
 
 
+def _off(limit, above=False):
+    """a check that a sampler field has its 'off' value: None, or <= limit (above: >= limit)"""
+    def ok(v):
+        if v is None:
+            return True
+        try:
+            return float(v) >= limit if above else float(v) <= limit
+        except (TypeError, ValueError):
+            return False
+    return ok
+
+
+# llama.cpp sampler fields the engine does not have (it samples with temperature, top_k, top_p, min_p and the presence /
+# frequency penalties): accepted only with the value that turns them off (llama.cpp's web UI sends them all)
+SAMPLER_OFF = {"mirostat": _off(0), "typical_p": _off(1, True), "typ_p": _off(1, True), "tfs_z": _off(1, True),
+               "xtc_probability": _off(0), "dry_multiplier": _off(0), "top_n_sigma": _off(0), "dynatemp_range": _off(0),
+               "min_tokens": _off(0), "n_probs": _off(0)}
+
+
+def check_params(body):
+    """400 for the request fields the server cannot honour (they would change the output and need engine work, e.g.
+    logprobs, n > 1, constrained sampling): never ignored silently. Harmless ones (user, metadata, store, samplers,
+    cache_prompt, ...) are accepted."""
+    def bad(field, why):
+        raise BadRequest(f"{field}: {why}")
+    if not isinstance(body.get("messages"), list):
+        bad("messages", "an array of messages is required")
+    if body.get("n") not in (None, 1):
+        bad("n", "one choice per request (the engine runs one sequence): send several requests instead")
+    if body.get("logprobs") or body.get("top_logprobs") not in (None, 0):
+        bad("logprobs", "token log-probabilities are not available from the megakernel (they need engine support)")
+    if body.get("logit_bias"):
+        bad("logit_bias", "not supported by the megakernel's sampler")
+    rf = body.get("response_format")
+    if rf is not None and not (isinstance(rf, dict) and rf.get("type", "text") == "text"):
+        bad("response_format", "only {\"type\": \"text\"}: JSON modes need constrained sampling (a grammar), which the "
+                               "megakernel does not have")
+    for k in ("json_schema", "grammar"):
+        if body.get(k):
+            bad(k, "constrained sampling (a grammar) is not supported by the megakernel")
+    tc = body.get("tool_choice")
+    if tc not in (None, "auto", "none"):
+        bad("tool_choice", "\"auto\" or \"none\": forcing a tool call (required / a named function) needs constrained "
+                           "sampling, which the megakernel does not have")
+    if body.get("tools") is not None and not isinstance(body["tools"], list):
+        bad("tools", "an array of tools")
+    if body.get("functions") or body.get("function_call"):
+        bad("functions", "the legacy function-calling fields are not supported: use tools")
+    if body.get("ignore_eos"):
+        bad("ignore_eos", "not supported by the megakernel")
+    if body.get("audio") or "audio" in (body.get("modalities") or []):
+        bad("audio", "audio output is not supported")
+    if body.get("add_generation_prompt") is False or body.get("continue_final_message"):
+        bad("add_generation_prompt", "continuing the final message is not supported")
+    for k, ok in SAMPLER_OFF.items():
+        if not ok(body.get(k)):
+            bad(k, f"{body.get(k)!r} is not supported: the megakernel samples with temperature, top_k, top_p, min_p "
+                   "and the presence / frequency penalties only")
+
+
 def stop_strings(v, field="stop"):
     """the stop strings of a request: a string or a list of strings (empty ones dropped, as llama-server does)"""
     if v is None:
@@ -841,6 +901,12 @@ class Server:
     def render(self, body):
         """(prompt text, thinking, image file bytes in prompt order: one MEDIA_MARKER in the text each)"""
         kw = dict(body.get("chat_template_kwargs") or {})
+        eff = body.get("reasoning_effort")  # (OpenAI's top-level field; chat_template_kwargs win)
+        if isinstance(eff, str) and eff:
+            if eff == "none":  # (as llama-server)
+                kw.setdefault("enable_thinking", False)
+            else:  # (the template knows low / medium / high / xhigh)
+                kw.setdefault("reasoning_effort", {"minimal": "low"}.get(eff, eff))
         media = [] if self.vision else None
         ctx = dict(messages=normalize_messages(body.get("messages") or [], media), add_generation_prompt=True)
         if body.get("tools"):
@@ -954,12 +1020,15 @@ class Server:
     def sampling(self, body):
         """top_k: absent or <= 0 ("off" for llama.cpp / OpenAI-style clients) -> TOPK_MAX, the engine's maximum;
         above TOPK_MAX -> TOPK_MAX with a one-time warning"""
-        temp = float(body["temperature"] if body.get("temperature") is not None else DEF_TEMP)
-        top_p = float(body["top_p"] if body.get("top_p") is not None else DEF_TOP_P)
-        top_k = int(body["top_k"]) if body.get("top_k") is not None else TOPK_MAX
-        min_p = float(body["min_p"] if body.get("min_p") is not None else DEF_MIN_P)
-        seed = body.get("seed")
-        seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)
+        try:
+            temp = float(body["temperature"] if body.get("temperature") is not None else DEF_TEMP)
+            top_p = float(body["top_p"] if body.get("top_p") is not None else DEF_TOP_P)
+            top_k = int(body["top_k"]) if body.get("top_k") is not None else TOPK_MAX
+            min_p = float(body["min_p"] if body.get("min_p") is not None else DEF_MIN_P)
+            seed = body.get("seed")
+            seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)
+        except (TypeError, ValueError, OverflowError):
+            raise BadRequest("temperature, top_p, top_k, min_p and seed must be numbers")
         if top_k <= 0:
             top_k = TOPK_MAX
         elif top_k > TOPK_MAX:
@@ -988,6 +1057,7 @@ class Server:
         Returns (finish_reason, tool_calls, usage, timings). emit returning False, or gone() returning True (the client
         closed its connection; asked before the prefill, during it by a watcher thread (the prefill stops at its next
         chunk) and before each engine cycle) stops it with ClientGone."""
+        check_params(body)
         text, thinking, media = self.render(body)
         toks, images = self.tokenize_prompt(text, media)
         try:
@@ -1000,12 +1070,16 @@ class Server:
 
     def _generate(self, body, emit, gone, thinking, toks, images):
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
-        max_new = int(max_new)
+        try:
+            max_new = int(max_new)
+        except (TypeError, ValueError, OverflowError):
+            raise BadRequest("max_tokens must be an integer")
         limit = self.args.ctx - len(toks) - 16
         if limit <= 0:
             raise BadRequest(f"prompt of {len(toks)} tokens does not fit the context of {self.args.ctx}")
         max_new = limit if max_new <= 0 else min(max_new, limit)
-        tools = body.get("tools") or []
+        # tool_choice "none": the tools stay in the prompt, calls are not parsed (returned as text), as llama-server does
+        tools = (body.get("tools") or []) if body.get("tool_choice") != "none" else []
         stopper = StopMatcher(stop_strings(body.get("stop")))
         self.stop_word = None
         self.sampling(body)
@@ -1056,6 +1130,8 @@ class Server:
             emit(kind, delta)
         self.stop_word = stopper.word
         calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
+        if body.get("parallel_tool_calls") is False:
+            calls = calls[:1]  # (the first call only)
         rest = parser.unparsed()
         if rest:
             emit("content", rest)
@@ -1175,8 +1251,10 @@ def make_handler(srv):
                 return
             try:
                 body = json.loads(raw or b"{}")
-            except json.JSONDecodeError:
-                self._json(400, {"error": {"message": "invalid JSON", "type": "invalid_request_error"}})
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                body = None
+            if not isinstance(body, dict):
+                self._json(400, {"error": {"message": "the request body must be a JSON object", "type": "invalid_request_error"}})
                 return
             srv.count(requests=1, deferred=1)  # (deferred: waiting for the engine)
             with srv.lock:
@@ -1250,7 +1328,8 @@ def make_handler(srv):
                     return False
                 return True
 
-            # render / tokenize errors are reported as a 400 before the stream starts
+            # parameter / render errors are reported as a 400 before the stream starts
+            check_params(body)
             srv.render(body)
             try:
                 finish, calls, usage, timings = srv.generate(body, emit, self.client_gone)

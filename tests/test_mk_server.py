@@ -1028,5 +1028,71 @@ class ReportingTests(_HttpCase):
         self.assertEqual(c.getresponse().status, 200)
 
 
+# === api: request parameters ===
+class RequestParamTests(_HttpCase):
+    """fields the server cannot honour are a 400 (never ignored silently); what it can do alone, it does"""
+
+    MSG = [{"role": "user", "content": "hi"}]
+
+    def test_unsupported_fields_are_a_400(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        for extra, field in (({"n": 2}, "n:"), ({"logprobs": True}, "logprobs"), ({"top_logprobs": 3}, "logprobs"),
+                             ({"logit_bias": {"5": 10}}, "logit_bias"),
+                             ({"response_format": {"type": "json_object"}}, "response_format"),
+                             ({"response_format": {"type": "json_schema", "json_schema": {}}}, "response_format"),
+                             ({"grammar": "root ::= x"}, "grammar"), ({"json_schema": {"type": "object"}}, "json_schema"),
+                             ({"tool_choice": "required"}, "tool_choice"),
+                             ({"tool_choice": {"type": "function", "function": {"name": "f"}}}, "tool_choice"),
+                             ({"functions": [{"name": "f"}]}, "functions"), ({"ignore_eos": True}, "ignore_eos"),
+                             ({"mirostat": 2}, "mirostat"), ({"typical_p": 0.9}, "typical_p"), ({"xtc_probability": 0.5}, "xtc"),
+                             ({"dry_multiplier": 0.8}, "dry_multiplier"), ({"n_probs": 5}, "n_probs"),
+                             ({"temperature": "hot"}, "must be numbers"), ({"max_tokens": "many"}, "max_tokens"),
+                             ({"messages": "hi"}, "messages"), ({"add_generation_prompt": False}, "add_generation_prompt")):
+            for stream in (False, True):
+                status, data = http_.post({"messages": self.MSG, "stream": stream, **extra})
+                self.assertEqual(status, 400, (extra, stream, data[:200]))
+                self.assertIn(field, json.loads(data)["error"]["message"], extra)
+        for raw in (b"[1, 2]", b"\"x\"", b"{bad"):
+            c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+            c.request("POST", "/v1/chat/completions", raw, {"Content-Type": "application/json"})
+            self.assertEqual(c.getresponse().status, 400, raw)
+
+    def test_harmless_and_neutral_fields_are_accepted(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        webui = {"n": 1, "response_format": {"type": "text"}, "tool_choice": "auto", "parallel_tool_calls": True,
+                 "user": "u", "metadata": {"a": "b"}, "store": False, "samplers": "edkypmxt", "typ_p": 1, "typical_p": 1.0,
+                 "xtc_probability": 0, "dry_multiplier": 0, "mirostat": 0, "top_n_sigma": -1, "dynatemp_range": 0,
+                 "cache_prompt": True, "logprobs": False, "top_logprobs": None, "logit_bias": {}, "timings_per_token": False}
+        status, data = http_.post({"messages": self.MSG, **webui})
+        self.assertEqual(status, 200, data[:300])
+
+    def test_tool_choice_none_returns_calls_as_text(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(ToolCallCutTests.PIECES))
+        body = {"messages": self.MSG, "tools": TOOLS, "max_tokens": 500}
+        c = json.loads(http_.post(body)[1])["choices"][0]
+        self.assertEqual((c["finish_reason"], len(c["message"]["tool_calls"])), ("tool_calls", 1))
+        c = json.loads(http_.post({**body, "tool_choice": "none"})[1])["choices"][0]
+        self.assertEqual((c["finish_reason"], c["message"].get("tool_calls")), ("stop", None))
+        self.assertEqual(c["message"]["content"], "Let me look.\n\n" + CALL)
+
+    def test_parallel_tool_calls_false_keeps_the_first_call(self) -> None:
+        two = "Two.\n\n" + CALL + "\n" + CALL.replace("hostname", "hosts")
+        _, http_ = self.serve(_ScriptEngine([two[i:i + 4] for i in range(0, len(two), 4)]))
+        body = {"messages": self.MSG, "tools": TOOLS, "max_tokens": 500}
+        self.assertEqual(len(json.loads(http_.post(body)[1])["choices"][0]["message"]["tool_calls"]), 2)
+        calls = json.loads(http_.post({**body, "parallel_tool_calls": False})[1])["choices"][0]["message"]["tool_calls"]
+        self.assertEqual([json.loads(c["function"]["arguments"])["path"] for c in calls], ["/etc/hostname"])
+
+    def test_top_level_reasoning_effort(self) -> None:
+        srv = _chat_server(self.mk, _ScriptEngine(["ok"]))
+        srv.template = self.mk.make_template("{{ reasoning_effort|default('-') }}|{{ enable_thinking|default('-') }}")
+        r = lambda body: srv.render({"messages": self.MSG, **body})[0]  # noqa: E731
+        self.assertEqual(r({}), "-|-")
+        self.assertEqual(r({"reasoning_effort": "none"}), "-|False")
+        self.assertEqual(r({"reasoning_effort": "minimal"}), "low|-")
+        self.assertEqual(r({"reasoning_effort": "high"}), "high|-")
+        self.assertEqual(r({"reasoning_effort": "high", "chat_template_kwargs": {"reasoning_effort": "medium"}}), "medium|-")
+
+
 if __name__ == "__main__":
     unittest.main()
