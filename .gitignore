@@ -11,6 +11,7 @@ tools/vocab_freq
 tools/llama_ref
 tools/mkv_cli
 tools/vision_ref
+tests/gguf_fuzz
 # microbenchmark binaries (bench/*.cu) and benchmark scratch output
 bench/ffn_bench
 bench/ffn_bench_h*

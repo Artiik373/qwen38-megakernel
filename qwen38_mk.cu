@@ -6127,6 +6127,8 @@ struct MKEngine::Impl {
         uint64_t nbytes = 0;
         std::vector<uint8_t> own; // the re-encoded copy, when there is one
     };
+    // a tensor's shape starts with [k, n] (a 1-D tensor does not: no read past ne)
+    static bool shape2(const std::vector<uint64_t> & ne, uint64_t k, uint64_t n) { return ne.size() >= 2 && ne[0] == k && ne[1] == n; }
     int n_conv = 0;
     double conv_s = 0;
     // MK_MTP_Q4: the MTP draft block's (blk.64 + nextn.eh_proj) matrices stored wider than Q4_K (Q5_K, Q6_K, Q8_0;
@@ -6317,7 +6319,7 @@ struct MKEngine::Impl {
 
     Mat up_mat(const std::string & name, int K, int N, int to = -1) {
         Src t = want(name, to < 0 ? (int) file.get(name).type : to);
-        if ((int) t.ne[0] != K || (int) t.ne[1] != N) throw std::runtime_error(name + " bad shape");
+        if (!shape2(t.ne, (uint64_t) K, (uint64_t) N)) throw std::runtime_error(name + " bad shape");
         Mat m{};
         m.K = K;
         m.N = N;
@@ -6761,8 +6763,8 @@ struct MKEngine::Impl {
                 L.snorm = up_f32(blk(i, "ssm_norm.weight"), HK);
                 const auto & raw_a = tget(blk(i, "ssm_alpha.weight"));
                 const auto & raw_b = tget(blk(i, "ssm_beta.weight"));
-                if (raw_a.type == gguf::Q8_0 && raw_b.type == gguf::Q8_0 && raw_a.ne[0] == D && raw_a.ne[1] == NVH &&
-                    raw_b.ne[0] == D && raw_b.ne[1] == NVH && !getenv("MK_AB_F32")) {
+                if (raw_a.type == gguf::Q8_0 && raw_b.type == gguf::Q8_0 && shape2(raw_a.ne, D, NVH) && shape2(raw_b.ne, D, NVH) &&
+                    !getenv("MK_AB_F32")) {
                     // Q8_0 alpha / beta (UD) kept as int8 rows + fp16 block scales; the kernels form
                     // (q * d) * attn_norm on the fly, the same fp32 values as the folded rows below (MK_AB_F32=1)
                     HSet & S = hset();
@@ -6787,7 +6789,7 @@ struct MKEngine::Impl {
                 // read below as raw floats, so anything but F32 would be reinterpreted silently
                 need(blk(i, "ssm_alpha.weight"), (int) ta.type, {T_F32});
                 need(blk(i, "ssm_beta.weight"), (int) tb.type, {T_F32});
-                if (ta.ne[0] != D || ta.ne[1] != NVH || tb.ne[0] != D || tb.ne[1] != NVH)
+                if (!shape2(ta.ne, D, NVH) || !shape2(tb.ne, D, NVH))
                     throw std::runtime_error(blk(i, "ssm_alpha/beta.weight") + " bad shape");
                 HSet & S = hset();
                 const size_t nab = (size_t) 2 * NVH * D;
