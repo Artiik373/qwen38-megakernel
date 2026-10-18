@@ -852,6 +852,11 @@ def make_handler(srv):
             cid, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
             started = [False]
 
+            def send(data, last=False):
+                """one event as a chunk of the body; last: then the end of the body"""
+                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
+                self.wfile.flush()
+
             def chunk(delta, finish=None, usage=None, timings=None):
                 obj = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": srv.model_id,
                        "choices": [] if delta is None else [{"index": 0, "delta": delta, "finish_reason": finish}]}
@@ -859,9 +864,7 @@ def make_handler(srv):
                     obj["usage"] = usage
                 if timings is not None:
                     obj["timings"] = timings
-                data = b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n"
-                self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
-                self.wfile.flush()
+                send(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
 
             def head():
                 if not started[0]:
@@ -883,16 +886,26 @@ def make_handler(srv):
 
             # render / tokenize errors are reported as a 400 before the stream starts
             srv.render(body)
-            finish, calls, usage, timings = srv.generate(body, emit)
+            try:
+                finish, calls, usage, timings = srv.generate(body, emit)
+            except Exception as e:
+                if not started[0] or isinstance(e, (BrokenPipeError, ConnectionResetError)):
+                    raise  # nothing sent yet: do_POST answers with a status (400 / 500)
+                # the status (200) and part of the reply are out: the error is the stream's last event, OpenAI style
+                bad = isinstance(e, BadRequest)
+                if not bad:
+                    log("error:", repr(e))
+                err = {"message": str(e), "type": "invalid_request_error" if bad else "server_error", "code": 400 if bad else 500}
+                send(b"data: " + json.dumps({"error": err}, ensure_ascii=False).encode() + b"\n\n")
+                send(b"data: [DONE]\n\n", last=True)
+                return
             head()
             for i, c in enumerate(calls):
                 chunk({"tool_calls": [{"index": i, **c}]})
             chunk({}, finish=finish, timings=timings)
             if (body.get("stream_options") or {}).get("include_usage"):
                 chunk(None, usage=usage)
-            data = b"data: [DONE]\n\n"
-            self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n0\r\n\r\n")
-            self.wfile.flush()
+            send(b"data: [DONE]\n\n", last=True)
 
     return H
 

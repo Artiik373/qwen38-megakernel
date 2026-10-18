@@ -572,5 +572,30 @@ class ImagePinTests(_HttpCase):
             self.assertEqual(http_.post(self._images([b"i%d" % i for i in range(4)]))[0], 200)
 
 
+# === sec:b2 ===
+class StreamErrorTests(_HttpCase):
+    """an engine error after the stream started is an SSE error event and [DONE], not a second status line"""
+
+    def test_an_error_mid_stream_is_an_event(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["a"] * 40, fail_at=3))
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 30, "stream": True}
+        raw = http_.raw(_request(body), until=b"0\r\n\r\n")
+        self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[-400:])
+        head, events = _sse(raw)
+        self.assertTrue(head.startswith(b"HTTP/1.1 200"))
+        self.assertEqual(events[-1], b"[DONE]")
+        err = json.loads(events[-2])["error"]
+        self.assertEqual((err["type"], err["code"]), ("server_error", 500))
+        self.assertIn("no finite logit", err["message"])
+        self.assertTrue(any(json.loads(e)["choices"][0]["delta"].get("content") for e in events[1:-2]))  # (text first)
+        srv.eng.fail_at = None
+        self.assertEqual(http_.post({**body, "stream": False})[0], 200)  # (keeps serving)
+
+    def test_an_error_before_the_stream_starts_is_a_status(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["a"] * 40, fail_at=1))
+        status, data = http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 30})
+        self.assertEqual((status, json.loads(data)["error"]["type"]), (500, "server_error"))
+
+
 if __name__ == "__main__":
     unittest.main()
