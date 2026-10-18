@@ -180,6 +180,11 @@ What the API supports:
 - **Chat template:** the one stored in the GGUF, with `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...)
   and OpenAI `tools`.
 - **Images:** base64 `data:` URLs only. There is no video or audio.
+- **Tool calls:** a call counts only when it is complete; one cut by `max_tokens` is returned as text in `content`, with
+  `finish_reason` "length".
+- **Limits:** request bodies up to 128 MB (`MK_MAX_BODY_MB`), 32 images per request (`MK_MAX_IMAGES`), 100 megapixels
+  per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded). A request whose client disconnects stops at
+  the next decode cycle; an engine error in a stream ends it with an error event and `data: [DONE]`.
 - **Requests:** one at a time.
 
 [docs/ENGINE.md](docs/ENGINE.md#server) has the details, the server's options and the engine's environment variables.
@@ -250,6 +255,8 @@ scripts\serve.bat                 :: http://127.0.0.1:8080, 120k context, q8_0 K
 ## Checking a build
 
 - **Server tests:** `python -m pytest -q tests` runs without a GPU, against fake engines.
+- **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed files under AddressSanitizer
+  and UBSan (CPU only, Linux).
 - **Depth independence:** the same prompt at `-d 0`, `-d 4` and `-d 7` must give identical ids:
   `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_32k.bin --ids`
 - **Accuracy against llama.cpp:** `tools/llama_ref` writes a reference file, and `./qwen38_mk -m <gguf> --kld <ref>

@@ -156,8 +156,8 @@ change), `MK_REENC3=1` / `MK_IQ4NL_Q8=1` / `MK_AB_F32=1` / `MK_PF_GLU_MIX=0` (th
 named in [The GGUF](#the-gguf)), `MK_MEMLOG=1` (device memory per load step). Compile-time options for tests and
 analysis: `-DMK_SPEC_LOG=1` (with `MK_SPEC_LOG_FILE=path`: one JSON line per decode cycle), `-DMK_TEST_NAN=1` (with
 `MK_TEST_NAN_AT=n`: poisons the first attention layer's K scales before decode launch n; the engine must stop with an
-error and the server answer HTTP 500 and recover), `-DMK_KV_EMU=1` (scores lower-bit KV formats per layer by rounding
-the q8 cache).
+error and the server answer HTTP 500, or an error event in a started stream, and recover), `-DMK_KV_EMU=1` (scores
+lower-bit KV formats per layer by rounding the q8 cache).
 
 ### The GGUF
 
@@ -180,6 +180,15 @@ path). The exact re-encodes keep every weight's value (both formats store a smal
 integer sub-block scale), and the loader checks each re-encoded or re-laid-out row bit for bit against ggml's
 dequantization of the original. A file with any other type is refused, naming the first tensor that does not match.
 Which files that covers: [Model files](#model-files).
+
+The engine reads the file with its own parser (`gguf.h`, mmap), independently of libllama's loader (which reads only
+the vocabulary, in parallel), so the parser checks every read against the file size: version 2 / 3, the kv and tensor
+counts, string and array lengths (no nested arrays, as ggml), duplicate keys or tensor names, 1-4 dimensions of at
+most 2^63 elements, the type and whole blocks per row, `general.alignment` (a power of two up to 1 MiB), and each
+tensor's data (aligned, inside the file); sizes are computed without overflow. A malformed file is refused with an
+error naming the field. `tests/gguf_fuzz.cpp` (`make tests/gguf_fuzz`) feeds it malformed and randomly corrupted
+files under AddressSanitizer / UBSan; UD-Q4_K_XL, UD-Q4_K_M and Q4_K_M parse to the same tensors and keys as before
+the checks (2026-10-17).
 
 The MTP draft block (`blk.64.*`, `nextn.eh_proj`) is the one lossy exception: its matrices stored wider than Q4_K
 (Q5_K, Q6_K, Q8_0: all of them in UD-Q4_K_XL, `eh_proj` / `attn_v` / `ffn_down` in Q4_K_M) are re-quantized to Q4_K at
@@ -225,11 +234,14 @@ Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `-c` con
 `--kv auto|f16|q8` [auto: q8_0 only when fp16 does not fit], `--draft-vocab` [draft_vocab_32k.bin], `--exact-reuse`
 [off; the launchers turn it on], `--ck-every n` (a checkpoint every n prompt tokens [4096], 0 = off), `--ck-msgs 1|0`
 (a checkpoint at each message start [1]), `--mmproj` (images, below), `--vision-backend auto|cpu|mtmd` [auto],
-`--vision-threads` [0 = all], `--image-min-tokens` / `--image-max-tokens` [the mmproj's], `--image-cache` [8].
+`--vision-threads` [0 = all], `--image-min-tokens` / `--image-max-tokens` [the mmproj's], `--image-cache` [8; images
+kept between requests].
 
 - Prompts are rendered with the chat template stored in the GGUF (jinja2): `chat_template_kwargs`
   `enable_thinking` / `preserve_thinking` / `reasoning_effort`, OpenAI `tools`. Reasoning is streamed as
-  `reasoning_content`, Qwen's XML tool calls are returned as structured `tool_calls`.
+  `reasoning_content`, Qwen's XML tool calls are returned as structured `tool_calls`. A call counts only with both
+  closing tags (`</function>`, `</tool_call>`): one cut by `max_tokens` (or left open) is returned as text at the end
+  of `content`, and the reply ends with `finish_reason` "length" (complete calls before it are still returned).
 - Successive requests of a conversation only prefill what is new: the prompt is matched against the engine's sequence
   (prompts + emitted tokens). When the new prompt diverges inside what the engine already processed (an edited message,
   a re-rendered thinking block or tool call), the engine rewinds to the last DeltaNet checkpoint at or before the
@@ -249,8 +261,20 @@ Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `-c` con
 - Sampling: temperature [0.8], top_p [0.95], top_k (1..32; absent or <= 0 means 32, the engine's maximum; above 32 is
   clamped with a one-time warning), min_p [0.05], seed, presence_penalty / frequency_penalty (-2..2, vLLM's semantics:
   the tokens generated in this response); repetition_penalty is ignored (with a warning). One request at a time.
-- Errors: a CUDA error or non-finite logits make the engine throw; the server answers HTTP 500 and keeps serving.
-  `/slots` requests get 501.
+- Errors: a CUDA error or non-finite logits make the engine throw; the server answers HTTP 500 and keeps serving. In a
+  stream that has started (status 200 sent), the error is the last event, OpenAI style:
+  `data: {"error": {"message": ..., "type": "server_error", "code": 500}}`, then `data: [DONE]`. `/slots` requests get
+  501.
+- Limits (environment, read at startup): a request body needs a Content-Length (411 without one, also for chunked
+  bodies; 400 when malformed) of at most `MK_MAX_BODY_MB` MB (default 128; 413, refused before the body is read, also
+  on `Expect: 100-continue`). At most `MK_MAX_IMAGES` images per request (default 32; 400), and no more images are
+  decoded once the prompt cannot fit the context. The image library refuses an image of more than
+  `MK_IMAGE_MAX_PIXELS` pixels (default 100,000,000) from its header, before decoding it. Measured on 2026-10-17
+  without the limit: a 446 KB PNG declaring 12000 x 12000 pixels took 39 s and 0.9 GB of server memory (decode, then
+  4096 tokens encoded); a 20000 x 20000 one asks stb_image for ~2.4 GB.
+- Disconnects: before the prefill and before each decode cycle the server checks whether the client closed its
+  connection, and stops (a prefill that is running finishes first). The engine keeps what it generated, as after a
+  reply cut by `max_tokens`, so the next request reuses or rewinds it as usual.
 - Images: see [Images](#images-vision).
 
 ## KV cache
@@ -291,7 +315,8 @@ python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj mmproj-BF16.
   attention kernel changes and a text-only prompt runs exactly what it ran before (KLD logs byte-identical).
   Checkpoints, rewinds and exact reuse work across images; a rewind into an image re-feeds it.
 - **Server reuse:** an image's placeholder tokens are all alike, so the reused prefix also ends at the first image
-  that is not the same file (content hash) at the same place; decoded / encoded images are cached (`--image-cache`).
+  that is not the same file (content hash) at the same place; decoded / encoded images are cached (`--image-cache`
+  images between requests; a request holds every image it references until it ends, so it may use more).
 - **Encoder** (`vision/mk_vision.h`, `--vision-backend auto|cpu|mtmd`): `cpu` = `vision/vit_cpu.cpp`, the tower in fp32
   with AVX2 / FMA kernels (packed 6x16 FMA GEMM micro-kernel, attention on the same kernel with an online softmax,
   exact tanh-GELU, weights widened from the file's type, a pool of pinned workers that take tasks dynamically;

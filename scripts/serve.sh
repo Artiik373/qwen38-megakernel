@@ -16,6 +16,9 @@
 #                       8-bit MTP layer and recent window: 1.1 GB less VRAM at 120k, ~162k context in the same VRAM,
 #                       up to 262,144 tokens on 24 GB; near-lossless, see README)
 #   MK_KEEP_WARM_S      seconds the engine keeps the GPU's clocks up after each request (default 120, 0 = off)
+#   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS
+#                       request limits: body size (default 128 MB), images per request (32), pixels per image
+#                       (100,000,000; checked before decoding)
 #   MK_PYTHON           Python with jinja2 (default python3)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
