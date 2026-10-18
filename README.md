@@ -114,7 +114,7 @@ inside: [docs/ENGINE.md](docs/ENGINE.md).
   SMs for more than 4 drafts (50 for up to 4; the engine checks at load).
 - **CUDA:** 13.2 is what we build with; older 12.x versions are untested.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64 ([Windows](#windows) has its own build steps).
-- **RAM:** about 27 GB free to compile the served configuration (ptxas). The lean build needs ~12 GB.
+- **RAM:** about 28 GB free to compile the served configuration (ptxas). The lean build needs ~19 GB.
 - **llama.cpp b10246**, built at `../llama.cpp`. The engine uses its tokenizer (libllama), and the vision library and
   reference tools use libmtmd.
 - **Python** 3.10+ with jinja2.
@@ -126,14 +126,17 @@ inside: [docs/ENGINE.md](docs/ENGINE.md).
 git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout b10246
 cmake -S ../llama.cpp -B ../llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
 cmake --build ../llama.cpp/build -j
-make -j2        # qwen38_mk (CLI), libqwen38mk.so (server), tools/, libqwen38vision.so: ~20 min
+make -j2        # qwen38_mk (CLI), libqwen38mk.so (server), tools/, libqwen38vision.so: ~15 min
 pip install -r requirements.txt
 ```
 
 - A plain `make` builds the configuration we serve: wide verify, up to 7 drafts, and K5
   (`MKFLAGS=-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1`).
-- `make MKFLAGS=` builds the lean engine. It compiles in a few minutes and takes at most 4 drafts (run it with
+- `make MKFLAGS=` builds the lean engine. It compiles in ~10 minutes and takes at most 4 drafts (run it with
   `MK_DRAFT=4`).
+- Most of the build is ptxas on the megakernel: one thread with ~25 GB of heap. The Makefile sets
+  `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, which lets it use transparent huge pages and runs it ~20% faster (same
+  machine code). It needs THP in `madvise` or `always` mode (`/sys/kernel/mm/transparent_hugepage/enabled`).
 - `make` targets the installed GPU's architecture; override it with `ARCH=sm_89` or similar.
 - `ptxas.log` lists registers and spills per function.
 - The vision library is built when `../llama.cpp/build/bin/libmtmd.so` exists (llama.cpp's default). `make vision`
@@ -230,7 +233,7 @@ this repository:
 git clone https://github.com/ggml-org/llama.cpp ..\llama.cpp; git -C ..\llama.cpp checkout b10246
 cmake -S ..\llama.cpp -B ..\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=OFF -DLLAMA_CURL=OFF
 cmake --build ..\llama.cpp\build --target llama mtmd
-.\build.ps1 -Cuda "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"   # ~20 min (the default is $env:CUDA_PATH)
+.\build.ps1 -Cuda "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"   # ~15 min (the default is $env:CUDA_PATH)
 python -m venv .venv; .venv\Scripts\pip install -r requirements.txt
 ```
 
