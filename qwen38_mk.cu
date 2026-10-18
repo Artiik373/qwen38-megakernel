@@ -7815,6 +7815,7 @@ struct MKEngine::Impl {
     // (r0: the queries are chunk rows r0 .. r0 + T - 1 at positions n ..: MK_EXACT with KV window rings, see pf_run)
     void attn(int T, int n, int slot, int r0 = 0) {
         if (attn_old) {
+            if (r0) throw std::runtime_error("prefill attention: MK_ATTN=1 (pk_attn) has no row offset (MK_EXACT with MK_KV_WIN)");
             if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, slot);
             else pk_attn<false><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, slot);
             return;
@@ -7837,6 +7838,8 @@ struct MKEngine::Impl {
         const int N = (T + A2_Q - 1) / A2_Q * NKV;
         int nfull = N, S = 1;
         if (attn_split) a2_plan(T, n, a2_slots, y1_floats, nfull, S);
+        if (r0 && N > nfull) // (r0 != 0 only with MK_EXACT, which runs unsplit)
+            throw std::runtime_error("prefill attention: the split merge (pk_attn2_comb) has no row offset");
         const int grid = nfull + (N - nfull) * S;
         if (hb.kvq8) {
             // pk_attn8 reads K in any MK_KV format (low-bit tiles are expanded to int8 in its staging) and any V format
@@ -7895,8 +7898,20 @@ struct MKEngine::Impl {
         }
     }
 
+    // pf::mmh's shapes: K in pairs of BK-wide stages (the pipelined loop steps two stages; fp16 sums span two), N in whole
+    // tiles of `rows` (BM; the fused gate / up: BM / 2 of each). Another shape would skip rows or columns silently.
+    static void pf_shape_check(const Mat & m, int rows) {
+        if (m.K % (2 * pf::BK) != 0 || m.N % rows != 0)
+            throw std::runtime_error("prefill GEMM: unsupported matrix shape K " + std::to_string(m.K) + " x N " + std::to_string(m.N) +
+                                     " (needs K % " + std::to_string(2 * pf::BK) + " == 0 and N % " + std::to_string(rows) + " == 0)");
+    }
+    static_assert(D % (2 * pf::BK) == 0 && 2 * D % (2 * pf::BK) == 0 && FF % (2 * pf::BK) == 0 && VD % (2 * pf::BK) == 0, "prefill GEMM: K");
+    static_assert(D % pf::BM == 0 && FF % pf::BM == 0 && VD % pf::BM == 0 && QG % pf::BM == 0 && KVD % pf::BM == 0 && QKV % pf::BM == 0 &&
+                      VOCAB % pf::BM == 0,
+                  "prefill GEMM: N");
     // y[t][row] (+)= W x_t for the first ntok fp16 rows of xh (token offset t0)
     void gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0 = 0, const __half * xin = nullptr) {
+        pf_shape_check(m, pf::BM);
         const pf::WMat W{m.w, m.d, m.type, m.K, m.N, m.rb, m.nd};
         const __half * X = (xin ? xin : hp.xh) + (size_t) t0 * m.K;
         const pf::Out O{y, ldy, mode, nullptr};
@@ -7940,6 +7955,8 @@ struct MKEngine::Impl {
         return g.type == u.type && g.rb == u.rb && (g.type == T_Q4K || g.type == T_Q5K || g.type == T_IQ4X);
     }
     void gemm_glu(const Mat & g, const Mat & u, int ntok) {
+        pf_shape_check(g, pf::BM / 2);
+        pf_shape_check(u, pf::BM / 2);
         const pf::WMat W{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
         const int nrt = g.N / (pf::BM / 2);
