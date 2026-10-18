@@ -516,6 +516,16 @@ Cost, Ryzen 9 5900XT, BF16 mmproj, 30 threads, steady state (2026-10-18; tokens 
 At 1 fps a clip costs more than half its 2 fps tokens: every 5 s run then has an odd number of frames, and its last
 frame is a grid of its own. A 640 x 360 clip at 4 fps encodes at about real time (two pairs per second of video).
 
+**Live feeds** need no extra API: cut the feed into short segments and append each as a new user message (with the
+stream time as a text part) to the conversation you re-send; send "watching" requests with `max_tokens: 1` and drop
+their one-token reply, and ask a question whenever you want an answer. Each request then encodes and prefills only the
+new segment (the earlier ones are reused up to the checkpoint at the generation prompt), so a tick costs the same at
+any stream age. Set `--video-cache` to at least the number of segments in the conversation, or every request decodes
+the earlier segments again; cached segments keep their rows (~20 KB per token, bounded by the context). When the context
+fills, start a new conversation from a summary plus the latest segments (one prefill, no re-encode). Measured
+(2026-10-18): 3 s segments of 480 x 272 at 4 fps, 10 ticks of 3.7-4.2 s each (3.0 s of encoding), and the model
+placed a color change at the right time after 30 s of feed.
+
 ## How it gets its speed
 
 - **Weights stay in their GGUF k-quant encoding** (Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS, plus Q3_K / IQ3_S / IQ4_NL),
