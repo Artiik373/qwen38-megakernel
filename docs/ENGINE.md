@@ -106,12 +106,12 @@ The random numbers come from a counter-based generator keyed by the seed and the
 resampling numbers by its position, a sampled draft's by the position it drafts. Each position is decided once, and a
 position drafted again after a rejection before it draws the same number, but that number is independent of
 everything that decided the tokens before it, so the output stays exact (2026-10-17: a CPU replica of the loop,
-`tests/spec_rng_sim.py`, 396k re-drafted positions; and the PIT test on the engine's re-drafted rows). Two opt-in
-`MK_POLICY` settings were not: with `blk=1` (block verification), which reads every row's number and leaves the rows
-after its cut to the next cycle, the acceptance numbers and the drafts are now keyed by the cycle's start position as
-well (position-only keys made the next cycle reuse numbers conditioned on the last one: biased in the replica); and
-`chain=2` with sampled drafts runs without drop gates (dropping a draft on its own probability selects which drafts get
-verified: biased).
+`tests/spec_rng_sim.py`, 396k re-drafted positions; the PIT test on 13,401 re-drafted rows of the engine at 7
+drafts). Two opt-in `MK_POLICY` settings were not: with `blk=1` (block verification), which reads every row's number
+and leaves the rows after its cut to the next cycle, the acceptance numbers and the drafts are now keyed by the cycle's
+start position as well (position-only keys made the next cycle reuse numbers conditioned on the last one: biased in
+the replica; with the new keys 72k rows of the engine pass the PIT test); and `chain=2` with sampled drafts runs
+without drop gates (dropping a draft on its own probability selects which drafts get verified: biased).
 
 **unsloth UD-Q4_K_XL** (`Qwen3.8-27B-UD-Q4_K_XL.gguf`, 17.6 GB: Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS per tensor plus a
 few Q3_K, IQ3_S and IQ4_NL) puts its extra bits where the decode spends its time: its FFN gate / up average 5.1 bits
@@ -170,7 +170,8 @@ analysis: `-DMK_SPEC_LOG=1` (with `MK_SPEC_LOG_FILE=path`: one JSON line per dec
 error and the server answer HTTP 500, or an error event in a started stream, and recover), `-DMK_KV_EMU=1` (scores
 lower-bit KV formats per layer by rounding the q8 cache), `-DMK_PF_INFCHK=1` (counts, per prefill GEMM and layer, the
 fp16 partial sums that overflow to inf / NaN, non-finite GEMM outputs, and the fp16 GEMM inputs the +-65504 clamps
-saturate or turn from NaN into -65504; printed after each batched prefill; the served build compiles none of it).
+saturate or turn from NaN into -65504; printed after each batched prefill; the served build compiles none of it. On
+2026-10-17 none occurred on 38k- and 101.6k-token prompts).
 
 ### The GGUF
 
