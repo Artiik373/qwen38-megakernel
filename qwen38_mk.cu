@@ -6190,8 +6190,8 @@ struct MKEngine::Impl {
         uint64_t nbytes = 0;
         std::vector<uint8_t> own; // the re-encoded copy, when there is one
     };
-    // a tensor's shape starts with [k, n] (a 1-D tensor does not: no read past ne)
-    static bool shape2(const std::vector<uint64_t> & ne, uint64_t k, uint64_t n) { return ne.size() >= 2 && ne[0] == k && ne[1] == n; }
+    // a tensor's shape is [k, n] (any further dimensions 1): its bytes are exactly n rows of k (gguf::shape_is)
+    static bool shape2(const std::vector<uint64_t> & ne, uint64_t k, uint64_t n) { return gguf::shape_is(ne, {k, n}); }
     int n_conv = 0;
     double conv_s = 0;
     // MK_MTP_Q4: the MTP draft block's (blk.64 + nextn.eh_proj) matrices stored wider than Q4_K (Q5_K, Q6_K, Q8_0;
@@ -6395,7 +6395,8 @@ struct MKEngine::Impl {
 
     Mat up_mat(const std::string & name, int K, int N, int to = -1) {
         Src t = want(name, to < 0 ? (int) file.get(name).type : to);
-        if (!shape2(t.ne, (uint64_t) K, (uint64_t) N)) throw std::runtime_error(name + " bad shape");
+        if (!shape2(t.ne, (uint64_t) K, (uint64_t) N))
+            throw std::runtime_error(name + " has shape " + gguf::shape_str(t.ne) + ", expected " + gguf::shape_str({(uint64_t) K, (uint64_t) N}));
         Mat m{};
         m.K = K;
         m.N = N;
@@ -6741,7 +6742,7 @@ struct MKEngine::Impl {
         Joiner embd_th;
         cudaError_t embd_err = cudaSuccess;
         double embd_pin_s = 0;
-        const size_t embd_nb = file.get("token_embd.weight").nbytes;
+        const size_t embd_nb = file.get("token_embd.weight", {(uint64_t) D, (uint64_t) VOCAB}).nbytes; // (rows are read by token id)
         auto embd_alloc = [&] {
             const auto t0 = lclk::now();
             embd_err = cudaHostAlloc(&embd_host, embd_nb, cudaHostAllocMapped | cudaHostAllocWriteCombined);

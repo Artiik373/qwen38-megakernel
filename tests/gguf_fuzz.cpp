@@ -1,5 +1,6 @@
 // Malformed-file test of gguf.h (CPU only, no CUDA): every file below must either parse or throw std::exception; a
-// crash, a sanitizer report or a hang is a failure. Build and run (Linux):
+// crash, a sanitizer report or a hang is a failure. Every file that parses has each tensor's bytes read in full and its
+// shape-checked reads (File::get(name, dims)) tried, as the loader does. Build and run (Linux):
 //   make tests/gguf_fuzz && tests/gguf_fuzz             (built with -fsanitize=address,undefined)
 //   tests/gguf_fuzz --dump model.gguf                   (the parsed kvs and tensors, to compare two builds of gguf.h)
 //   GGUF_FUZZ_ONLY="alignment 0" tests/gguf_fuzz      (one check)
@@ -36,6 +37,7 @@ struct Spec { // a small, valid file; the tests change one field at a time
     uint32_t a_dims = 1, a_type = gguf::F32;
     uint64_t a_ne0 = 8, a_off = 0;
     uint64_t b_ne0 = 256, b_ne1 = 2, b_off = 32;
+    std::vector<uint64_t> b_more; // further dimensions of b
     uint32_t b_type = gguf::Q4_K;
     std::string b_name = "b";
     bool dup_key = false;
@@ -73,9 +75,10 @@ Bytes build(const Spec & s) {
     put<uint32_t>(b, s.a_type);
     put<uint64_t>(b, s.a_off);
     put_str(b, s.b_name);
-    put<uint32_t>(b, 2);
+    put<uint32_t>(b, 2 + (uint32_t) s.b_more.size());
     put<uint64_t>(b, s.b_ne0);
     put<uint64_t>(b, s.b_ne1);
+    for (uint64_t n : s.b_more) put<uint64_t>(b, n);
     put<uint32_t>(b, s.b_type);
     put<uint64_t>(b, s.b_off);
     while (b.size() % 32) b.push_back(0);
@@ -86,6 +89,7 @@ Bytes build(const Spec & s) {
 
 std::string g_path;
 int g_fail = 0, g_n = 0;
+unsigned g_sink = 0;
 
 // 1: parsed, 0: threw; anything else (a crash) ends the process
 int parse(const Bytes & b, std::string * err = nullptr) {
@@ -97,6 +101,22 @@ int parse(const Bytes & b, std::string * err = nullptr) {
     fclose(f);
     try {
         gguf::File g(g_path);
+        // the loader's reads: every byte of every tensor (inside the mapping, or a SIGSEGV / SIGBUS here), and the
+        // shape-checked lookups (an exception is fine)
+        unsigned x = 0;
+        for (const auto & [name, t] : g.tensors)
+            for (uint64_t i = 0; i < t.nbytes; i++) x += t.data[i];
+        g_sink += x;
+        for (const auto & [name, dims] : std::vector<std::pair<std::string, std::vector<uint64_t>>>{{"a", {8}}, {"b", {256, 2}}}) {
+            try {
+                const auto & t = g.get(name, dims);
+                if (t.nbytes != gguf::type_row_bytes(t.type, dims[0]) * (dims.size() > 1 ? dims[1] : 1)) {
+                    fprintf(stderr, "shape-checked %s: %llu bytes\n", name.c_str(), (unsigned long long) t.nbytes);
+                    abort();
+                }
+            } catch (const std::exception &) {
+            }
+        }
         return 1;
     } catch (const std::exception & e) {
         if (err) *err = e.what();
@@ -107,6 +127,32 @@ int parse(const Bytes & b, std::string * err = nullptr) {
 bool selected(const char * what) {
     const char * only = getenv("GGUF_FUZZ_ONLY");
     return !only || std::string(only) == what;
+}
+
+// a shape-checked read of a file that parses: File::get(name, dims) returns (1) or throws (0)
+void expect_get(const char * what, const Bytes & b, const std::string & name, const std::vector<uint64_t> & dims, int want) {
+    if (!selected(what)) return;
+    g_n++;
+    if (parse(b) != 1) {
+        g_fail++;
+        printf("FAIL %s: the file does not parse\n", what);
+        return;
+    }
+    std::string err;
+    int got = 0;
+    try {
+        gguf::File g(g_path);
+        g.get(name, dims);
+        got = 1;
+    } catch (const std::exception & e) {
+        err = e.what();
+    }
+    if (got != want) {
+        g_fail++;
+        printf("FAIL %s: %s\n", what, got ? "read" : ("threw: " + err).c_str());
+    } else {
+        printf("ok   %s%s%s\n", what, got ? "" : ": ", err.c_str());
+    }
 }
 
 void expect(const char * what, const Bytes & b, int want) {
@@ -199,6 +245,34 @@ int main(int argc, char ** argv) {
     expect("unaligned offset", with([](Spec & s) { s.a_off = 4; }), 0);
     expect("not a gguf file", Bytes(64, 'x'), 0);
     expect("empty file", Bytes(), 0);
+    // dimensions: none may be 0 (an empty tensor, nbytes 0, would pass as any shape that starts with its other dims)
+    expect("dimension 0", with([](Spec & s) { s.b_ne1 = 0; }), 0);
+    expect("dimension 0 in a third dimension", with([](Spec & s) { s.b_more = {0}; }), 0);
+    expect("row of 0", with([](Spec & s) { s.a_ne0 = 0; }), 0);
+    expect("third dimension 1", with([](Spec & s) { s.b_more = {1}; }), 1);
+    // size lies: the bytes a tensor's dims declare must be in the file (the size is never taken from elsewhere)
+    expect("size lie: one more row than the data", with([](Spec & s) { s.b_ne1 = 3; }), 0);
+    expect("size lie: a wider row", with([](Spec & s) { s.b_ne0 = 512; }), 0);
+    expect("size lie: a third dimension of 2", with([](Spec & s) { s.b_more = {2}; }), 0);
+    // (a size lie that stays inside the file parses, like an overlap; the shape-checked read below refuses it)
+    expect("size lie inside the file: a as 80 values over b", with([](Spec & s) { s.a_ne0 = 80; }), 1);
+    // offset lies: offset + size inside the data section (an overlap stays inside the file: allowed, as ggml does)
+    expect("offset lie: b one block later", with([](Spec & s) { s.b_off = 64; }), 0);
+    expect("offset lie: b at 2^63", with([](Spec & s) { s.b_off = 1ull << 63; }), 0);
+    expect("offset lie: b over a (overlap)", with([](Spec & s) { s.b_off = 0; }), 1);
+    expect("offset lie: a at the end of the data", with([](Spec & s) { s.a_off = 320; }), 0);
+    // the loader's shape-checked reads (File::get(name, dims)): a tensor of the right name and another shape is refused
+    expect_get("get: the expected shape", good, "b", {256, 2}, 1);
+    expect_get("get: 1-D a as [8]", good, "a", {8}, 1);
+    expect_get("get: 1-D a as [8, 1]", good, "a", {8, 1}, 1);
+    expect_get("get: fewer rows than expected", good, "b", {256, 3}, 0);
+    expect_get("get: more rows than expected", good, "b", {256, 1}, 0);
+    expect_get("get: same bytes, other row length", good, "b", {512, 1}, 0);
+    expect_get("get: a as [4, 2]", good, "a", {4, 2}, 0);
+    expect_get("get: [256, 2, 1] as [256, 2]", with([](Spec & s) { s.b_more = {1}; }), "b", {256, 2}, 1);
+    expect_get("get: [256, 1, 2] as [256, 2]", with([](Spec & s) { s.b_ne1 = 1; s.b_more = {2}; }), "b", {256, 2}, 0);
+    expect_get("get: a missing tensor", good, "c", {8}, 0);
+    expect_get("get: a as 80 values over b, read as [8]", with([](Spec & s) { s.a_ne0 = 80; }), "a", {8}, 0);
 
     // random corruption of the valid file: anything may happen except a crash (sanitizers catch out-of-bounds reads)
     std::mt19937_64 rng(1234);

@@ -203,9 +203,16 @@ the vocabulary, in parallel), so the parser checks every read against the file s
 counts, string and array lengths (no nested arrays, as ggml), duplicate keys or tensor names, 1-4 dimensions of at
 most 2^63 elements, the type and whole blocks per row, `general.alignment` (a power of two up to 1 MiB), and each
 tensor's data (aligned, inside the file); sizes are computed without overflow. A malformed file is refused with an
-error naming the field. `tests/gguf_fuzz.cpp` (`make tests/gguf_fuzz`) feeds it malformed and randomly corrupted
-files under AddressSanitizer / UBSan; UD-Q4_K_XL, UD-Q4_K_M and Q4_K_M parse to the same tensors and keys as before
-the checks (2026-10-17).
+error naming the field. A tensor's byte size always comes from its type and dimensions, and no dimension may be 0. The
+loader then reads every tensor by the shape it expects (`File::get(name, dims)`, `gguf::shape_is`): each matrix is
+exactly [K, N] (further dimensions 1), `token_embd` exactly [5120, 248320], the norms and vectors their exact sizes, so
+a file with the right names but a short or reshaped tensor is refused, naming it, instead of being read past its end.
+`tests/gguf_fuzz.cpp` (`make tests/gguf_fuzz`) feeds it malformed and randomly corrupted files (size and offset lies
+included) under AddressSanitizer / UBSan, reads every byte of every tensor of the files that parse and tries the
+shape-checked reads; UD-Q4_K_XL, UD-Q4_K_M and Q4_K_M parse to the same tensors and keys as before the checks
+(2026-10-17). The vision projector (mmproj) is read through ggml's GGUF reader, which checks the same sizes; the CPU
+encoder then checks every tensor's size against the projector's hyperparameters, and the hyperparameters and the types
+of the keys it reads (a crafted file is refused with an error rather than ending the process).
 
 The MTP draft block (`blk.64.*`, `nextn.eh_proj`) is the one lossy exception: its matrices stored wider than Q4_K
 (Q5_K, Q6_K, Q8_0: all of them in UD-Q4_K_XL, `eh_proj` / `attn_v` / `ffn_down` in Q4_K_M) are re-quantized to Q4_K at

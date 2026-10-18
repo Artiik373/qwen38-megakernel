@@ -507,14 +507,27 @@ struct GG {
         if (f) fclose(f);
     }
     int64_t key(const char * k) const { return gguf_find_key(g, k); }
-    uint32_t u32(const char * k) const {
+    // (ggml's typed getters abort on a key of another type: a crafted mmproj is refused with an error instead)
+    int64_t typed(const char * k, gguf_type t) const {
         const int64_t i = key(k);
+        if (i >= 0 && gguf_get_kv_type(g, i) != t) throw std::runtime_error(std::string("mmproj: ") + k + " has an unexpected type");
+        return i;
+    }
+    uint32_t u32(const char * k) const {
+        const int64_t i = typed(k, GGUF_TYPE_UINT32);
         if (i < 0) throw std::runtime_error(std::string("mmproj: missing ") + k);
         return gguf_get_val_u32(g, i);
     }
     float f32(const char * k, float def) const {
-        const int64_t i = key(k);
+        const int64_t i = typed(k, GGUF_TYPE_FLOAT32);
         return i < 0 ? def : gguf_get_val_f32(g, i);
+    }
+    // an array key of n elements of type t (-1: absent)
+    int64_t arr(const char * k, gguf_type t, size_t n = 0) const {
+        const int64_t i = typed(k, GGUF_TYPE_ARRAY);
+        if (i >= 0 && (gguf_get_arr_type(g, i) != t || (n && gguf_get_arr_n(g, i) != n)))
+            throw std::runtime_error(std::string("mmproj: ") + k + " has an unexpected type or length");
+        return i;
     }
     // a tensor widened to fp32 (row-major, ne0 fastest)
     std::vector<float> get(const std::string & name) const {
@@ -557,7 +570,7 @@ Vit::Vit(const std::string & mmproj, const Params & prm) {
     if (!gg.f) throw std::runtime_error("vit: cannot open " + mmproj);
     gg.data = gguf_get_data_offset(gg.g);
     {
-        const int64_t k = gg.key("clip.projector_type");
+        const int64_t k = gg.typed("clip.projector_type", GGUF_TYPE_STRING);
         if (k < 0 || std::string(gguf_get_val_str(gg.g, k)) != "qwen3vl_merger")
             throw std::runtime_error("vit: only the qwen3vl_merger projector (Qwen3.x vision) is implemented");
     }
@@ -570,18 +583,22 @@ Vit::Vit(const std::string & mmproj, const Params & prm) {
     I.merge = gg.key("clip.vision.spatial_merge_size") >= 0 ? (int) gg.u32("clip.vision.spatial_merge_size") : 2;
     I.eps = gg.f32("clip.vision.attention.layer_norm_epsilon", 1e-6f);
     for (const char * k : {"clip.vision.image_mean", "clip.vision.image_std"}) {
-        const int64_t i = gg.key(k);
-        if (i >= 0 && gguf_get_arr_n(gg.g, i) == 3) {
+        const int64_t i = gg.arr(k, GGUF_TYPE_FLOAT32, 3);
+        if (i >= 0) {
             const float * v = static_cast<const float *>(gguf_get_arr_data(gg.g, i));
             memcpy(std::string(k).find("mean") != std::string::npos ? I.mean : I.stdv, v, 3 * sizeof(float));
         }
     }
     {
-        const int64_t i = gg.key("clip.vision.is_deepstack_layers");
+        const int64_t i = gg.arr("clip.vision.is_deepstack_layers", GGUF_TYPE_BOOL);
         if (i >= 0)
             for (size_t j = 0; j < gguf_get_arr_n(gg.g, i); j++)
                 if (static_cast<const int8_t *>(gguf_get_arr_data(gg.g, i))[j]) throw std::runtime_error("vit: deepstack layers are not implemented");
     }
+    // (before any division by them or allocation sized by them: a crafted mmproj gets an error, not a SIGFPE)
+    if (I.D <= 0 || I.nH <= 0 || I.FF <= 0 || I.nL <= 0 || I.nL > 1024 || I.n_embd <= 0 || I.D > (1 << 16) || I.FF > (1 << 18) ||
+        I.n_embd > (1 << 16))
+        throw std::runtime_error("vit: bad vision hyperparameters in the mmproj");
     if (I.D / I.nH != HD || I.merge != 2 || I.patch != 16) throw std::runtime_error("vit: unexpected vision tower shape");
     // llama.cpp's limits for this projector (clip.cpp: set_limit_image_tokens(8, 4096)), per merged token 32 x 32 pixels
     const int area = I.patch * I.patch * I.merge * I.merge;

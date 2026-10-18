@@ -1,9 +1,14 @@
 // Minimal read-only GGUF parser (mmap based). Only what the megakernel loader needs.
 // Every read is checked against the file size and every size is computed without overflow: a truncated or malformed
 // file throws std::runtime_error (never a read outside the mapping, a division by zero or a huge allocation).
-// tests/gguf_fuzz.cpp feeds it malformed files.
+// A tensor's byte size comes from its type and dimensions (never from anything else the file says); its type must be one
+// the engine reads, every dimension at least 1, and offset + size inside the data section. Readers that expect a shape
+// ask for it (File::get(name, dims), shape_is): a tensor with the right name but another shape (fewer rows, an extra
+// dimension) is refused with its name, so no reader trusts a size the file declares. tests/gguf_fuzz.cpp feeds it
+// malformed files.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -64,6 +69,19 @@ inline uint64_t type_block(uint32_t type) {
     }
 }
 
+inline std::string shape_str(const std::vector<uint64_t> & ne) {
+    std::string s = "[";
+    for (size_t d = 0; d < ne.size(); d++) s += (d ? ", " : "") + std::to_string(ne[d]);
+    return s + "]";
+}
+
+// ne is exactly `dims` (GGUF order: ne[0] = the row length), missing or further dimensions being 1
+inline bool shape_is(const std::vector<uint64_t> & ne, const std::vector<uint64_t> & dims) {
+    for (size_t d = 0; d < std::max(ne.size(), dims.size()); d++)
+        if ((d < ne.size() ? ne[d] : 1) != (d < dims.size() ? dims[d] : 1)) return false;
+    return true;
+}
+
 struct File {
     const uint8_t * base = nullptr;
     size_t size = 0;
@@ -104,6 +122,14 @@ struct File {
         auto it = tensors.find(name);
         if (it == tensors.end()) throw std::runtime_error("missing tensor " + name);
         return it->second;
+    }
+    // the tensor, which must have the shape `dims` (shape_is): its nbytes then cover exactly what a reader of that shape
+    // reads (the type's row bytes x the rows)
+    const Tensor & get(const std::string & name, const std::vector<uint64_t> & dims) const {
+        const Tensor & t = get(name);
+        if (!shape_is(t.ne, dims))
+            throw std::runtime_error("tensor " + name + " has shape " + shape_str(t.ne) + ", expected " + shape_str(dims));
+        return t;
     }
 
   private:
@@ -190,7 +216,8 @@ struct File {
             uint64_t nel = 1;
             for (uint32_t d = 0; d < nd; d++) {
                 const uint64_t ne = rd<uint64_t>();
-                if (ne > (uint64_t) INT64_MAX || (ne && nel > (uint64_t) INT64_MAX / ne))
+                if (ne == 0) fail("tensor " + t.name + " has a dimension of 0"); // (an empty tensor: nothing to read)
+                if (ne > (uint64_t) INT64_MAX || nel > (uint64_t) INT64_MAX / ne)
                     fail("tensor " + t.name + " has too many elements");
                 nel *= ne;
                 t.ne.push_back(ne);
