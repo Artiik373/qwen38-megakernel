@@ -12,6 +12,8 @@ REM   MK_PF_CAP           prefill chunk tokens (default 2048; 1024 above 96k con
 REM   MK_KV, MK_KV_WIN    low-bit KV cache, preset D': set MK_KV=K*=6,V*=5,*16=8 and MK_KV_WIN=2048
 REM   MK_KEEP_WARM_S      seconds the engine keeps the GPU's clocks up after each request (default 120, 0 = off)
 REM   MK_DRAFT_Q4=0       the draft head reads lm_head instead of its Q4_K copy (saves 90 MiB; the copy is on by default)
+REM   MK_MTP              the MTP draft layer from a separate GGUF of the same model (e.g. an mtp-*.gguf)
+REM   MK_NO_MTP=1         no MTP layer: plain decoding, depth 0 (also automatic for a model file without one)
 REM   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS
 REM                       request limits: body size (default 128 MB), images per request (32), pixels per image
 REM                       (100,000,000; checked before decoding)

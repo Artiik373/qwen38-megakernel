@@ -17,6 +17,9 @@
 #                       up to 262,144 tokens on 24 GB; near-lossless, see README)
 #   MK_KEEP_WARM_S      seconds the engine keeps the GPU's clocks up after each request (default 120, 0 = off)
 #   MK_DRAFT_Q4=0       the draft head reads lm_head instead of its Q4_K copy (saves 90 MiB; the copy is on by default)
+#   MK_MTP              the MTP draft layer from a separate GGUF of the same model (e.g. an mtp-*.gguf), for a model
+#                       file without one or instead of the file's own
+#   MK_NO_MTP=1         no MTP layer: plain decoding, depth 0 (also automatic for a model file without one)
 #   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS
 #                       request limits: body size (default 128 MB), images per request (32), pixels per image
 #                       (100,000,000; checked before decoding)

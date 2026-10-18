@@ -64,7 +64,7 @@ def log(*a):
 class Engine:
     """ctypes binding of capi.cpp"""
 
-    def __init__(self, lib, model, ctx, n_draft, draft_vocab, kv_mode=-1):
+    def __init__(self, lib, model, ctx, n_draft, draft_vocab, kv_mode=-1, mtp=None):
         L = self.L = ctypes.CDLL(lib)
         vp, ip, cp = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p
         sig = {
@@ -107,9 +107,21 @@ class Engine:
             L.mk_prefill_img.argtypes = [vp, ip, ctypes.c_int, ip, ctypes.c_int, ctypes.c_int, ip, ip, ip,
                                          ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
             L.mk_n_embd.restype, L.mk_n_embd.argtypes = ctypes.c_int, []
-        self.h = L.mk_new(model.encode(), ctx, n_draft, draft_vocab.encode() if draft_vocab else None, kv_mode)
+        dv = draft_vocab.encode() if draft_vocab else None
+        if mtp is not None:  # --mtp FILE / --no-mtp ("none"); otherwise the model file's MTP layer (or MK_MTP / MK_NO_MTP)
+            if not hasattr(L, "mk_new_mtp"):
+                raise RuntimeError("--mtp / --no-mtp need a newer libqwen38mk (mk_new_mtp)")
+            L.mk_new_mtp.restype = vp
+            L.mk_new_mtp.argtypes = [cp, ctypes.c_int, ctypes.c_int, cp, ctypes.c_int, cp]
+            self.h = L.mk_new_mtp(model.encode(), ctx, n_draft, dv, kv_mode, mtp.encode())
+        else:
+            self.h = L.mk_new(model.encode(), ctx, n_draft, dv, kv_mode)
         if not self.h:
             raise RuntimeError(L.mk_last_error().decode())
+        self.has_mtp = True  # False: no MTP layer, plain decoding at depth 0
+        if hasattr(L, "mk_has_mtp"):
+            L.mk_has_mtp.restype, L.mk_has_mtp.argtypes = ctypes.c_int, [vp]
+            self.has_mtp = L.mk_has_mtp(self.h) == 1
         self.ctx = ctx
         self._pieces = {}
         # MK_EXACT engines (exact reuse): prefill rows do not depend on the chunking; see Server.load_prompt
@@ -577,7 +589,9 @@ class Server:
         self.args = args
         t0 = time.time()
         self.eng = Engine(args.lib, args.model, args.ctx, args.draft, args.draft_vocab,
-                          {"f16": 0, "q8": 1, "auto": -1}[args.kv])
+                          {"f16": 0, "q8": 1, "auto": -1}[args.kv], "none" if args.no_mtp else args.mtp)
+        if not self.eng.has_mtp:
+            log("no MTP layer: plain decoding (depth 0)")
         self.template = make_template(self.eng.chat_template())
         im = self.eng.tokenize("<|im_start|>")
         self.im_start = im[0] if len(im) == 1 else None  # checkpoint at the start of the generation prompt
@@ -1084,6 +1098,9 @@ def main():
     ap.add_argument("-c", "--ctx", type=int, default=32768)
     ap.add_argument("-d", "--draft", type=int, default=4)
     ap.add_argument("--draft-vocab", default=os.path.join(os.path.dirname(HERE), "draft_vocab_32k.bin"))
+    ap.add_argument("--mtp", default=None,
+                    help="the MTP draft layer from another GGUF of the same model (default: the model file's; env MK_MTP)")
+    ap.add_argument("--no-mtp", action="store_true", help="no MTP layer: plain decoding, depth 0 (env MK_NO_MTP=1)")
     ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), LIB_MK))
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
                     help="KV cache format (auto: q8_0 only when the fp16 cache does not fit)")

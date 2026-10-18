@@ -39,7 +39,11 @@ class MKEngine {
     // draft_vocab: optional file of int32 token ids; the MTP draft head is restricted to them.
     // kv_mode: KV cache format, 0 fp16, 1 q8_0 (half the memory, ~1-2% slower), -1 auto (q8_0 only
     // when the fp16 cache for ctx positions does not fit in the free GPU memory).
-    MKEngine(const std::string & gguf_path, int ctx, int n_draft, const std::string & draft_vocab = "", int kv_mode = -1);
+    // mtp: where the MTP draft layer (blk.64) comes from: "" the model file (else the env vars MK_NO_MTP=1 / MK_MTP=FILE),
+    // a path: that GGUF's MTP layer (it must belong to this model; it replaces the model file's own), "none": no MTP layer.
+    // Without one (also a model file that has none) the engine decodes without drafting: n_draft is 0 whatever is asked.
+    MKEngine(const std::string & gguf_path, int ctx, int n_draft, const std::string & draft_vocab = "", int kv_mode = -1,
+             const std::string & mtp = "");
     ~MKEngine();
 
     // Clears all sequence state (KV, recurrent state, positions).
@@ -105,9 +109,12 @@ class MKEngine {
     std::vector<unsigned long long> state_digest();
     // MK_EXACT=1 at construction: prefill results independent of the chunking (see qwen38_mk.cu `exact`).
     bool exact() const;
+    // false: no MTP layer (see the constructor's mtp): depth 0 only
+    bool has_mtp() const;
 
     // Draft depth for the following prefills and steps, 0 .. the n_draft given at construction (CLI batch mode: an engine
     // built for the deepest job runs each job at its own depth; the same launches as an engine built for that depth).
+    // Without an MTP layer any depth becomes 0 (a notice, not an error).
     void set_n_draft(int n);
     // Post-prefill state files (test runs: decode A-B-As at long context without re-prefilling). prefill(tokens) on an
     // empty sequence that first looks in dir for a state file of the same batched prefill (every prompt token but the

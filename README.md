@@ -154,6 +154,33 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 
 Use the BF16 mmproj. The encoder widens any file to fp32, so a Q8_0 mmproj is no faster and is less accurate.
 
+Other Qwen3.8-27B GGUFs (fine-tunes such as abliterated or uncensored conversions) run when every tensor has a type
+the engine reads ([docs/ENGINE.md](docs/ENGINE.md#the-gguf)): `token_embd` Q4_K, Q6_K or Q8_0, `output` Q6_K or Q8_0.
+Some conversions drop the MTP layer (`blk.64`) the engine drafts with:
+
+- Without one the engine loads with a notice and decodes without drafting (depth 0, about a third of the drafted
+  speed); it allocates no MTP weights and no MTP KV slot. `--no-mtp` (`MK_NO_MTP=1`) does the same for a file that has
+  one.
+- `--mtp FILE` (`MK_MTP=FILE` for scripts/serve.sh) takes the MTP layer from another GGUF of the same model, e.g. a
+  separate `mtp-*.gguf`, instead of the model file's own. The engine checks that it belongs to the model
+  (architecture, sizes, vocabulary) and re-quantizes its matrices to Q4_K like the built-in layer's.
+
+The MTP layer only proposes drafts, which the main model verifies: output is the same with any MTP layer or none
+(greedy bit for bit), only the acceptance rate and so the speed can change.
+
+Checked on 2026-10-18 (greedy output the same at depth 0, 4 and 7; top-token agreement with llama.cpp running the same
+file, 98.7% for UD-Q4_K_XL):
+
+| file | what it needs | agreement |
+|---|---|---|
+| OrcaSAQ-2-27B-Uncensored | Q6_K `token_embd` and `output` | 99.0% |
+| Qwen3.8-27B-Uncensored-Cyber IQ4_XS (imatrix, plus-mtp) | Q8_0 `token_embd` and `output` | 99.1% |
+| Qwen3.8-27B-Uncensored-Cyber Q4_K_M | no MTP layer: depth 0, or `--mtp` with its `mtp-*-Q4_0.gguf` | 99.1% |
+| Huihui-Qwen3.8-27B-abliterated Q4_K_L | Q8_0 `token_embd` and `output`; 19.7 GB of weights, so a short context on 24 GB | 98.7% |
+
+Huihui's abliterated UD-DW-Q4_K_M ran before these changes and still does. A fine-tune's MTP layer drafted as well as
+the original's on these files (49-54% of drafts accepted at depth 7).
+
 ## Run
 
 ```sh

@@ -31,7 +31,7 @@
 namespace gguf {
 
 enum GType : uint32_t {
-    F32 = 0, F16 = 1, Q8_0 = 8, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23
+    F32 = 0, F16 = 1, Q4_0 = 2, Q8_0 = 8, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23
 };
 
 struct Tensor {
@@ -47,6 +47,7 @@ inline uint64_t type_row_bytes(uint32_t type, uint64_t n) {
     switch (type) {
         case F32: return n * 4;
         case F16: return n * 2;
+        case Q4_0: return n / 32 * 18;
         case Q8_0: return n / 32 * 34;
         case Q4_K: return n / 256 * 144;
         case Q5_K: return n / 256 * 176;
@@ -63,7 +64,7 @@ inline uint64_t type_row_bytes(uint32_t type, uint64_t n) {
 inline uint64_t type_block(uint32_t type) {
     switch (type) {
         case F32: case F16: return 1;
-        case Q8_0: case IQ4_NL: return 32;
+        case Q4_0: case Q8_0: case IQ4_NL: return 32;
         case Q4_K: case Q5_K: case Q6_K: case Q3_K: case IQ3_S: case IQ4_XS: return 256;
         default: return 0;
     }
@@ -88,6 +89,7 @@ struct File {
     std::map<std::string, Tensor> tensors;
     std::map<std::string, uint64_t> ints;
     std::map<std::string, std::string> strs;
+    std::map<std::string, uint64_t> arrs; // element count of each array kv (e.g. tokenizer.ggml.tokens: the vocabulary)
 
     static constexpr uint64_t MAX_ALIGNMENT = 1u << 20; // general.alignment: a power of two up to this
 
@@ -172,6 +174,7 @@ struct File {
             case 9: { // arrays are skipped; their elements are scalars or strings (ggml rejects nested arrays too)
                 const uint32_t et = rd<uint32_t>();
                 const uint64_t n = rd<uint64_t>();
+                arrs[key] = n;
                 if (const uint64_t eb = scalar_bytes(et)) {
                     if (n > (size - pos) / eb) fail("array " + key + " of " + std::to_string(n) + " elements runs past the end");
                     pos += (size_t) (n * eb);

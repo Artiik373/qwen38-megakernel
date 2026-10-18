@@ -44,9 +44,13 @@ struct LoadClock {
 class Prefetch {
   public:
     static constexpr size_t PIECE = 4u << 20;
-    Prefetch(const gguf::File & f, int nth, size_t window) : win_(std::max<size_t>(1, window / PIECE)) {
+    // keep (optional): the tensors to read ahead (the MTP block of a --mtp file; the main file without the blocks it
+    // does not supply)
+    Prefetch(const gguf::File & f, int nth, size_t window, const std::function<bool(const std::string &)> & keep = nullptr)
+        : win_(std::max<size_t>(1, window / PIECE)) {
         std::vector<const gguf::Tensor *> v;
-        for (const auto & kv : f.tensors) v.push_back(&kv.second);
+        for (const auto & kv : f.tensors)
+            if (!keep || keep(kv.first)) v.push_back(&kv.second);
         auto layer = [](const std::string & n) { return n.compare(0, 4, "blk.") == 0 ? atoi(n.c_str() + 4) : 1 << 20; };
         std::sort(v.begin(), v.end(), [&](const gguf::Tensor * a, const gguf::Tensor * b) {
             const int la = layer(a->name), lb = layer(b->name);

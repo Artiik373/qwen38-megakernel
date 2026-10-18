@@ -17,6 +17,8 @@ Which model file runs on it (details in [The GGUF](#the-gguf)):
 | unsloth's Qwen3.8-27B `UD-Q4_K_XL` | yes (tuned on it) |
 | unsloth's Qwen3.8-27B `Q4_K_M` | yes |
 | another Qwen3.8-27B `Q4_K_M` | when every tensor has a type listed under [The GGUF](#the-gguf); untested |
+| fine-tunes of Qwen3.8-27B (other quantizers) | when every tensor has a type listed under [The GGUF](#the-gguf); four checked on 2026-10-18 (README) |
+| a file without the MTP layer | yes, without drafting (depth 0), or with `--mtp` and a separate MTP file of the same model |
 | any other quant | refused by the loader, which names the first tensor it cannot read (use llama.cpp) |
 
 ## How it works
@@ -190,7 +192,10 @@ any of:
 | Q3_K, IQ3_S | re-laid-out at load (values + scales streams, 114 / 112 B per 256 weights); the GEMV and the prefill GEMM feed exactly the integers and scales of the Q6_K re-encode they replace (`MK_REENC3=1`): bit-identical results at ~0.54x the bytes |
 | IQ4_NL | re-laid-out at load into 144-byte blocks of 256 weights (the eight fp16 scales, then the index bytes); bit-identical to the Q8_0 re-encode it replaces (`MK_IQ4NL_Q8=1`) at 0.53x the bytes |
 
-`token_embd` must be Q4_K (it stays in mapped pinned host memory, not in VRAM) and `output` Q6_K. Q8_0 `ssm_alpha` /
+`token_embd` can be Q4_K, Q6_K or Q8_0: it stays in mapped pinned host memory (not in VRAM) as stored, and each lookup
+(the decode embed phase, the MTP block's input, the prefill embed kernels) stages the token's row and dequantizes it the
+way ggml does. `output` can be Q6_K or Q8_0 (Q8_0: ~0.3 GB more VRAM; lm_head and the draft head have an instance per
+type). Q8_0 `ssm_alpha` /
 `ssm_beta` (UD) stay int8 with their block scales and the kernels apply the norm weight on the fly; other types are
 dequantized to F32 at load and folded with the norm weight into fp32 rows (the same values; `MK_AB_F32=1` forces this
 path). The exact re-encodes keep every weight's value (both formats store a small integer times the same fp16 `d` and an
@@ -217,10 +222,21 @@ of the keys it reads (a crafted file is refused with an error rather than ending
 The MTP draft block (`blk.64.*`, `nextn.eh_proj`) is the one lossy exception: its matrices stored wider than Q4_K
 (Q5_K, Q6_K, Q8_0: all of them in UD-Q4_K_XL, `eh_proj` / `attn_v` / `ffn_down` in Q4_K_M) are re-quantized to Q4_K at
 load (`ggml_quantize_chunk`, ~2.5 s of CPU for UD-Q4_K_XL, on a background thread during the load), so every MTP pass
-streams less. Only the drafts change: they are verified by the unchanged main model, so greedy output and the sampled
-output distribution stay exact. When it went in (2026-10-12, before wide verify) it saved 107 MiB of VRAM on
-UD-Q4_K_XL, sped greedy decode up 1.5% and moved acceptance by under a point. `MK_MTP_Q4=0` keeps the stored types
-(`MK_MTP_Q4=ab` loads both and the policy key `mtpq=0|1` switches between them, for A/B tests).
+streams less (a Q4_0 MTP block too; with `MK_MTP_Q4=0` Q4_0 is repacked to Q8_0 exactly). Only the drafts change: they
+are verified by the unchanged main model, so greedy output and the sampled output distribution stay exact. When it went
+in (2026-10-12, before wide verify) it saved 107 MiB of VRAM on UD-Q4_K_XL, sped greedy decode up 1.5% and moved
+acceptance by under a point. `MK_MTP_Q4=0` keeps the stored types (`MK_MTP_Q4=ab` loads both and the policy key
+`mtpq=0|1` switches between them, for A/B tests).
+
+The MTP layer can come from another file (`--mtp FILE`, `MK_MTP=FILE`; C API `mk_new_mtp`), e.g. the separate
+`mtp-*.gguf` files published for conversions that dropped it: its `blk.64.*` tensors replace the model file's (the
+file's own `token_embd` / `output` copies are not used: the MTP block shares the model's). The file goes through the
+same parser and loader; the load stops with an error naming the mismatch unless its architecture, embedding / FFN
+sizes, head counts and dimensions, `block_count` (the MTP block at layer 64), vocabulary size and tokenizer match the
+model and all 15 `blk.64` tensors are there. A model file without the layer (`block_count` 64), or `--no-mtp` /
+`MK_NO_MTP=1`, runs without drafting: depth 0 whatever is asked (a notice, not an error), no MTP weights, draft head
+or MTP KV slot (1/17 of the KV cache), and the prefill skips the MTP block's K / V. Greedy output equals the drafted
+engine's at depth 0 bit for bit (checked on UD-Q4_K_XL, 2026-10-17).
 
 The draft head gets the same treatment (`MK_DRAFT_Q4`, on by default; `MK_DRAFT_Q4=0` turns it off and saves its 90 MiB
 of VRAM): the 32,768 rows of the draft vocabulary are re-quantized from `output`'s Q6_K to a Q4_K copy at load (0.8 s),
@@ -262,7 +278,8 @@ python3 server/mk_server.py -m ~/models/Qwen3.8-27B-UD-Q4_K_XL.gguf -c 120000 --
 ```
 
 Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `-c` context [32768], `-d` drafts [4],
-`--kv auto|f16|q8` [auto: q8_0 only when fp16 does not fit], `--draft-vocab` [draft_vocab_32k.bin], `--exact-reuse`
+`--kv auto|f16|q8` [auto: q8_0 only when fp16 does not fit], `--draft-vocab` [draft_vocab_32k.bin], `--mtp FILE` (the
+MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decoding; env `MK_NO_MTP=1`), `--exact-reuse`
 [off; the launchers turn it on], `--ck-every n` (a checkpoint every n prompt tokens [4096], 0 = off), `--ck-msgs 1|0`
 (a checkpoint at each message start [1]), `--mmproj` (images, below), `--vision-backend auto|cpu|mtmd` [auto],
 `--vision-threads` [0 = all], `--image-min-tokens` / `--image-max-tokens` [the mmproj's], `--image-cache` [8; images

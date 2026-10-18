@@ -306,6 +306,7 @@ struct ModelW {
     // draft head reads instead; 0 rows: off. Rows past it (tokens dv_add appended) come from lm_head as before.
     const uint8_t * dq4;
     int dq4_n;
+    int embd_t; // token_embd's type: T_Q4K, T_Q6K or T_Q8_0 (ggml rows, embd_rb<type>() bytes)
 };
 
 // Quantised activation vector(s) in the "unit" layout consumed by the GEMV:
@@ -1298,6 +1299,60 @@ __device__ __forceinline__ float dequant_q4k(const uint8_t * row, int e) {
 
 constexpr int EMBD_RB = D / 256 * 144; // bytes of one Q4_K token_embd row
 
+// token_embd of another type (ModelW::embd_t; files whose token_embd is Q6_K or Q8_0): ggml's rows as stored, element e
+// dequantised as ggml does (every product here is exact in fp32: d * sc has at most 18 significant bits, times a 6-bit q)
+template <int ET>
+__host__ __device__ constexpr int embd_rb() {
+    return ET == T_Q4K ? D / 256 * 144 : ET == T_Q6K ? D / 256 * 210 : D / 32 * 34;
+}
+__device__ __forceinline__ float dequant_q6k_e(const uint8_t * row, int e) { // ggml block_q6_K: ql[128] qh[64] sc[16] d
+    const int b = e >> 8, w = e & 255, n = w >> 7, r = w & 127, qq = r >> 5, l = r & 31;
+    const uint8_t * blk = row + b * 210;
+    const uint8_t ql = blk[64 * n + l + (qq & 1) * 32], qh = blk[128 + 32 * n + l];
+    const int q = (int) (((qq & 2) ? (ql >> 4) : (ql & 0xF)) | (((qh >> (2 * qq)) & 3) << 4)) - 32;
+    const int sc = (int) reinterpret_cast<const int8_t *>(blk + 192)[8 * n + (l >> 4) + 2 * qq];
+    const float d = __half2float(*reinterpret_cast<const __half *>(blk + 208));
+    return d * (float) sc * (float) q;
+}
+__device__ __forceinline__ float dequant_q80_e(const uint8_t * row, int e) { // ggml block_q8_0: d, qs[32]
+    const uint8_t * blk = row + (e >> 5) * 34;
+    return (float) reinterpret_cast<const int8_t *>(blk + 2)[e & 31] * __half2float(*reinterpret_cast<const __half *>(blk));
+}
+template <int ET>
+__device__ __forceinline__ float dequant_embd(const uint8_t * row, int e) {
+    if constexpr (ET == T_Q4K) return dequant_q4k(row, e);
+    else if constexpr (ET == T_Q6K) return dequant_q6k_e(row, e);
+    else return dequant_q80_e(row, e);
+}
+// nbytes (a multiple of 4) of the table at byte offset off -> shared memory, 4-byte reads (Q6_K rows are only 8-byte
+// aligned); every thread of the block calls it
+__device__ __forceinline__ void stage_embd_bytes(size_t off, int nbytes, uint8_t * dst) {
+    for (int i = threadIdx.x; i < nbytes / 4; i += blockDim.x)
+        reinterpret_cast<unsigned *>(dst)[i] = reinterpret_cast<const unsigned *>(cW.embd + off)[i];
+    __syncthreads();
+}
+// embed_prologue's element e (block s: elements [512 s, 512 s + 512)) for a Q6_K / Q8_0 table, out of line
+__device__ __noinline__ float embed_elem_other(int tok, int s, int e) {
+    if (cW.embd_t == T_Q6K) {
+        stage_embd_bytes((size_t) tok * embd_rb<T_Q6K>() + 2 * s * 210, 2 * 210, smem);
+        return dequant_q6k_e(smem, e - 512 * s);
+    }
+    stage_embd_bytes((size_t) tok * embd_rb<T_Q8_0>() + 16 * s * 34, 16 * 34, smem);
+    return dequant_q80_e(smem, e - 512 * s);
+}
+// a whole Q6_K / Q8_0 token_embd row dequantised into se[0 .. D) (the MTP M0 phases; staged at stage, out of line);
+// each thread writes the elements e = threadIdx.x + k NT it reads back
+static_assert(2 * D * 4 + 32 * 4 + embd_rb<T_Q8_0>() <= SM_TOTAL, "MTP M0: se, sh, red and a staged token_embd row");
+__device__ __noinline__ void embed_row_other(int tok, float * se, uint8_t * stage) {
+    if (cW.embd_t == T_Q6K) {
+        stage_embd_bytes((size_t) tok * embd_rb<T_Q6K>(), embd_rb<T_Q6K>(), stage);
+        for (int e = threadIdx.x; e < D; e += NT) se[e] = dequant_q6k_e(stage, e);
+    } else {
+        stage_embd_bytes((size_t) tok * embd_rb<T_Q8_0>(), embd_rb<T_Q8_0>(), stage);
+        for (int e = threadIdx.x; e < D; e += NT) se[e] = dequant_q80_e(stage, e);
+    }
+}
+
 // token_embd row -> shared memory in one coalesced read: the table is in mapped host memory, where
 // every dependent access pays a PCIe round trip
 __device__ __forceinline__ const uint8_t * stage_embd_row(int tok, uint8_t * dst) {
@@ -1334,11 +1389,16 @@ __device__ __noinline__ void embed_prologue() {
     if (t >= T) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int tok = ((volatile Ctl *) cB.ctl)->tok[t];
-    // units 16 s .. 16 s + 15 = elements [512 s, 512 s + 512) = Q4_K super-blocks 2 s, 2 s + 1 (288 bytes)
-    stage_embd_part(tok, 2 * s * 144, 2 * 144, smem);
     const float * w0 = cW.L[0].attn_norm;
     const int j = EMB_UB * s + warp, e = 32 * j + lane;
-    const float v = dequant_q4k(smem, e - 512 * s);
+    float v;
+    if (cW.embd_t == T_Q4K) {
+        // units 16 s .. 16 s + 15 = elements [512 s, 512 s + 512) = Q4_K super-blocks 2 s, 2 s + 1 (288 bytes)
+        stage_embd_part(tok, 2 * s * 144, 2 * 144, smem);
+        v = dequant_q4k(smem, e - 512 * s);
+    } else {
+        v = embed_elem_other(tok, s, e);
+    }
     cB.x[t * D + e] = v;
     q32_store(cB.qn, t, j, v * w0[e], v * v, true);
 }
@@ -4058,9 +4118,9 @@ constexpr int DQ4_RB = D / 256 * 144; // MK_DRAFT_Q4: bytes of one Q4_K lm_head 
 __device__ __forceinline__ float pen_logit(float a, float sc, int c, float pres, float freq) {
     return __fsub_rn(__fsub_rn(__fmul_rn(a, sc), __fmul_rn(freq, (float) c)), c > 0 ? pres : 0.f);
 }
-template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false, bool PEN = false>
-__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr,
-                                     float pres = 0.f, float freq = 0.f, int nx0 = 0) {
+// HT: lm_head's type (output.weight: Q6_K, or Q8_0 in some fine-tunes); lm_head<...> below picks the instance.
+template <int TL, bool TOPK, bool FULL, bool LSE, bool PEN, int HT>
+__device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 * cand, float pres, float freq, int nx0) {
     static_assert(!LSE || TL == 1, "LSE: one row");
     static_assert(!(PEN && FULL), "no penalty when scoring");
     uint8_t * const sm = smem;
@@ -4105,7 +4165,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                 rp[1] = head.w + (size_t) p1 * head.rb;
                 dp[0] = head.d + (size_t) p0 * head.nd;
                 dp[1] = head.d + (size_t) p1 * head.nd;
-                rows_t<TL, 5, 2, T_Q6K>(rp, dp, sx, a);
+                rows_t<TL, 5, 2, HT>(rp, dp, sx, a);
             }
         }
         wsum_acc<TL, 2>(a);
@@ -4276,6 +4336,14 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     if (tid == 0) *cB.cnt = 0;
     __syncthreads();
     return true;
+}
+// lm_head on the file's output.weight type: a thin out-of-line wrapper, so the callers (mk_cycle, mtp_pass) are unchanged
+// and each type's body is its own function (both bodies inline in one function would raise register pressure)
+template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false, bool PEN = false>
+__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr,
+                                     float pres = 0.f, float freq = 0.f, int nx0 = 0) {
+    if (cW.head.type == T_Q8_0) return lm_head_t<TL, TOPK, FULL, LSE, PEN, T_Q8_0>(t0, draft, s_tok, cand, pres, freq, nx0);
+    return lm_head_t<TL, TOPK, FULL, LSE, PEN, T_Q6K>(t0, draft, s_tok, cand, pres, freq, nx0);
 }
 
 // ---- sampling (single thread) ----
@@ -4725,10 +4793,13 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
         float * se = reinterpret_cast<float *>(sm);
         float * sh = se + D;
         float * red = sh + D;
-        const uint8_t * erow = stage_embd_row(tok, reinterpret_cast<uint8_t *>(red + 32));
+        const bool eq4 = cW.embd_t == T_Q4K; // (Q6_K / Q8_0 tables: embed_row_other leaves the row's values in se)
+        uint8_t * const erow = reinterpret_cast<uint8_t *>(red + 32);
+        if (eq4) stage_embd_row(tok, erow);
+        else embed_row_other(tok, se, erow);
         float ae = 0.f, ah = 0.f;
         for (int e = tid; e < D; e += NT) {
-            const float v = dequant_q4k(erow, e);
+            const float v = eq4 ? dequant_q4k(erow, e) : se[e];
             const float hv = hsrc ? __ldcg(hsrc + e) : 0.f;
             se[e] = v;
             sh[e] = hv;
@@ -4842,10 +4913,13 @@ __device__ __noinline__ void mtp_kv_pass(int row0, unsigned & epoch) {
         float * se = reinterpret_cast<float *>(sm);
         float * sh = se + D;
         float * red = sh + D;
-        const uint8_t * erow = stage_embd_row(tok, reinterpret_cast<uint8_t *>(red + 32));
+        const bool eq4 = cW.embd_t == T_Q4K; // (Q6_K / Q8_0 tables: embed_row_other leaves the row's values in se)
+        uint8_t * const erow = reinterpret_cast<uint8_t *>(red + 32);
+        if (eq4) stage_embd_row(tok, erow);
+        else embed_row_other(tok, se, erow);
         float ae = 0.f, ah = 0.f;
         for (int e = tid; e < D; e += NT) {
-            const float v = dequant_q4k(erow, e);
+            const float v = eq4 ? dequant_q4k(erow, e) : se[e];
             const float hv = hsrc ? __ldcg(hsrc + e) : 0.f;
             se[e] = v;
             sh[e] = hv;
@@ -5248,6 +5322,20 @@ void reencode_iq4nl_q80(const uint8_t * src, uint8_t * out, int64_t K) {
         for (int j = 0; j < 16; j++) {
             o[2 + j] = (uint8_t) kv[s[2 + j] & 0xf];
             o[2 + j + 16] = (uint8_t) kv[s[2 + j] >> 4];
+        }
+    }
+}
+
+// Q4_0 row (18 B blocks: fp16 d | 16 bytes, element j in the low nibble of byte j and element j + 16 in its high nibble,
+// value d * (q - 8)) -> Q8_0 with the same d and q - 8 as int8: the same values (an MTP block stored as Q4_0, MK_MTP_Q4=0)
+void reencode_q40_q80(const uint8_t * src, uint8_t * out, int64_t K) {
+    for (int64_t b = 0; b < K / 32; b++) {
+        const uint8_t * s = src + b * 18;
+        uint8_t * o = out + b * 34;
+        memcpy(o, s, 2);
+        for (int j = 0; j < 16; j++) {
+            o[2 + j] = (uint8_t) (int8_t) ((s[2 + j] & 0xf) - 8);
+            o[2 + j + 16] = (uint8_t) (int8_t) ((s[2 + j] >> 4) - 8);
         }
     }
 }
@@ -6233,11 +6321,26 @@ struct MKEngine::Impl {
     double nat_s = 0;
     bool iq3s_grid_up = false;
 
+    // The MTP block's source (M3 / M4): the model file; a second GGUF (MKEngine's mtp argument: --mtp FILE, MK_MTP=FILE),
+    // whose blk.<NL>.* tensors replace the model file's (its token_embd / output copies are not used: the MTP block shares
+    // the model's embedding and lm_head); or none (a file without the MTP layer, or --no-mtp / MK_NO_MTP=1): plain
+    // decoding at depth 0, no MTP weights, no MTP KV slot, no draft head.
+    std::unique_ptr<gguf::File> mtpf;
+    bool has_mtp = true;
+    std::string mtp_desc = "model"; // (state-file key) "model", "none" or the --mtp file's identity
+    int kv_slots = N_ATT_SLOTS;     // KV slots allocated (N_ATT_SLOTS - 1 without the MTP block: its slot is the last)
+    static bool is_mtp_name(const std::string & n) {
+        static const std::string p = "blk." + std::to_string(NL) + ".";
+        return n.compare(0, p.size(), p) == 0;
+    }
+    const gguf::File & src_of(const std::string & name) const { return mtpf && is_mtp_name(name) ? *mtpf : file; }
+
     // The GGUF tensor `name`, its bytes read in (Prefetch, MK_LOAD_IO)
-    std::unique_ptr<Prefetch> pfx;
+    std::unique_ptr<Prefetch> pfx, pfx_mtp;
     const gguf::Tensor & tget(const std::string & name) {
-        const auto & t = file.get(name);
-        if (pfx) pfx->need(t);
+        const gguf::File & f = src_of(name);
+        const auto & t = f.get(name);
+        if (Prefetch * px = &f == &file ? pfx.get() : pfx_mtp.get()) px->need(t);
         return t;
     }
     // MK_MTP_Q4 re-quantisation of one tensor's rows to Q4_K (rs_to bytes per row into out)
@@ -6254,7 +6357,7 @@ struct MKEngine::Impl {
             ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), out + (size_t) r * rs_to, 0, 1, K, nullptr); // lossy by design (mtp_q4)
         });
     }
-    static bool requant_type(uint32_t t) { return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0; }
+    static bool requant_type(uint32_t t) { return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0; }
     // The MTP block's re-quantisation (~2.5 s of CPU on UD-Q4_K_XL) runs on a background thread from early in the load
     // (rq_start; MK_LOAD_RQBG=0: inline as before); want() takes its results. Same rows, same calls, same bytes.
     std::map<std::string, std::vector<uint8_t>> rq_res;
@@ -6267,13 +6370,14 @@ struct MKEngine::Impl {
     } rq_th;
     bool rq_bg = false;
     void rq_start() {
-        rq_bg = mtp_q4 != 0 && !(getenv("MK_LOAD_RQBG") && atoi(getenv("MK_LOAD_RQBG")) == 0);
+        rq_bg = has_mtp && mtp_q4 != 0 && !(getenv("MK_LOAD_RQBG") && atoi(getenv("MK_LOAD_RQBG")) == 0);
         if (!rq_bg) return;
         std::vector<const gguf::Tensor *> ts;
+        const gguf::File & mf = mtpf ? *mtpf : file;
         for (const char * r : {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight",
                                "ffn_down.weight", "nextn.eh_proj.weight"}) {
-            const auto it = file.tensors.find("blk." + std::to_string(NL) + "." + r);
-            if (it != file.tensors.end() && requant_type(it->second.type)) ts.push_back(&it->second);
+            const auto it = mf.tensors.find("blk." + std::to_string(NL) + "." + r);
+            if (it != mf.tensors.end() && requant_type(it->second.type)) ts.push_back(&it->second);
         }
         rq_th.t = std::thread([this, ts] {
             const auto t0 = lclk::now();
@@ -6296,9 +6400,10 @@ struct MKEngine::Impl {
         s.data = t.data;
         s.nbytes = t.nbytes;
         const bool to_f32 = to == T_F32 && t.type != gguf::F32;
-        const bool to_q4 = !to_f32 && req_q4 && (t.type == gguf::Q5_K || t.type == gguf::Q6_K || t.type == gguf::Q8_0);
+        const bool to_q4 = !to_f32 && req_q4 && requant_type(t.type);
         const bool to_q6 = !to_f32 && !to_q4 && reenc3 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S);
-        const bool to_q8 = !to_f32 && !to_q4 && t.type == gguf::IQ4_NL && getenv("MK_IQ4NL_Q8"); // native IQ4_NL unless MK_IQ4NL_Q8
+        // native IQ4_NL unless MK_IQ4NL_Q8; Q4_0 (an MTP block, MK_MTP_Q4=0 / ab) always (the kernels do not read it)
+        const bool to_q8 = !to_f32 && !to_q4 && ((t.type == gguf::IQ4_NL && getenv("MK_IQ4NL_Q8")) || t.type == gguf::Q4_0);
         if (!to_f32 && !to_q4 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
         const ggml_type from = (ggml_type) t.type;
         const ggml_type dst = to_f32 ? GGML_TYPE_F32 : to_q4 ? GGML_TYPE_Q4_K : to_q6 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
@@ -6335,6 +6440,7 @@ struct MKEngine::Impl {
                 return;
             }
             if (to_q6) reencode_q6k(t.type, src, f.data(), out, K);
+            else if (t.type == gguf::Q4_0) reencode_q40_q80(src, out, K);
             else reencode_iq4nl_q80(src, out, K);
             g.resize((size_t) K);
             tr_dst->to_float(out, g.data(), K);
@@ -6396,7 +6502,7 @@ struct MKEngine::Impl {
     }
 
     Mat up_mat(const std::string & name, int K, int N, int to = -1) {
-        Src t = want(name, to < 0 ? (int) file.get(name).type : to);
+        Src t = want(name, to < 0 ? (int) src_of(name).get(name).type : to);
         if (!shape2(t.ne, (uint64_t) K, (uint64_t) N))
             throw std::runtime_error(name + " has shape " + gguf::shape_str(t.ne) + ", expected " + gguf::shape_str({(uint64_t) K, (uint64_t) N}));
         Mat m{};
@@ -6715,14 +6821,91 @@ struct MKEngine::Impl {
     int n_draft_max;
     int n_draft_cap; // the depth given at construction (set_n_draft: at most this)
     int kv_mode; // KV cache format: 0 fp16, 1 q8_0, -1 auto (q8_0 when fp16 does not fit)
-    Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_)
+    // A --mtp file must hold the MTP layer of this model: same architecture and shapes, its MTP block at layer index NL
+    // (block_count NLA), the same vocabulary; every tensor of the block present (shapes: up_mat / up_f32 as they load)
+    void check_mtp_file(const gguf::File & m, const std::string & mp) const {
+        auto bad = [&](const std::string & what) {
+            throw std::runtime_error("--mtp " + mp + ": " + what + " (an MTP layer file of this model is needed)");
+        };
+        auto gi = [](const gguf::File & f, const std::string & k) -> long long {
+            const auto it = f.ints.find(k);
+            return it == f.ints.end() ? -1 : (long long) it->second;
+        };
+        const auto arch = m.strs.find("general.architecture");
+        if (arch == m.strs.end() || arch->second != "qwen35")
+            bad("architecture " + (arch == m.strs.end() ? std::string("missing") : "'" + arch->second + "'") + ", expected qwen35");
+        for (const char * k : {"embedding_length", "feed_forward_length", "attention.head_count", "attention.head_count_kv",
+                               "attention.key_length", "attention.value_length"}) {
+            const std::string key = std::string("qwen35.") + k;
+            if (gi(m, key) != gi(file, key))
+                bad(key + " " + std::to_string(gi(m, key)) + ", the model has " + std::to_string(gi(file, key)));
+        }
+        if (gi(m, "qwen35.block_count") != NLA) bad("block_count " + std::to_string(gi(m, "qwen35.block_count")) + ", expected " +
+                                                   std::to_string(NLA) + " (the MTP block at layer " + std::to_string(NL) + ")");
+        if (gi(m, "qwen35.nextn_predict_layers") == 0) bad("nextn_predict_layers 0");
+        const auto vm = m.arrs.find("tokenizer.ggml.tokens"), vf = file.arrs.find("tokenizer.ggml.tokens");
+        if (vm != m.arrs.end() && vf != file.arrs.end() && vm->second != vf->second)
+            bad("vocabulary of " + std::to_string(vm->second) + " tokens, the model has " + std::to_string(vf->second));
+        for (const char * k : {"tokenizer.ggml.model", "tokenizer.ggml.pre"}) {
+            const auto a = m.strs.find(k), b = file.strs.find(k);
+            if (a != m.strs.end() && b != file.strs.end() && a->second != b->second) bad(std::string(k) + " '" + a->second + "', the model has '" + b->second + "'");
+        }
+        for (const char * k : {"token_embd.weight", "output.weight"}) { // (copies the engine does not use: their shape only)
+            const auto it = m.tensors.find(k);
+            if (it != m.tensors.end() && !shape2(it->second.ne, D, VOCAB)) bad(std::string(k) + " is not [" + std::to_string(D) + ", " + std::to_string(VOCAB) + "]");
+        }
+        for (const char * r : {"attn_norm.weight", "post_attention_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                               "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight", "ffn_gate.weight", "ffn_up.weight",
+                               "ffn_down.weight", "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight",
+                               "nextn.shared_head_norm.weight"}) {
+            const std::string n = "blk." + std::to_string(NL) + "." + r;
+            if (!m.tensors.count(n)) bad("missing tensor " + n);
+        }
+    }
+    // the state-file identity of a file: real path, size, mtime, hash of its first and last 4 MiB
+    static std::string file_ident(const std::string & p, const gguf::File & f);
+
+    Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_, const std::string & mtp_)
         : file(path), ctx(ctx_), ndraft(ndraft_), nd_avail(ndraft_), n_draft_max(ndraft_), n_draft_cap(ndraft_), kv_mode(kv_mode_) {
         model_path = path;
         if (file.strs["general.architecture"] != "qwen35") throw std::runtime_error("expected qwen35 architecture");
-        if (file.ints["qwen35.block_count"] != NLA || file.ints["qwen35.embedding_length"] != D)
+        // block_count NLA: the 64 layers + the MTP layer; NL: a conversion without the MTP layer (M3)
+        if ((file.ints["qwen35.block_count"] != NLA && file.ints["qwen35.block_count"] != NL) || file.ints["qwen35.embedding_length"] != D)
             throw std::runtime_error("unexpected model dimensions (this kernel is specialised for the 27B)");
+        {
+            // MTP source: the mtp argument (CLI --mtp FILE / --no-mtp), else MK_NO_MTP=1 / MK_MTP=FILE, else the model file's
+            std::string mtp = mtp_;
+            if (mtp.empty()) {
+                if (getenv("MK_NO_MTP") && atoi(getenv("MK_NO_MTP")) != 0) mtp = "none";
+                else if (getenv("MK_MTP") && getenv("MK_MTP")[0]) mtp = getenv("MK_MTP");
+            }
+            const bool file_mtp = file.tensors.count("blk." + std::to_string(NL) + ".nextn.eh_proj.weight") != 0;
+            if (mtp == "none") {
+                has_mtp = false;
+                fprintf(stderr, "[mk] MTP layer off (--no-mtp / MK_NO_MTP=1): plain decoding, depth 0\n");
+            } else if (!mtp.empty()) {
+                mtpf.reset(new gguf::File(mtp));
+                check_mtp_file(*mtpf, mtp);
+                mtp_desc = file_ident(mtp, *mtpf);
+                fprintf(stderr, "[mk] MTP layer from %s%s\n", mtp.c_str(), file_mtp ? " (instead of the model file's own)" : "");
+            } else if (!file_mtp) {
+                has_mtp = false;
+                fprintf(stderr, "[mk] the model file has no MTP layer (blk.%d): plain decoding, depth 0 (--mtp FILE loads one from another GGUF)\n", NL);
+            }
+            if (!has_mtp) {
+                mtp_desc = "none";
+                kv_slots = N_ATT_SLOTS - 1;
+                if (ndraft > 0) fprintf(stderr, "[mk] n_draft %d -> 0 (no MTP layer)\n", ndraft);
+                ndraft = nd_avail = n_draft_max = n_draft_cap = 0;
+            }
+        }
         // read-ahead of the tensor data from here on (loader.cuh Prefetch; MK_LOAD_IO threads, 0: off), 3 GiB ahead at most
-        if (const int nio = getenv("MK_LOAD_IO") ? atoi(getenv("MK_LOAD_IO")) : 8; nio > 0) pfx.reset(new Prefetch(file, nio, (size_t) 3 << 30));
+        // (the model file without an MTP block it does not supply; a --mtp file: its MTP block only, a few threads)
+        if (const int nio = getenv("MK_LOAD_IO") ? atoi(getenv("MK_LOAD_IO")) : 8; nio > 0) {
+            if (has_mtp && !mtpf) pfx.reset(new Prefetch(file, nio, (size_t) 3 << 30));
+            else pfx.reset(new Prefetch(file, nio, (size_t) 3 << 30, [](const std::string & n) { return !is_mtp_name(n); }));
+            if (mtpf) pfx_mtp.reset(new Prefetch(*mtpf, std::max(1, nio / 4), (size_t) 3 << 30, is_mtp_name));
+        }
         cudaDeviceProp prop;
         {
             auto _ = lc.scope("CUDA context");
@@ -6730,11 +6913,11 @@ struct MKEngine::Impl {
             CK(cudaFree(0));
         }
         { // the persistent kernel runs one block per SM (mk_min_grid: launches of up to MAXT rows when n_draft > 4)
-            const int rows = ndraft_ + 1 > MAXT_PF ? MAXT : MAXT_PF, need = mk_min_grid(rows);
+            const int rows = ndraft + 1 > MAXT_PF ? MAXT : MAXT_PF, need = mk_min_grid(rows);
             if (prop.multiProcessorCount < need)
                 throw std::runtime_error(std::string(prop.name) + " has " + std::to_string(prop.multiProcessorCount) +
                                          " SMs; the megakernel runs one block per SM and needs at least " + std::to_string(need) +
-                                         " (launches of " + std::to_string(rows) + " rows at n_draft " + std::to_string(ndraft_) +
+                                         " (launches of " + std::to_string(rows) + " rows at n_draft " + std::to_string(ndraft) +
                                          "; n_draft <= 4: " + std::to_string(mk_min_grid(MAXT_PF)) + ")");
         }
         upl.start(!(getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0));
@@ -6777,6 +6960,7 @@ struct MKEngine::Impl {
             switch (t) {
                 case gguf::F32: return "F32";
                 case gguf::F16: return "F16";
+                case gguf::Q4_0: return "Q4_0";
                 case gguf::Q8_0: return "Q8_0";
                 case gguf::Q3_K: return "Q3_K";
                 case gguf::Q4_K: return "Q4_K";
@@ -6811,7 +6995,7 @@ struct MKEngine::Impl {
         }
         rq_start();
         wrec_on = true; // (MK_WDIGEST: the weight allocations from here to token_embd, without the draft ids)
-        for (int i = 0; i < NLA; i++) {
+        for (int i = 0; i < (has_mtp ? NLA : NL); i++) { // (no MTP block: hw.L[NL] stays empty)
             LayerW & L = hw.L[i];
             const bool mtp = i == NL;
             req_q4 = mtp && mtp_q4 != 0;
@@ -6925,35 +7109,39 @@ struct MKEngine::Impl {
                                         : "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a")
                           : "Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
 #endif
-        req_q4 = mtp_q4 != 0;
-        hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
-        req_q4 = false;
-        needq(blk(NL, "nextn.eh_proj.weight"), hw.eh.type);
-        if (mtp_q4 == 2) { // A/B: the file's MTP matrices as well (the norms are shared)
-            mtp_set[1] = {hw.L[NL], hw.eh};
-            MtpW & a = mtp_set[0];
-            a.L = hw.L[NL];
-            a.L.q = up_mat(blk(NL, "attn_q.weight"), D, QG);
-            a.L.k = up_mat(blk(NL, "attn_k.weight"), D, KVD);
-            a.L.v = up_mat(blk(NL, "attn_v.weight"), D, KVD);
-            a.L.o = up_mat(blk(NL, "attn_output.weight"), VD, D);
-            a.L.fg = up_mat(blk(NL, "ffn_gate.weight"), D, FF);
-            a.L.fu = up_mat(blk(NL, "ffn_up.weight"), D, FF);
-            a.L.fd = up_mat(blk(NL, "ffn_down.weight"), FF, D);
-            a.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
-            mem_mark("MTP block, file types (MK_MTP_Q4=ab)");
+        if (has_mtp) {
+            req_q4 = mtp_q4 != 0;
+            hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
+            req_q4 = false;
+            needq(blk(NL, "nextn.eh_proj.weight"), hw.eh.type);
+            if (mtp_q4 == 2) { // A/B: the file's MTP matrices as well (the norms are shared)
+                mtp_set[1] = {hw.L[NL], hw.eh};
+                MtpW & a = mtp_set[0];
+                a.L = hw.L[NL];
+                a.L.q = up_mat(blk(NL, "attn_q.weight"), D, QG);
+                a.L.k = up_mat(blk(NL, "attn_k.weight"), D, KVD);
+                a.L.v = up_mat(blk(NL, "attn_v.weight"), D, KVD);
+                a.L.o = up_mat(blk(NL, "attn_output.weight"), VD, D);
+                a.L.fg = up_mat(blk(NL, "ffn_gate.weight"), D, FF);
+                a.L.fu = up_mat(blk(NL, "ffn_up.weight"), D, FF);
+                a.L.fd = up_mat(blk(NL, "ffn_down.weight"), FF, D);
+                a.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
+                mem_mark("MTP block, file types (MK_MTP_Q4=ab)");
+            }
+            hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
+            hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
+            hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
         }
-        hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
-        hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
-        hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
         hw.onorm = up_f32("output_norm.weight", D);
         hw.head = up_mat("output.weight", D, VOCAB);
-        if (hw.head.type != T_Q6K) throw std::runtime_error("output.weight must be Q6_K");
+        // Q8_0: lm_head_t<.., T_Q8_0> (some fine-tunes; ~0.3 GB more than Q6_K)
+        if (hw.head.type != T_Q6K && hw.head.type != T_Q8_0)
+            throw std::runtime_error("output.weight is " + tname(hw.head.type) + ", the kernel needs Q6_K or Q8_0 (see README: the GGUF)");
         mem_mark("weights: eh, norms, lm_head");
         hw.head_d = hw.head;
         hw.draft_ids = nullptr;
         wrec_on = false;
-        if (!draft_vocab.empty()) {
+        if (!draft_vocab.empty() && has_mtp) { // (no MTP block: no draft head)
             FILE * f = fopen(draft_vocab.c_str(), "rb");
             if (!f) throw std::runtime_error("cannot open draft vocab " + draft_vocab);
             std::vector<int> ids;
@@ -6979,14 +7167,14 @@ struct MKEngine::Impl {
             dv_in.assign(VOCAB, 0);
             for (int t : ids) dv_in[t] = 1;
             fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
-            if (draft_q4) { // MK_DRAFT_Q4: the rows' Q4_K copy (row r = lm_head row ids[r], from the file's Q6_K)
+            if (draft_q4) { // MK_DRAFT_Q4: the rows' Q4_K copy (row r = lm_head row ids[r], from the file's Q6_K or Q8_0)
                 auto _ = lc.scope("draft head Q4_K copy (MK_DRAFT_Q4)");
                 const auto t0 = lclk::now();
                 const auto & t = tget("output.weight");
-                const size_t rs_from = ggml_row_size(GGML_TYPE_Q6_K, D), rs_to = ggml_row_size(GGML_TYPE_Q4_K, D);
-                if (t.type != gguf::Q6_K || rs_to != (size_t) DQ4_RB) throw std::runtime_error("MK_DRAFT_Q4: unexpected lm_head");
+                const size_t rs_from = ggml_row_size((ggml_type) t.type, D), rs_to = ggml_row_size(GGML_TYPE_Q4_K, D);
+                if ((t.type != gguf::Q6_K && t.type != gguf::Q8_0) || rs_to != (size_t) DQ4_RB) throw std::runtime_error("MK_DRAFT_Q4: unexpected lm_head");
                 std::vector<uint8_t> q(rs_to * ids.size());
-                const auto * tr = ggml_get_type_traits(GGML_TYPE_Q6_K);
+                const auto * tr = ggml_get_type_traits((ggml_type) t.type);
                 parallel_rows((int64_t) ids.size(), [&](int64_t r) {
                     thread_local std::vector<float> f;
                     f.resize((size_t) D);
@@ -7006,7 +7194,11 @@ struct MKEngine::Impl {
         wrec_on = true;
         {
             const auto & t = tget("token_embd.weight");
-            if (t.type != gguf::Q4_K) throw std::runtime_error("token_embd must be Q4_K");
+            // the embedding lookups dequantise each type (embed_prologue, the MTP M0 phases, pk_embed*, pk_mtp_in)
+            if (t.type != gguf::Q4_K && t.type != gguf::Q6_K && t.type != gguf::Q8_0)
+                throw std::runtime_error("token_embd.weight is " + tname((int) t.type) + ", the engine reads Q4_K, Q6_K or Q8_0 (see README: the GGUF)");
+            if (!shape2(t.ne, D, VOCAB)) throw std::runtime_error("token_embd.weight bad shape");
+            hw.embd_t = (int) t.type; // (gguf::Q4_K / Q6_K / Q8_0 == T_Q4K / T_Q6K / T_Q8_0)
             // mapped pinned host memory: a cycle reads only a few 2.8 KB rows over PCIe, saves 0.7 GB of VRAM
             auto _ = lc.scope("token_embd (pinned table)");
             if (!embd_dev) {
@@ -7081,7 +7273,7 @@ struct MKEngine::Impl {
 #endif
         hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
         {
-            const size_t rows = (size_t) N_ATT_SLOTS * NKV * hb.ctx;
+            const size_t rows = (size_t) kv_slots * NKV * hb.ctx; // (no MTP block: no slot N_ATT_SLOTS - 1)
             size_t free_b = 0, total_b = 0;
             CK(cudaMemGetInfo(&free_b, &total_b));
             // fp16 needs 2 x rows x HD x 2 bytes; leave ~1.5 GB for the prefill buffers, checkpoint and runtime.
@@ -7136,10 +7328,14 @@ struct MKEngine::Impl {
                                 }
                 }
             }
+            for (int s = kv_slots; s < N_ATT_SLOTS; s++) { // (not allocated)
+                hb.kvb[0][s] = hb.kvb[1][s] = 8;
+                hb.kvr[s] = hb.kvrv[s] = 0;
+            }
             size_t vbytes[2] = {0, 0};
             int n4 = 0;
             for (int w = 0; w < 2; w++)
-                for (int s = 0; s < N_ATT_SLOTS; s++) {
+                for (int s = 0; s < kv_slots; s++) {
                     vbytes[w] += srows * HD * hb.kvb[w][s] / 8;
                     n4 += hb.kvb[w][s] != 8 || (w == 0 ? hb.kvr[s] : hb.kvrv[s]);
                 }
@@ -7150,6 +7346,11 @@ struct MKEngine::Impl {
             size_t off[2] = {0, 0};
             for (int s = 0; s < N_ATT_SLOTS; s++)
                 for (int w = 0; w < 2; w++) { // slots packed in order: all-q8 gives the same addresses as [slot][head][ctx][HD]
+                    if (s >= kv_slots) {
+                        hb.kvp[w][s] = nullptr;
+                        hb.kvs[w][s] = nullptr;
+                        continue;
+                    }
                     hb.kvp[w][s] = static_cast<int8_t *>(w ? hb.vc : hb.kc) + off[w];
                     hb.kvs[w][s] = q8 ? (w ? hb.vsc : hb.ksc) + s * srows * (HD / 32) : nullptr;
                     off[w] += srows * HD * hb.kvb[w][s] / 8;
@@ -7178,7 +7379,7 @@ struct MKEngine::Impl {
                 const bool win_all = getenv("MK_KV_WIN_ALL") && atoi(getenv("MK_KV_WIN_ALL")) != 0;
                 int nr = 0;
                 for (int w = 0; w < 2; w++)
-                    for (int s = 0; s < N_ATT_SLOTS; s++)
+                    for (int s = 0; s < kv_slots; s++)
                         if (hb.kvb[w][s] != 8 || win_all) {
                             hb.kvrp[w][s] = dalloc<int8_t>((size_t) NKV * hb.kvrc * HD);
                             hb.kvrs[w][s] = dalloc<__half>((size_t) NKV * hb.kvrc * (HD / 32));
@@ -8323,8 +8524,18 @@ struct MKEngine::Impl {
             for (int j = 0; j < sn; j++) ck[ss[j]].ring_ok = false;
             if (rsnap) ring_snap_begin(sn, ss);
             gap_mark(ci, 0); // (after the token upload: MK_PF_SYNC's idle is before it)
-            if (img) pf_time("embed", [&] { pk_embed_img<<<T, 256>>>(T); });
-            else pf_time("embed", [&] { pk_embed<<<T, 256>>>(T); });
+            pf_time("embed", [&] { // (token_embd's type)
+                if (hw.embd_t == T_Q6K) {
+                    if (img) pk_embed_img<T_Q6K><<<T, 256>>>(T);
+                    else pk_embed<T_Q6K><<<T, 256>>>(T);
+                } else if (hw.embd_t == T_Q8_0) {
+                    if (img) pk_embed_img<T_Q8_0><<<T, 256>>>(T);
+                    else pk_embed<T_Q8_0><<<T, 256>>>(T);
+                } else {
+                    if (img) pk_embed_img<T_Q4K><<<T, 256>>>(T);
+                    else pk_embed<T_Q4K><<<T, 256>>>(T);
+                }
+            });
             int dl = 0;
             for (int L = 0; L < NL; L++) {
                 const LayerW & W = hw.L[L];
@@ -8463,11 +8674,20 @@ struct MKEngine::Impl {
                     const int lo = std::max(n, sp[j] - H_RING);
                     pk_ck_hist<<<sp[j] - lo, 256>>>(lo, n, 0, ck[ss[j]].hdev);
                 }
+                if (!has_mtp) return; // (no MTP block: no MTP K / V rows)
 #if MK_PF_INFCHK
                 chk_set(NL, -1);
 #endif
-                if (img) pk_mtp_in<true><<<T, 256>>>();
-                else pk_mtp_in<false><<<T, 256>>>();
+                if (hw.embd_t == T_Q6K) {
+                    if (img) pk_mtp_in<true, T_Q6K><<<T, 256>>>();
+                    else pk_mtp_in<false, T_Q6K><<<T, 256>>>();
+                } else if (hw.embd_t == T_Q8_0) {
+                    if (img) pk_mtp_in<true, T_Q8_0><<<T, 256>>>();
+                    else pk_mtp_in<false, T_Q8_0><<<T, 256>>>();
+                } else {
+                    if (img) pk_mtp_in<true, T_Q4K><<<T, 256>>>();
+                    else pk_mtp_in<false, T_Q4K><<<T, 256>>>();
+                }
                 gemm(hw.eh, T, hp.xm, D, pf::OUT_STORE);
                 const LayerW & M = hw.L[NL];
                 pf_norm_quant(hp.xm, M.attn_norm, T);
@@ -8609,7 +8829,7 @@ struct MKEngine::Impl {
             if (!all && (slot < 0 || slot >= N_ATT_SLOTS)) throw std::runtime_error("MK_KV_EMU_SPEC: bad slot in " + tok);
             for (int w = 0; w < 2; w++)
                 if (tok[0] == '*' || tok[0] == "KV"[w])
-                    for (int q = 0; q < N_ATT_SLOTS; q++)
+                    for (int q = 0; q < kv_slots; q++) // (no MTP block: its slot stays 0, not allocated)
                         if (all || q == slot) hb.kvemu[w][q] = mode == 8 ? 0 : mode;
         }
         fprintf(stderr, "[mk] MK_KV_EMU_SPEC %s: K", s.c_str());
@@ -8731,6 +8951,7 @@ struct MKEngine::Impl {
         k << " model " << rp << " " << (long long) st.st_size << " " << (long long) st.st_mtim.tv_sec << "." << (long long) st.st_mtim.tv_nsec
 #endif
           << " " << hex64(mh);
+        k << " mtp " << mtp_desc; // (the MTP block's weights decide its KV slot; none: no slot)
         k << " ctx " << ctx << " kvq8 " << hb.kvq8 << " kvb";
         for (int w = 0; w < 2; w++)
             for (int s = 0; s < N_ATT_SLOTS; s++) k << " " << hb.kvb[w][s] << (w ? hb.kvrv[s] : hb.kvr[s]);
@@ -8758,7 +8979,7 @@ struct MKEngine::Impl {
     std::vector<std::pair<char *, size_t>> st_regions(int hend) {
         std::vector<std::pair<char *, size_t>> r;
         const size_t cx = (size_t) hb.ctx, n = (size_t) hend; // (row stride per kv head)
-        for (int s = 0; s < N_ATT_SLOTS; s++)
+        for (int s = 0; s < kv_slots; s++)
             for (int w = 0; w < 2; w++)
                 for (int g = 0; g < NKV; g++) {
                     if (hb.kvq8) {
@@ -8770,7 +8991,7 @@ struct MKEngine::Impl {
                         r.push_back({reinterpret_cast<char *>(b), n * HD * sizeof(__half)});
                     }
                 }
-        for (int s = 0; s < N_ATT_SLOTS; s++)
+        for (int s = 0; s < kv_slots; s++)
             for (int w = 0; w < 2; w++)
                 if (hb.kvrp[w][s]) {
                     r.push_back({reinterpret_cast<char *>(hb.kvrp[w][s]), (size_t) NKV * hb.kvrc * HD});
@@ -8902,10 +9123,12 @@ struct MKEngine::Impl {
     }
 };
 
-MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::string & draft_vocab, int kv_mode)
+MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::string & draft_vocab, int kv_mode,
+                   const std::string & mtp)
     : p_(nullptr), n_draft_(n_draft) {
     if (n_draft < 0 || n_draft > MAXT - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXT - 1) + "]");
-    p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode);
+    p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode, mtp);
+    n_draft = n_draft_ = p_->n_draft_cap; // (0 without an MTP block)
 #if MK_MAXT > 5
     if (n_draft > 4) { // the wide pass (T >= 6) runs the pipelined q8-cache decode attention only (attn_core<T > 5>: attn_core_q8,
                        // or attn_core_q8m for the low-bit MK_KV sides)
@@ -9006,6 +9229,12 @@ void MKEngine::cancel(bool on) { p_->pf_cancel.store(on ? 1 : 0); }
 int MKEngine::position() const { return p_->hctl.n; }
 
 void MKEngine::set_n_draft(int n) {
+    if (!p_->has_mtp && n > 0) { // (no MTP block: depth 0, a notice once)
+        static bool told = false;
+        if (!told) fprintf(stderr, "[mk] n_draft %d -> 0 (no MTP layer)\n", n);
+        told = true;
+        n = 0;
+    }
     if (n < 0 || n > p_->n_draft_cap)
         throw std::runtime_error("set_n_draft: 0 .. " + std::to_string(p_->n_draft_cap) + " (the engine's construction depth)");
     p_->n_draft_max = p_->ndraft = p_->nd_avail = n;
@@ -9432,6 +9661,26 @@ std::vector<float> MKEngine::last_hidden() {
 
 bool MKEngine::exact() const { return p_->exact; }
 
+bool MKEngine::has_mtp() const { return p_->has_mtp; }
+
+std::string MKEngine::Impl::file_ident(const std::string & p, const gguf::File & f) {
+    char rp[PATH_MAX];
+    if (!realpath(p.c_str(), rp)) snprintf(rp, sizeof rp, "%s", p.c_str());
+    struct stat st{};
+    stat(rp, &st);
+    const size_t edge = std::min<size_t>(f.size, (size_t) 4 << 20);
+    unsigned long long mh = wd_hash(f.base, edge);
+    mh = wd_hash(f.base + f.size - edge, edge, mh);
+    std::ostringstream k;
+#ifdef _WIN32
+    k << rp << " " << (long long) st.st_size << " " << (long long) st.st_mtime << ".0";
+#else
+    k << rp << " " << (long long) st.st_size << " " << (long long) st.st_mtim.tv_sec << "." << (long long) st.st_mtim.tv_nsec;
+#endif
+    k << " " << hex64(mh);
+    return k.str();
+}
+
 // state_digest (test helper for the exact-reuse probes; slow, host-side hashing): 64-bit words
 //   [0] 0x4d4b444701, [1] n = committed position (dn_c), [2] mtp_valid, [3] kvrc (0: no MK_KV_WIN ring),
 //   [4] ring_lo = max(0, n - kvrc), [5] N_ATT_SLOTS, [6] NKV, [7] H_RING; then
@@ -9459,14 +9708,14 @@ std::vector<unsigned long long> MKEngine::state_digest() {
     CK(cudaMemcpy(&c, I.hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
     typedef unsigned long long u64;
     const int n = c.dn_c, rc = I.hb.kvwin > 0 ? I.hb.kvrc : 0, rlo = rc ? std::max(0, n - rc) : n;
-    std::vector<u64> out = {0x4d4b444701ULL, (u64) n, (u64) c.mtp_valid, (u64) rc, (u64) rlo, (u64) N_ATT_SLOTS, (u64) NKV, (u64) H_RING};
+    std::vector<u64> out = {0x4d4b444701ULL, (u64) n, (u64) c.mtp_valid, (u64) rc, (u64) rlo, (u64) I.kv_slots, (u64) NKV, (u64) H_RING};
     const size_t ctx = (size_t) I.hb.ctx, sbq = (HD / 32) * sizeof(__half); // (row stride per kv head)
     std::vector<unsigned char> vb, sb;
     auto d2h = [&](std::vector<unsigned char> & dst, const void * src, size_t nb) {
         dst.resize(std::max<size_t>(1, nb));
         if (nb) CK(cudaMemcpy(dst.data(), src, nb, cudaMemcpyDeviceToHost));
     };
-    for (int s = 0; s < N_ATT_SLOTS; s++)
+    for (int s = 0; s < I.kv_slots; s++)
         for (int w = 0; w < 2; w++)
             for (int g = 0; g < NKV; g++) {
                 size_t rb, srb = 0;
@@ -9481,7 +9730,7 @@ std::vector<unsigned long long> MKEngine::state_digest() {
                 }
                 for (int p = 0; p < n; p++) out.push_back(dg_hash(sb.data() + p * srb, srb, dg_hash(vb.data() + p * rb, rb)));
             }
-    for (int s = 0; s < N_ATT_SLOTS; s++)
+    for (int s = 0; s < I.kv_slots; s++)
         for (int w = 0; w < 2; w++)
             for (int g = 0; g < NKV; g++) {
                 if (!rc || !I.hb.kvrp[w][s]) {

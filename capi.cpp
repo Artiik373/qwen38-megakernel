@@ -213,7 +213,8 @@ extern "C" {
 
 const char * mk_last_error() { return g_err.c_str(); }
 
-void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode) {
+// mtp: the MTP layer's source (MKEngine's mtp): NULL / "" the model file (or MK_NO_MTP / MK_MTP), a GGUF path, "none"
+void * mk_new_mtp(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode, const char * mtp) {
     try {
         llama_backend_init();
         llama_model_params mp = llama_model_default_params();
@@ -222,7 +223,7 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
         h->lm = llama_model_load_from_file(model, mp);
         if (!h->lm) throw std::runtime_error("failed to load the vocabulary");
         h->vocab = llama_model_get_vocab(h->lm);
-        h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode);
+        h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode, mtp ? mtp : "");
         // keep-warm (MK_KEEP_WARM_S seconds, default 120; 0 = off): armed by mk_keep_warm only
         const char * ks = getenv("MK_KEEP_WARM_S");
         const double sec = ks && *ks ? atof(ks) : 120.0;
@@ -243,6 +244,13 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
         return nullptr;
     }
 }
+
+void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode) {
+    return mk_new_mtp(model, ctx, n_draft, draft_vocab, kv_mode, nullptr);
+}
+
+// 1: the engine has an MTP layer (drafting), 0: plain decoding (depth 0)
+int mk_has_mtp(void * hp) { return static_cast<Handle *>(hp)->eng->has_mtp() ? 1 : 0; }
 
 void mk_free(void * hp) {
     auto * h = static_cast<Handle *>(hp);

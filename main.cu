@@ -32,6 +32,8 @@ static void usage() {
             "                 [--temp t] [--top-p p] [--top-k k] [--min-p p] [--seed s]   (default: greedy)\n"
             "                 [--presence-penalty p] [--frequency-penalty f]   (on the generated tokens; default 0)\n"
             "                 [--kv f16|q8|auto]   (KV cache format; auto: q8_0 only when fp16 does not fit)\n"
+            "                 [--mtp file.gguf | --no-mtp]   (the MTP draft layer from another GGUF of this model / none:\n"
+            "                     plain decoding, depth 0; default: the model file's, if it has one; env MK_MTP, MK_NO_MTP=1)\n"
             "                 [--kld ref [--ref-out f] [--score-path prefill|decode|mixed]]   (KL divergence, perplexity and\n"
             "                     top-token agreement against a reference file of tools/llama_ref or of --ref-out)\n"
             "                 [--kld-images f]   (with --kld: the reference's image rows, tools/vision_ref --images-out)\n"
@@ -157,7 +159,7 @@ int main(int argc, char ** argv) {
 }
 
 static int run(int argc, char ** argv) {
-    std::string model, draft_vocab, batch_file;
+    std::string model, draft_vocab, batch_file, mtp; // mtp: --mtp FILE / --no-mtp ("none"); "": the model file's
     int ctx = 8192;
     bool bench_phases = false;
     std::string score_file; // file with whitespace-separated continuation token ids to teacher-force
@@ -180,6 +182,8 @@ static int run(int argc, char ** argv) {
         if (a == "-m") model = next();
         else if (a == "-c") ctx = atoi(next().c_str());
         else if (a == "--draft-vocab") draft_vocab = next();
+        else if (a == "--mtp") mtp = next();
+        else if (a == "--no-mtp") mtp = "none";
         else if (a == "--bench-phases") bench_phases = true;
         else if (a == "--score") score_file = next();
         else if (a == "--kld") kld_file = next();
@@ -357,7 +361,7 @@ static int run(int argc, char ** argv) {
         nd_engine = 0;
         for (const Job & j : jobs) nd_engine = std::max(nd_engine, j.n_draft);
     }
-    MKEngine eng(model, ctx, nd_engine, draft_vocab, kv_mode);
+    MKEngine eng(model, ctx, nd_engine, draft_vocab, kv_mode, mtp);
     eng.set_sampling(job0.temp, job0.top_p, job0.top_k, job0.min_p, job0.seed);
     eng.set_penalty(job0.pres, job0.freq);
     if (bench_phases) {
