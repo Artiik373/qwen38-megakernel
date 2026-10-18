@@ -302,6 +302,10 @@ struct ModelW {
     const int * draft_ids; // row -> token id for head_d (nullptr: identity)
     const float *enorm, *hnorm, *shnorm, *onorm;
     const uint8_t * embd;
+    // MK_DRAFT_Q4: a Q4_K copy of head_d's first dq4_n rows (row r = lm_head row draft_ids[r], DQ4_RB bytes) that the
+    // draft head reads instead; 0 rows: off. Rows past it (tokens dv_add appended) come from lm_head as before.
+    const uint8_t * dq4;
+    int dq4_n;
 };
 
 // Quantised activation vector(s) in the "unit" layout consumed by the GEMV:
@@ -4050,6 +4054,7 @@ static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + MK_MAX_GRID * 8 <= SM_M
 constexpr int LM_WLSE = MAXT > 5 ? 16 + 2 * NW * MAXT : 208, LM_LSE = LM_WLSE + 32, LM_BEST = LM_LSE + 1;
 constexpr int LM_LAST = MAXT > 5 ? LM_BEST + 1 : 200;
 static_assert(LM_LAST < 400 && (MAXT == 5 || LM_WLSE >= 16 + 2 * NW * MAXT), "lm_head misc slots (s_tok at 400)");
+constexpr int DQ4_RB = D / 256 * 144; // MK_DRAFT_Q4: bytes of one Q4_K lm_head row (ModelW::dq4)
 __device__ __forceinline__ float pen_logit(float a, float sc, int c, float pres, float freq) {
     return __fsub_rn(__fsub_rn(__fmul_rn(a, sc), __fmul_rn(freq, (float) c)), c > 0 ? pres : 0.f);
 }
@@ -4074,6 +4079,9 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     }
     float lm_m = -INFINITY, lm_s = 0.f; // LSE: running max / sum of exp (warp-uniform)
     const Mat head = draft ? cW.head_d : cW.head;
+    // MK_DRAFT_Q4 (draft head only: its calls are the LSE ones): rows [0, nq4) from the Q4_K copy cW.dq4
+    int nq4 = 0;
+    if constexpr (LSE) nq4 = draft ? cW.dq4_n : 0;
     int xt[MAXT - 1]; // PEN: the drafts tok[1..MAXT - 1] (only the first nx0 + t count for row t)
     if constexpr (PEN) {
 #pragma unroll
@@ -4088,11 +4096,17 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             const __half * dp[2]; // Q6_K: the rows' scale (meta) streams
             p0 = ids ? __ldg(ids + r) : r;
             p1 = ids ? __ldg(ids + r + 1) : r + 1;
-            rp[0] = head.w + (size_t) p0 * head.rb;
-            rp[1] = head.w + (size_t) p1 * head.rb;
-            dp[0] = head.d + (size_t) p0 * head.nd;
-            dp[1] = head.d + (size_t) p1 * head.nd;
-            rows_t<TL, 5, 2, T_Q6K>(rp, dp, sx, a);
+            if (LSE && r < nq4) { // (rows come in pairs and nq4 is even)
+                rp[0] = cW.dq4 + (size_t) r * DQ4_RB;
+                rp[1] = rp[0] + DQ4_RB;
+                rows_t<TL, 5, 2, T_Q4K>(rp, dp, sx, a);
+            } else {
+                rp[0] = head.w + (size_t) p0 * head.rb;
+                rp[1] = head.w + (size_t) p1 * head.rb;
+                dp[0] = head.d + (size_t) p0 * head.nd;
+                dp[1] = head.d + (size_t) p1 * head.nd;
+                rows_t<TL, 5, 2, T_Q6K>(rp, dp, sx, a);
+            }
         }
         wsum_acc<TL, 2>(a);
         if constexpr (PEN) { // a[k][t] <- the penalised true logit
@@ -6176,6 +6190,18 @@ struct MKEngine::Impl {
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
     }
 
+    // MK_DRAFT_Q4=1: the draft head's base rows (the draft vocabulary, --draft-vocab) re-quantised from lm_head's Q6_K to a
+    // Q4_K copy at load (ggml_quantize_chunk, no imatrix; +94 MB of VRAM): each draft streams 0.69x the head's bytes.
+    // Lossy, but only the drafts can change (they are verified by the exact main head), so the output (greedy ids, the
+    // sampled distribution) is unchanged and only acceptance moves. 0 / unset: off. Policy key dq4=0|1 switches it.
+    bool draft_q4 = false;
+    int dq4_rows = 0; // rows of the copy (0: none)
+    void set_draft_q4(int on) {
+        if (!dq4_rows) throw std::runtime_error("policy dq4 needs MK_DRAFT_Q4=1 and a draft vocabulary");
+        hw.dq4_n = on ? dq4_rows : 0;
+        CK(cudaMemcpyToSymbol(cW, &hw.dq4_n, sizeof(int), offsetof(ModelW, dq4_n)));
+    }
+
     // MK_REENC3=1: Q3_K and IQ3_S re-encoded to Q6_K at load (the path before native Q3_K / IQ3_S; A/B tests)
     const bool reenc3 = getenv("MK_REENC3") && atoi(getenv("MK_REENC3")) != 0;
     int n_nat = 0; // Q3_K / IQ3_S tensors repacked to their native layouts
@@ -6752,6 +6778,10 @@ struct MKEngine::Impl {
             else if (!strcmp(e, "0") || !strcmp(e, "1")) mtp_q4 = e[0] - '0';
             else throw std::runtime_error("MK_MTP_Q4: 0, 1 or ab");
         }
+        if (const char * e = getenv("MK_DRAFT_Q4")) {
+            if (strcmp(e, "0") && strcmp(e, "1")) throw std::runtime_error("MK_DRAFT_Q4: 0 or 1");
+            draft_q4 = e[0] == '1';
+        }
         rq_start();
         wrec_on = true; // (MK_WDIGEST: the weight allocations from here to token_embd, without the draft ids)
         for (int i = 0; i < NLA; i++) {
@@ -6922,6 +6952,28 @@ struct MKEngine::Impl {
             dv_in.assign(VOCAB, 0);
             for (int t : ids) dv_in[t] = 1;
             fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
+            if (draft_q4) { // MK_DRAFT_Q4: the rows' Q4_K copy (row r = lm_head row ids[r], from the file's Q6_K)
+                auto _ = lc.scope("draft head Q4_K copy (MK_DRAFT_Q4)");
+                const auto t0 = lclk::now();
+                const auto & t = tget("output.weight");
+                const size_t rs_from = ggml_row_size(GGML_TYPE_Q6_K, D), rs_to = ggml_row_size(GGML_TYPE_Q4_K, D);
+                if (t.type != gguf::Q6_K || rs_to != (size_t) DQ4_RB) throw std::runtime_error("MK_DRAFT_Q4: unexpected lm_head");
+                std::vector<uint8_t> q(rs_to * ids.size());
+                const auto * tr = ggml_get_type_traits(GGML_TYPE_Q6_K);
+                parallel_rows((int64_t) ids.size(), [&](int64_t r) {
+                    thread_local std::vector<float> f;
+                    f.resize((size_t) D);
+                    tr->to_float(t.data + (size_t) ids[r] * rs_from, f.data(), D);
+                    ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), q.data() + (size_t) r * rs_to, 0, 1, D, nullptr); // lossy by design
+                });
+                hw.dq4 = dput<uint8_t>(q.data(), q.size());
+                own_keep.push_back(std::move(q)); // (until its upload is done)
+                hw.dq4_n = dq4_rows = (int) ids.size();
+                fprintf(stderr, "[mk] draft head: %d rows re-quantised to Q4_K in %.2f s (%.1f MiB; drafts only, MK_DRAFT_Q4=0: off)\n",
+                        dq4_rows, lsec(t0), (double) rs_to * dq4_rows / 1048576.0);
+            }
+        } else if (draft_q4) {
+            fprintf(stderr, "[mk] MK_DRAFT_Q4 ignored: it needs a draft vocabulary (--draft-vocab)\n");
         }
         mem_mark("draft head copy");
         wrec_on = true;
@@ -8838,6 +8890,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 // "key=value,...": depth=0|1|2 (see Impl::Policy), dmin=N; on-device early stop (Launch::gate_*): drop=F,
 // stop=F (every draft), dropK=F / stopK=F (draft K = 1..4 only), chain=0|1; h1=0|1 (sampled drafts when
 // sampling); mtpq=0|1 (MK_MTP_Q4=ab only: the MTP block as stored / re-quantised to Q4_K; kept until changed);
+// dq4=0|1 (MK_DRAFT_Q4=1 only: the draft head reads lm_head / its Q4_K copy; kept until changed);
 // MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
 // chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);
 // blk=0|1 (sampled drafts: block verification, sample_targets_blk); g7=0|1 (the depth > 5 gates, Impl::Policy);
@@ -8878,6 +8931,7 @@ void MKEngine::set_policy(const std::string & spec) {
         else if (k == "blk") pol.blk = std::stoi(v);
 #endif
         else if (k == "mtpq") p_->set_mtp_q4(std::stoi(v)); // MK_MTP_Q4=ab only; takes effect from the next prefill
+        else if (k == "dq4") p_->set_draft_q4(std::stoi(v)); // MK_DRAFT_Q4=1 only; from the next launch
         else throw std::runtime_error("policy: unknown key " + k);
     }
     for (int j = 0; j < MAXT - 1; j++) {

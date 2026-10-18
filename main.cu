@@ -38,6 +38,8 @@ static void usage() {
             "                 [--state-dir dir]   (post-prefill state files: the first prompt's prefill is restored from\n"
             "                     dir when a file of the same prompt, binary, model and settings is there, else saved there)\n"
             "                 [--digest]   (print a hash of the sequence state after the first prefill: test runs)\n"
+            "                 [--policy spec]   (MKEngine::set_policy \"key=value,...\" before the job, e.g. dq4=0 with\n"
+            "                     MK_DRAFT_Q4=1; default: MK_POLICY; a batch job's setting stays for the jobs after it)\n"
             "                 [--batch jobs.txt]   (batch mode: one job per line, its arguments as on this command line\n"
             "                     (the generation options above) plus -o <prefix>: stdout to <prefix>.out, stderr to\n"
             "                     <prefix>.err; the model, -c, --kv and --draft-vocab are this command line's; one model\n"
@@ -51,7 +53,7 @@ struct Job {
     std::string prompt = "Write a Python function that checks whether a number is prime.";
     int n_predict = 256, n_draft = 2;
     bool raw = false, print_ids = false, quiet = false, digest = false;
-    std::string turn2, prompt_ids_file, think, out, state_dir;
+    std::string turn2, prompt_ids_file, think, out, state_dir, policy;
     float temp = 0.f, top_p = 1.f, min_p = 0.f, pres = 0.f, freq = 0.f;
     int top_k = 32;
     unsigned long long seed = 1;
@@ -95,6 +97,7 @@ static bool job_arg(Job & j, const std::vector<std::string> & av, size_t & i) {
     else if (a == "--presence-penalty") j.pres = atof(next().c_str());
     else if (a == "--frequency-penalty") j.freq = atof(next().c_str());
     else if (a == "--state-dir") j.state_dir = next();
+    else if (a == "--policy") j.policy = next();
     else if (a == "-o") j.out = next();
     else return false;
     return true;
@@ -411,6 +414,7 @@ static int run(int argc, char ** argv) {
 
     // one job: prompt (+ an optional second turn), output to stdout, stats to stderr
     auto run_job = [&](const Job & J) {
+        if (!J.policy.empty()) eng.set_policy(J.policy);
         eng.set_n_draft(J.n_draft);
         eng.set_sampling(J.temp, J.top_p, J.top_k, J.min_p, J.seed);
         eng.set_penalty(J.pres, J.freq);
