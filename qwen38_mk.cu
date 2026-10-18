@@ -4263,6 +4263,13 @@ __device__ __forceinline__ float urand(unsigned long long seed, unsigned long lo
     z ^= z >> 31;
     return (float) (z >> 40) * (1.0f / 16777216.0f);
 }
+// Keys: a row's acceptance / residual uniforms by its position, a draft's by its absolute position. The per-token rule
+// uses each once (a position is decided once), and a draft drawn again at a position (after a rejection before it) is
+// independent of everything that decided its prefix: exact as is. Block verification (policy blk=1) reads every row's
+// eta, past its tau too, and the next launch verifies those positions again with drafts drawn again there: keyed by
+// position alone, those draws repeat, conditioned on the previous block (eta_i >= h_i past tau), a bias
+// (tests/spec_rng_sim.py). blk=1 salts its etas and the drafts by the launch's start position (fresh per launch).
+__device__ __forceinline__ unsigned long long launch_salt(unsigned long long n) { return (n + 1) * 0xD6E8FEB86659FD93ull; }
 
 // sampling distribution over one row's candidates (descending), llama.cpp order: top_k, top_p, min_p,
 // temperature; returns the number kept, p[0..K) normalised
@@ -4322,11 +4329,11 @@ __device__ __forceinline__ float dq_prob(const float2 * q, int id) {
 
 // Sampled draft (single thread): q' = the sampling distribution (top_k, top_p, min_p, temp) of the draft
 // head's top logits src; writes q' to dst as (prob, token id) terminated by (0, -1) (dst may alias src) and
-// draws the draft from it with its own random stream, keyed by the draft's absolute position.
-__device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos) {
+// draws the draft from it with its own random stream, keyed by the draft's absolute position (and salt: blk=1).
+__device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos, unsigned long long salt = 0) {
     float p[TOPK_MAX];
     const int K = cand_probs(src, P, p);
-    float x = urand(P.seed ^ 0xD1B54A32D192ED03ull, pos);
+    float x = urand(P.seed ^ 0xD1B54A32D192ED03ull ^ salt, pos);
     int pick = -1, last = __float_as_int(src[0].y);
     for (int j = 0; j < K; j++) {
         const float2 e = src[j];
@@ -4358,6 +4365,7 @@ __device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl,
                                                 const float2 * dq, float (&p)[TOPK_MAX]) {
     const Ctl * c = cB.ctl;
     const unsigned long long n = (unsigned long long) c->n;
+    const unsigned long long es = P.seed ^ launch_salt(n); // the etas: fresh per launch (launch_salt)
     const int g = T - 1;
     float w = 1.f, wt = 1.f; // w_i; w_tau
     int tau = 0;
@@ -4370,7 +4378,7 @@ __device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl,
             for (int j = 0; j < K; j++) r += fmaxf(0.f, w * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
             const float den = r + 1.f - w;
             const float h = den > 0.f ? r / den : 1.f;
-            if (urand(P.seed, 2 * (n + i - 1)) < h) {
+            if (urand(es, 2 * (n + i - 1)) < h) {
                 tau = i;
                 wt = w;
             }
@@ -4382,7 +4390,7 @@ __device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl,
         const float qd = dq_prob(q, d);
         w = qd > 0.f ? fminf(w * pd / qd, 1.f) : 0.f;
     }
-    if (urand(P.seed, 2 * (n + g - 1)) < w) { // h_g = w_g
+    if (urand(es, 2 * (n + g - 1)) < w) { // h_g = w_g
         tau = g;
         wt = w;
     }
@@ -4755,7 +4763,7 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
 #endif
             // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
             const int dt = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                     (unsigned long long) c->mtp_P + 1 + k)
+                                                     (unsigned long long) c->mtp_P + 1 + k, P.spec_blk ? launch_salt(c->mtp_P) : 0ull)
                                       : s_tok[0];
             c->tok[1 + k] = dt;
             // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -7355,6 +7363,10 @@ struct MKEngine::Impl {
 #endif
         L.gate_chain = pol.gate_chain;
         L.spec_smp = smp_temp > 0.f && pol.h1;
+        // chain=2 with sampled drafts: the chain holds the drafted token's own q' probability, so a drop gate on it would
+        // pick which drafts get verified by their value (biased output: tests/spec_rng_sim.py); stop gates only
+        if (L.gate_chain == 2 && L.spec_smp)
+            for (int k = 0; k < MAXT - 1; k++) L.gate_drop[k] = 0.f;
 #if MK_MAXT > 5
         L.spec_blk = L.spec_smp && pol.blk;
 #endif

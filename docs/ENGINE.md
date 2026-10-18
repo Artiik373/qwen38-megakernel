@@ -102,6 +102,17 @@ Speculative verification is exact: greedy output is the main model's greedy choi
 sampling a draft is accepted with probability p(draft) and a rejected one is resampled from the rest of the
 distribution, so the sampled distribution is the same as without drafts (chi-square and PIT tests).
 
+The random numbers come from a counter-based generator keyed by the seed and the position: a row's acceptance and
+resampling numbers by its position, a sampled draft's by the position it drafts. Each position is decided once, and a
+position drafted again after a rejection before it draws the same number, but that number is independent of
+everything that decided the tokens before it, so the output stays exact (2026-10-17: a CPU replica of the loop,
+`tests/spec_rng_sim.py`, 396k re-drafted positions; and the PIT test on the engine's re-drafted rows). Two opt-in
+`MK_POLICY` settings were not: with `blk=1` (block verification), which reads every row's number and leaves the rows
+after its cut to the next cycle, the acceptance numbers and the drafts are now keyed by the cycle's start position as
+well (position-only keys made the next cycle reuse numbers conditioned on the last one: biased in the replica); and
+`chain=2` with sampled drafts runs without drop gates (dropping a draft on its own probability selects which drafts get
+verified: biased).
+
 **unsloth UD-Q4_K_XL** (`Qwen3.8-27B-UD-Q4_K_XL.gguf`, 17.6 GB: Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS per tensor plus a
 few Q3_K, IQ3_S and IQ4_NL) puts its extra bits where the decode spends its time: its FFN gate / up average 5.1 bits
 per weight against Q4_K's 4.5, so a cycle reads more weight bytes than with the plain Q4_K_M. Its MTP block (Q6_K in
