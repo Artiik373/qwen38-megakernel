@@ -311,6 +311,12 @@ kept between requests].
 - Sampling: temperature [0.8], top_p [0.95], top_k (1..32; absent or <= 0 means 32, the engine's maximum; above 32 is
   clamped with a one-time warning), min_p [0.05], seed, presence_penalty / frequency_penalty (-2..2, vLLM's semantics:
   the tokens generated in this response); repetition_penalty is ignored (with a warning). One request at a time.
+- Stop strings: `stop` (a string or a list; at most 64 strings of at most 1024 characters; empty ones are dropped).
+  As in llama-server they are matched on the whole generated text (reasoning included, and tool-call markup): the
+  reply ends before the first occurrence, with `finish_reason` "stop" ("tool_calls" when complete calls came before
+  it). A stream holds back text that could be the start of a stop string until the next token decides it. Tokens the
+  engine accepted in the same cycle after the stop (MTP drafts) are dropped; the next request continues from the
+  reply that was sent (the prompt reuse finds the divergence, as after `max_tokens`).
 - Errors: a CUDA error or non-finite logits make the engine throw; the server answers HTTP 500 and keeps serving. In a
   stream that has started (status 200 sent), the error is the last event, OpenAI style:
   `data: {"error": {"message": ..., "type": "server_error", "code": 500}}`, then `data: [DONE]`. `/slots` requests get

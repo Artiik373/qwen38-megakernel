@@ -822,5 +822,135 @@ class LingerTests(_HttpCase):
             self.assertLess(time.time() - t, 3.0)
 
 
+# === api: stop strings ===
+class StopStringTests(_HttpCase):
+    """`stop`: the reply ends before the first stop string (matched on the raw generated text, across tokens), the rest
+    of the engine cycle's tokens dropped; a stream never sends a stop string's first characters"""
+
+    def _cut(self, text, stops):
+        at = [(text.find(s), k) for k, s in enumerate(stops) if s and text.find(s) >= 0]
+        if not at:
+            return text, None
+        i, k = min(at)
+        return text[:i], stops[k]
+
+    def test_matcher_equals_the_cut_text_for_any_chunking(self) -> None:
+        import random as rnd
+        r = rnd.Random(5)
+        for _ in range(3000):
+            text = "".join(r.choice("ab c\n") for _ in range(r.randint(0, 30)))
+            stops = ["".join(r.choice("ab c\n") for _ in range(r.randint(1, 4))) for _ in range(r.randint(1, 3))]
+            m, out, i = self.mk.StopMatcher(stops), "", 0
+            while i < len(text):
+                n = r.randint(1, 5)
+                out += m.feed(text[i:i + n])
+                i += n
+                if m.word is not None:
+                    break
+            out += m.feed("", final=True)
+            want, word = self._cut(text, stops)
+            if len(stops) == 1 or word is None:
+                self.assertEqual((out, m.word), (want, word), (text, stops))
+            else:  # (as llama-server: the first stop string to COMPLETE wins, so with overlapping ones, e.g. "bcc" and
+                # "c" on "bcc", the cut depends on the token boundaries; it is always at an occurrence, none before it)
+                self.assertTrue(text.startswith(out) and text.startswith(m.word, len(out)), (text, stops, out))
+                self.assertFalse(any(s in out for s in stops), (text, stops, out))
+
+    def test_stop_values(self) -> None:
+        self.assertEqual(self.mk.stop_strings(None), [])
+        self.assertEqual(self.mk.stop_strings("x"), ["x"])
+        self.assertEqual(self.mk.stop_strings(["a", "", "b"]), ["a", "b"])
+        for bad in (5, ["a", 1], {"a": 1}, ["x"] * 65, ["x" * 1025]):
+            with self.assertRaises(self.mk.BadRequest):
+                self.mk.stop_strings(bad)
+
+    PIECES = ["Hello", " wor", "ld", ". The", " END", " is", " near", "."]
+
+    def _reply(self, stop, stream, pieces=None, template=None, max_tokens=50):
+        eng = _ScriptEngine(pieces or self.PIECES)
+        srv, http_ = self.serve(eng)
+        if template:
+            srv.template = self.mk.make_template(template)
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": max_tokens, "stream": stream}
+        if stop is not None:
+            body["stop"] = stop
+        if not stream:
+            status, data = http_.post(body)
+            self.assertEqual(status, 200, data[:300])
+            o = json.loads(data)
+            m = o["choices"][0]["message"]
+            return (m.get("content") or "", m.get("reasoning_content") or "", o["choices"][0]["finish_reason"],
+                    o["usage"]["completion_tokens"], srv)
+        _, events = _sse(http_.raw(_request({**body, "stream_options": {"include_usage": True}}), until=b"0\r\n\r\n"))
+        self.assertEqual(events[-1], b"[DONE]")
+        objs = [json.loads(e) for e in events[:-1]]
+        deltas = [c for o in objs for c in o["choices"]]
+        content = "".join(d["delta"].get("content") or "" for d in deltas)
+        reasoning = "".join(d["delta"].get("reasoning_content") or "" for d in deltas)
+        for s in ([stop] if isinstance(stop, str) else stop or []):
+            for d in deltas:  # (no delta carries a stop string's start that was then cut)
+                self.assertNotIn(s, d["delta"].get("content") or "")
+        finish = [d["finish_reason"] for d in deltas if d["finish_reason"]][-1]
+        return content, reasoning, finish, objs[-1]["usage"]["completion_tokens"], srv
+
+    def test_the_reply_is_the_no_stop_reply_cut_at_the_first_occurrence(self) -> None:
+        full = "".join(self.PIECES)
+        for stream in (False, True):
+            base = self._reply(None, stream)
+            self.assertEqual(base[:3], (full, "", "stop"))
+            for stop in ("END", ["near", " wor"], "ld. T", ["o"], "Hello", "zzz", ["is n", "ear"]):
+                content, _, finish, n, srv = self._reply(stop, stream)
+                want, word = self._cut(full, [stop] if isinstance(stop, str) else stop)
+                self.assertEqual(content, want.rstrip(), (stop, stream))  # (the end of a reply is trimmed, as ever)
+                self.assertEqual(finish, "stop", (stop, stream))
+                self.assertEqual(srv.stop_word, word, (stop, stream))
+                if word is not None:  # (tokens up to the one that completed the stop string)
+                    k = next(i for i in range(1, len(self.PIECES) + 1) if word in "".join(self.PIECES[:i])
+                             and "".join(self.PIECES[:i]).find(word) == len(want))
+                    self.assertEqual(n, k, (stop, stream))
+
+    def test_a_stop_in_a_cycle_drops_the_cycles_later_tokens(self) -> None:
+        # _ScriptEngine: token 1 from the prefill, then two per cycle (2-3, 4-5, ...): ". The" is token 4, " END" 5
+        for stream in (False, True):
+            content, _, finish, n, srv = self._reply("The", stream)  # (token 4: token 5 of the same cycle dropped)
+            self.assertEqual((content, finish, n, srv.eng.cycles), ("Hello world.", "stop", 4, 2), stream)
+            content, _, finish, n, srv = self._reply(" EN", stream)  # (completed inside token 5)
+            self.assertEqual((content, finish, n, srv.eng.cycles), ("Hello world. The", "stop", 5, 2), stream)
+
+    def test_max_tokens_releases_held_text(self) -> None:
+        for stream in (False, True):
+            content, _, finish, n, _ = self._reply("ld!", stream, max_tokens=3)  # ("ld" held, then the end)
+            self.assertEqual((content, finish, n), ("Hello world", "length", 3))
+
+    def test_stop_applies_to_the_reasoning_too(self) -> None:
+        think = TEMPLATE.replace("assistant\n{% endif %}", "assistant\n<think>\n{% endif %}")
+        pieces = ["Let me", " think", " hard.", "</think>", "\n\nAnswer", ": 4"]
+        for stream in (False, True):
+            content, reasoning, finish, _, _ = self._reply(None, stream, pieces, think)
+            self.assertEqual((content, reasoning.strip(), finish), ("Answer: 4", "Let me think hard.", "stop"))
+            content, reasoning, finish, _, _ = self._reply("hard", stream, pieces, think)
+            self.assertEqual((content, reasoning.strip(), finish), ("", "Let me think", "stop"))
+            content, reasoning, finish, _, _ = self._reply(": ", stream, pieces, think)
+            self.assertEqual((content, reasoning.strip(), finish), ("Answer", "Let me think hard.", "stop"))
+
+    def test_a_stop_inside_a_tool_call_leaves_text(self) -> None:
+        pieces = ToolCallCutTests.PIECES
+        _, http_ = self.serve(_ScriptEngine(pieces))
+        body = {"messages": [{"role": "user", "content": "hostname?"}], "tools": TOOLS, "max_tokens": 500}
+        o = json.loads(http_.post({**body, "stop": "hostname\n"})[1])
+        c = o["choices"][0]
+        self.assertEqual((c["finish_reason"], c["message"].get("tool_calls")), ("stop", None))
+        self.assertTrue(c["message"]["content"].endswith("/etc/"), c["message"]["content"])
+        o = json.loads(http_.post({**body, "stop": "</tool_call>\n"})[1])  # (never matches: the call is whole)
+        self.assertEqual(o["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_bad_stop_is_a_400(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        for stream in (False, True):
+            status, data = http_.post({"messages": [{"role": "user", "content": "hi"}], "stop": [1], "stream": stream})
+            self.assertEqual(status, 400, data[:200])
+            self.assertIn(b"stop must be", data)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,7 @@ POST /v1/chat/completions (streaming or not): the request is rendered with the c
 in the GGUF (enable_thinking / preserve_thinking / reasoning_effort via chat_template_kwargs, tools
 via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured
 `tool_calls`.  Sampling: temperature, top_p, top_k (1..32; absent or <= 0: 32, the engine's maximum),
-min_p, seed.  Successive requests of a conversation reuse the processed tokens: the new prompt is
+min_p, seed; stop strings (`stop`).  Successive requests of a conversation reuse the processed tokens: the new prompt is
 matched against the sequence so far and only the rest is prefilled. When the new prompt diverges inside
 what the engine already processed, it rewinds to the last DeltaNet checkpoint at or before the
 divergence (saved during earlier prefills: at each generation prompt, each message start and every
@@ -50,6 +50,7 @@ TOPK_MAX = 32
 # request limits; main() reads them from the environment
 MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64 data: URLs fit)
 MAX_IMAGES = 32  # MK_MAX_IMAGES: images per request
+MAX_STOP, MAX_STOP_LEN = 64, 1024  # stop strings per request, characters per stop string
 # lingering close (HTTPServer.shutdown_request): what a client still sends after the server's last answer is read and
 # dropped for at most LINGER_S seconds / LINGER_BYTES bytes, LINGER_IDLE_S seconds without data (nginx's defaults)
 LINGER_S, LINGER_IDLE_S, LINGER_BYTES = 30.0, 5.0, 1 << 30
@@ -505,6 +506,61 @@ def parse_tool_calls(text, tools):
     return calls
 
 
+def stop_strings(v, field="stop"):
+    """the stop strings of a request: a string or a list of strings (empty ones dropped, as llama-server does)"""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, list) or not all(isinstance(s, str) for s in v):
+        raise BadRequest(f"{field} must be a string or a list of strings")
+    v = [s for s in v if s]
+    if len(v) > MAX_STOP or any(len(s) > MAX_STOP_LEN for s in v):
+        raise BadRequest(f"{field}: at most {MAX_STOP} strings of at most {MAX_STOP_LEN} characters")
+    return v
+
+
+class StopMatcher:
+    """Cuts the generated text at the first occurrence of a stop string, as llama-server does: on the raw text (reasoning,
+    content and tool-call markup alike), the stop string and everything after it dropped. Text that could still become
+    the start of a stop string is held back until the next piece decides it (or the end releases it)."""
+
+    def __init__(self, stops):
+        self.stops = stops
+        self.held = ""
+        self.word = None  # the stop string found
+
+    def _partial(self, buf):
+        """length of the longest suffix of buf that is a proper prefix of a stop string"""
+        best = 0
+        for s in self.stops:
+            j = buf.find(s[0], max(0, len(buf) - len(s) + 1))  # (scanned from the longest candidate)
+            while 0 <= j and len(buf) - j > best:
+                if s.startswith(buf[j:]):
+                    best = len(buf) - j
+                    break
+                j = buf.find(s[0], j + 1)
+        return best
+
+    def feed(self, text, final=False):
+        """the text that can go out now; after a match (self.word set) nothing more"""
+        if not self.stops or self.word is not None:
+            return text if self.word is None else ""
+        buf = self.held + text
+        # (a match cannot start in text released before: its start would have been held)
+        at = -1
+        for s in self.stops:
+            i = buf.find(s)
+            if i >= 0 and (at < 0 or i < at):
+                at, self.word = i, s
+        if at >= 0:
+            self.held = ""
+            return buf[:at]
+        keep = 0 if final else self._partial(buf)
+        self.held = buf[len(buf) - keep:] if keep else ""
+        return buf[:len(buf) - keep]
+
+
 class OutputParser:
     """Splits the generated text into reasoning (before </think>), content and tool-call markup."""
 
@@ -584,6 +640,7 @@ class OutputParser:
 class Server:
     vision = None   # Vision (--mmproj), else text only
     img_spans = ()  # the images of the engine's sequence: (pos, n, key); replaced, never mutated
+    stop_word = None  # the stop string that ended the last reply (None: it ended otherwise)
 
     def __init__(self, args):
         self.args = args
@@ -803,6 +860,8 @@ class Server:
             raise BadRequest(f"prompt of {len(toks)} tokens does not fit the context of {self.args.ctx}")
         max_new = limit if max_new <= 0 else min(max_new, limit)
         tools = body.get("tools") or []
+        stopper = StopMatcher(stop_strings(body.get("stop")))
+        self.stop_word = None
         self.sampling(body)
         if gone():  # (it left while the request waited for the engine)
             log("the client disconnected before its prompt was processed")
@@ -833,16 +892,23 @@ class Server:
             if self.eng.is_eog(t):
                 finish = "stop"
                 break
-            for kind, delta in parser.feed(dec.decode(self.eng.piece(t))):
+            for kind, delta in parser.feed(stopper.feed(dec.decode(self.eng.piece(t)))):
                 if emit(kind, delta) is False:
                     aborted = True
                     break
+            if stopper.word is not None:
+                # a stop string: the reply ends at it, and the tokens after this one (the rest of the cycle's accepted
+                # drafts) are dropped. The engine's sequence keeps them, as after max_tokens: the next request finds
+                # the divergence (load_prompt) and continues from the reply that was sent.
+                finish = "stop"
+                break
         if aborted:  # (the engine's state is that of a reply cut by max_tokens: the next request reuses it as usual)
             log(f"prompt {len(toks)} tok ({reused} reused), {n_gen} tok in {time.time() - t1:.2f} s: the client "
                 f"disconnected, stopped")
             raise ClientGone()
-        for kind, delta in parser.feed(dec.decode(b"", final=True), final=True):
+        for kind, delta in parser.feed(stopper.feed(dec.decode(b"", final=True), final=True), final=True):
             emit(kind, delta)
+        self.stop_word = stopper.word
         calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
         rest = parser.unparsed()
         if rest:
@@ -852,7 +918,7 @@ class Server:
             finish = "tool_calls"
         t2 = time.time()
         log(f"prompt {len(toks)} tok ({reused} reused) in {t1 - t0:.2f} s, {n_gen} tok in {t2 - t1:.2f} s "
-            f"({n_gen / max(t2 - t1, 1e-9):.1f} tok/s), {finish}")
+            f"({n_gen / max(t2 - t1, 1e-9):.1f} tok/s), {finish}" + (" (stop string)" if stopper.word is not None else ""))
         usage = {"prompt_tokens": len(toks), "completion_tokens": n_gen, "total_tokens": len(toks) + n_gen,
                  "prompt_tokens_details": {"cached_tokens": reused}}
         timings = {"prompt_n": len(toks) - reused, "prompt_ms": (t1 - t0) * 1e3, "predicted_n": n_gen,
