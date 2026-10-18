@@ -125,6 +125,8 @@ class VideoDecoderTests(unittest.TestCase):
         self.assertEqual([(w, h, d[0]) for w, h, d in out], [(4, 2, 1), (4, 2, 2)])
         self.assertEqual(cmd[cmd.index("-vf") + 1], "fps=4.000000")  # (llama.cpp's filter)
         self.assertIn("ppm", cmd)
+        self.assertEqual(cmd[cmd.index("-protocol_whitelist") + 1], "file")  # (no URLs from inside a "video")
+        self.assertLess(cmd.index("-protocol_whitelist"), cmd.index("-i"))
 
     def test_too_many_frames_no_frames_and_bad_streams_are_400(self) -> None:
         mk = self.mk

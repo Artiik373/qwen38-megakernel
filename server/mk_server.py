@@ -640,11 +640,13 @@ class VideoDecoder:
         max_frames frames (when the next frame arrives) or a decode over `timeout` seconds"""
         timeout = VIDEO_DECODE_S if timeout is None else timeout
         with tempfile.TemporaryDirectory(prefix="mkvideo") as d:
+            # (a name without an extension and only the file protocol: a "video" that is a playlist or a concat list
+            # cannot make ffmpeg open URLs or other files; ffmpeg 6 refuses an HLS playlist without .m3u8 by itself)
             path = os.path.join(d, "input")
             with open(path, "wb") as f:
                 f.write(data)
-            cmd = [self.exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", path, "-an", "-sn",
-                   "-vf", f"fps={fps:.6f}", "-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "pipe:1"]
+            cmd = [self.exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file", "-i", path,
+                   "-an", "-sn", "-vf", f"fps={fps:.6f}", "-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "pipe:1"]
             try:
                 p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
