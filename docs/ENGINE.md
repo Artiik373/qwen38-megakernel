@@ -284,8 +284,9 @@ Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `-c` con
 MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decoding; env `MK_NO_MTP=1`), `--exact-reuse`
 [off; the launchers turn it on], `--ck-every n` (a checkpoint every n prompt tokens [4096], 0 = off), `--ck-msgs 1|0`
 (a checkpoint at each message start [1]), `--mmproj` (images, below), `--vision-backend auto|cpu|mtmd` [auto],
-`--vision-threads` [0 = all], `--image-min-tokens` / `--image-max-tokens` [the mmproj's], `--image-cache` [8; images
-kept between requests].
+`--vision-threads` [0 = every logical CPU but two], `--image-min-tokens` / `--image-max-tokens` [the mmproj's],
+`--image-cache` [8; images kept between requests], `--video-fps` [4], `--video-max-tokens` [0 = the image limit],
+`--video-cache` [2; videos kept between requests], `--ffmpeg` [ffmpeg on PATH; env `MK_FFMPEG`] (video, below).
 
 - Prompts are rendered with the chat template stored in the GGUF (jinja2): `chat_template_kwargs`
   `enable_thinking` / `preserve_thinking` / `reasoning_effort`, OpenAI `tools`. Reasoning is streamed as
@@ -371,8 +372,9 @@ kept between requests].
   save / restore) and `POST /props` get 501.
 - Limits (environment, read at startup): a request body needs a Content-Length (411 without one, also for chunked
   bodies; 400 when malformed) of at most `MK_MAX_BODY_MB` MB (default 128; 413, refused before the body is read, also
-  on `Expect: 100-continue`). At most `MK_MAX_IMAGES` images per request (default 32; 400), and no more images are
-  decoded once the prompt cannot fit the context. The image library refuses an image of more than
+  on `Expect: 100-continue`). At most `MK_MAX_IMAGES` images per request (default 32; 400) and `MK_MAX_VIDEO_FRAMES`
+  video frames (default 256, all videos of the request; 400 as soon as the frame past it is decoded), and no more
+  images are decoded once the prompt cannot fit the context. The image library refuses an image of more than
   `MK_IMAGE_MAX_PIXELS` pixels (default 100,000,000) from its header, before decoding it. Measured on 2026-10-17
   without the limit: a 446 KB PNG declaring 12000 x 12000 pixels took 39 s and 0.9 GB of server memory (decode, then
   4096 tokens encoded); a 20000 x 20000 one asks stb_image for ~2.4 GB.
@@ -389,7 +391,7 @@ kept between requests].
   resets without one), with the draft vocabulary as it was, so the next request answers as on a server that never saw
   it. After a disconnect during decoding the engine keeps what it generated, as after a reply cut by `max_tokens`, so the
   next request reuses or rewinds it as usual.
-- Images: see [Images](#images-vision).
+- Images: see [Images](#images-vision); video: see [Video](#video).
 
 ## KV cache
 
@@ -467,7 +469,52 @@ Encode time, Ryzen 9 5900XT (Zen 3, 16 cores / 32 threads), BF16 mmproj, steady 
 
 The first encode after the server's load costs ~0.5 s more (the weights streamed in again); the server absorbs it with
 a warm-up encode at startup. A new image after the CPU has been idle takes ~1.2-1.5 s for 300 tokens while the cores
-ramp up.
+ramp up. The encoder's workers are pinned and meet at a barrier after every step, so one other busy thread on a CPU
+they use doubles the encode time; the server's keep-warm load is such a thread (with all 32 threads a 220-token frame
+pair took 1.15 s next to it, 0.65 s without it). The default thread count leaves two logical CPUs free, which costs
+nothing on an idle machine (2026-10-18).
+
+## Video
+
+With `--mmproj` and an ffmpeg executable (`--ffmpeg` / `MK_FFMPEG`: the file or its directory; else `ffmpeg` on
+`PATH`; else the binary of the `imageio-ffmpeg` Python package, which bundles one for Windows, Linux and macOS) the
+server takes video clips: llama-server's `{"type": "input_video", "input_video": {"data": <base64>}}` and vLLM-style
+`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}` (no remote or file URLs).
+`Server.video_ok` says whether video works in this process (`/props`); without ffmpeg, or with an older vision
+library, a video request gets a 400 naming what is missing. Any container / codec the ffmpeg reads works.
+
+- **Frames:** ffmpeg decodes the clip (written to a temporary file) through its `fps` filter at `--video-fps` (4,
+  llama.cpp's default) into RGB24, as llama.cpp's mtmd-helper does (`-vf fps=4.000000 -pix_fmt rgb24`), read as a PPM
+  stream so that no ffprobe is needed: the same frames, byte for byte, as llama.cpp's command. Each frame is resized
+  like an image (smart resize; `--video-max-tokens` caps a frame's tokens, default the image limit). A decode that
+  takes over 300 s, or a clip ffmpeg cannot read, is a 400.
+- **Prompt, as llama.cpp b10246 builds it:** the clip's media marker becomes the text `Video:`, then the frames with a
+  timestamp text after each frame that reaches the next 5 s mark (`[0m0.00s]` after frame 0, `[0m5.00s]` after the
+  frame at 5 s, ...; float arithmetic as llama.cpp's), each text tokenized on its own. Consecutive frames merge in
+  pairs into one grid of tokens (Qwen-VL's temporal patch of 2): frame 0 stands alone (its timestamp follows it), and a
+  run between two timestamps with an odd number of frames ends with a lone frame. Each frame or pair is placed like an
+  image (`<|vision_start|>`, rows, `<|vision_end|>`; the same M-RoPE positions, so the engine needs nothing new).
+  Checked against llama.cpp's own path (libmtmd with `MTMD_VIDEO` on 4 clips: H.264, VP9, 12 to 40 frames): the same
+  texts and grids, and llama-server reported the same prompt token counts.
+- **Encoder:** a lone frame is a still image (the patch embedding's two temporal kernels summed); a pair puts the first
+  frame through the first kernel and the second through the other (`vit_cpu` `encode_pair`, `mkv_frames_load`).
+  Against an fp64 forward (`vision/vit_ref.py`, 3 pairs of 220 .. 920 tokens): vit_cpu 5e-6 .. 1.1e-5, min row cosine
+  1.000000; libmtmd 5.5e-3 .. 2.2e-2, 0.981: the same as for images.
+- **Reuse:** each frame or pair is an image to the reuse logic (its key: the clip's hash, the frame rate, the token
+  limit and its place), so a follow-up turn reuses the whole clip. Decoded and encoded clips are cached (`--video-cache`
+  clips between requests); a request holds all of its own. A client that disconnects stops the encodes between pairs.
+
+Cost, Ryzen 9 5900XT, BF16 mmproj, 30 threads, steady state (2026-10-18; tokens per second of video include the
+`<|vision_start|>` / `<|vision_end|>` pair of each frame or pair and the timestamps):
+
+| frames | tokens per pair | encode per pair | tokens per second of video at 1 / 2 / 4 fps |
+|---|---|---|---|
+| 320 x 240 | 80 | 0.22 s | 51 / 85 / 167 |
+| 640 x 360 | 220 | 0.56 s | 135 / 228 / 450 |
+| 1280 x 720 | 920 | 3.1-3.7 s | 555 / 939 / 1861 |
+
+At 1 fps a clip costs more than half its 2 fps tokens: every 5 s run then has an odd number of frames, and its last
+frame is a grid of its own. A 640 x 360 clip at 4 fps encodes at about real time (two pairs per second of video).
 
 ## How it gets its speed
 
@@ -560,9 +607,10 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
 - Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order), and presence / frequency
   penalties on the generated tokens (applied first; greedy too; exact under speculative verification: a verify row also
   counts the drafts before it); no repetition penalty.
-- Text and images (no video or audio; images as base64 `data:` URLs; Qwen-VL projectors only); one sequence: a
-  conversation is reused while it grows (or diverges after a checkpoint); editing an earlier part, e.g. context
-  compaction, re-prefills from the last checkpoint before the edit. One request at a time; no slot save / restore.
+- Text, images and video (no audio; images and clips as base64; video needs ffmpeg; Qwen-VL projectors only); one
+  sequence: a conversation is reused while it grows (or diverges after a checkpoint); editing an earlier part, e.g.
+  context compaction, re-prefills from the last checkpoint before the edit. One request at a time; no slot save /
+  restore.
 
 ## Files
 
@@ -579,9 +627,11 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
 - `tools/vocab_freq.cpp` - builds a draft vocabulary from a list of text files
 - `tools/llama_ref.cpp` / `logit_stats.h` - llama.cpp's next-token distributions and the comparison with them (KL
   divergence, perplexity, top-token agreement)
-- `vision/mk_vision.{h,cpp}` - the CPU vision encoder's C API (`libqwen38vision.so`): image decoding, backends
+- `vision/mk_vision.{h,cpp}` - the CPU vision encoder's C API (`libqwen38vision.so`): image decoding, video frames and
+  frame pairs, backends
 - `vision/vit_cpu.{h,cpp}` - the vision tower in fp32 with AVX2 / FMA kernels (the `cpu` backend)
 - `vision/mkv_cli.cpp` - encodes images from the command line (grid, time, rows)
-- `vision/vit_check.cpp` - test: vit_cpu against libmtmd (pixels, rows, times); `vision/vit_ref.py` - the fp64 reference
+- `vision/vit_check.cpp` - test: vit_cpu against libmtmd (pixels, rows, times; `--pair`: video frame pairs);
+  `vision/vit_ref.py` - the fp64 reference
 - `tools/vision_ref.cpp` - llama.cpp's distributions for an image prompt + the image rows it fed (`--kld-images`)
 - `bench/` - benchmarks (see [Build / run](#build--run)); `tests/` - server tests (no GPU needed)

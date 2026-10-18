@@ -1,7 +1,7 @@
 # qwen38-megakernel
 
 The development home of a single-GPU engine for **Qwen3.8-27B on one RTX 3090 (24 GB)** and the OpenAI-compatible
-server around it, with image input. It contains:
+server around it, with image and video input. It contains:
 
 - **The engine**, a CUDA megakernel tuned on an RTX 3090. Each speculative decode cycle is one persistent cooperative
   kernel launch: the model's own MTP head drafts up to 7 tokens, and the main model verifies all 8 rows in one pass,
@@ -15,8 +15,8 @@ server around it, with image input. It contains:
   such as Claude Code), llama-server's `/health`, `/props`, `/v1/models`, `/slots`, `/metrics`, `/tokenize`,
   `/detokenize`, `/apply-template`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints. After each
   request the engine keeps the GPU's clocks up for a while (keep-warm), so a reply after a pause starts at full speed.
-- **The vision encoder** turns OpenAI `image_url` parts into model input. It runs **on the CPU** (fp32 AVX2 / FMA), so
-  images cost no VRAM and the full context stays available.
+- **The vision encoder** turns OpenAI `image_url` parts and video clips (llama-server's `input_video`) into model input.
+  It runs **on the CPU** (fp32 AVX2 / FMA), so images and video cost no VRAM and the full context stays available.
 - **KV cache:** q8_0 by default. Opt-in near-lossless presets with 6-bit K and 5-bit V free about 1 GB at 120k context
   and fit the model's full 262,144-token context on 24 GB.
 
@@ -110,6 +110,13 @@ most recent 2,048 positions and for the MTP layer. Measured on 2026-10-15 at 7d6
 - On six image prompts, the mean KL against llama.cpp fed the same image rows is 0.0006-0.0059 (text only: 0.0012).
 - The encoder's rows are within 4e-6 to 4e-5 (relative) of an fp64 forward of the vision tower.
 
+**Video** (same CPU, 2026-10-18; frames sampled at 4 fps as llama.cpp does, two consecutive frames per grid of tokens):
+- A 640 x 360 clip costs ~450 prompt tokens per second of video (228 at 2 fps) and its frame pairs encode in 0.56 s
+  each, about real time at 4 fps. 320 x 240: 167 tokens per second, 0.22 s per pair; 1280 x 720: 1861 tokens per
+  second, ~3.2 s per pair.
+- The prompt is llama-server's: the same prompt token counts on four clips, the same frames (ffmpeg), and frame-pair
+  rows within 5e-6 to 1.1e-5 of an fp64 forward (libmtmd's: 5.5e-3 to 2.2e-2).
+
 Earlier results with charts and raw data (one session, 2026-10-14) and the gates behind each change up to 2026-10-16
 are in the fork's [perf docs](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf/perf). How the engine works
 inside: [docs/ENGINE.md](docs/ENGINE.md).
@@ -125,6 +132,8 @@ inside: [docs/ENGINE.md](docs/ENGINE.md).
   reference tools use libmtmd.
 - **Python** 3.10+ with jinja2.
 - **CPU for the fast image encoder:** x86-64 with AVX2 + FMA (Zen 2+, Haswell+). Other CPUs fall back to libmtmd.
+- **ffmpeg** for video input only (optional): on `PATH`, named by `MK_FFMPEG` / `--ffmpeg`, or the one bundled with
+  `pip install imageio-ffmpeg`. Without it the server answers video requests with a 400.
 
 ## Build
 
@@ -209,6 +218,12 @@ IMG=$(base64 -w0 photo.jpg)
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "messages": [{"role": "user", "content": [{"type": "text", "text": "What is in this picture?"},
     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$IMG"'"}}]}]}'
+
+# a video clip (base64, llama-server's input_video; needs ffmpeg)
+VID=$(base64 -w0 clip.mp4)
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [{"type": "text", "text": "What happens in this video?"},
+    {"type": "input_video", "input_video": {"data": "'"$VID"'"}}]}]}'
 ```
 
 What the API supports:
@@ -216,11 +231,15 @@ What the API supports:
   penalty. Absent values default to temperature 0.8, top_p 0.95 and min_p 0.05. There is no repetition penalty.
 - **Chat template:** the one stored in the GGUF, with `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...)
   and OpenAI `tools`.
-- **Images:** base64 `data:` URLs only. There is no video or audio.
+- **Images:** base64 `data:` URLs only.
+- **Video:** `input_video` parts (`{"data": <base64>}`, as llama-server) or `video_url` parts with a base64 `data:` URL;
+  ffmpeg samples `--video-fps` frames per second (default 4) and the prompt is laid out as llama.cpp does
+  ([docs/ENGINE.md](docs/ENGINE.md#video)). There is no audio.
 - **Tool calls:** a call counts only when it is complete; one cut by `max_tokens` is returned as text in `content`, with
   `finish_reason` "length".
 - **Limits:** request bodies up to 128 MB (`MK_MAX_BODY_MB`), 32 images per request (`MK_MAX_IMAGES`), 100 megapixels
-  per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded). A refused upload still gets its 4xx answer:
+  per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded), 256 video frames per request
+  (`MK_MAX_VIDEO_FRAMES`: 64 s at 4 fps). A refused upload still gets its 4xx answer:
   the server drains the rest of the body (bounded) before it closes. A request whose client disconnects stops at the
   next prefill chunk (2048 tokens) or decode cycle, and a stopped prompt leaves nothing behind; an engine error in a
   stream ends it with an error event and `data: [DONE]`.

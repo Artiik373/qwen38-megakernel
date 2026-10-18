@@ -7,6 +7,10 @@
 #   MK_MMPROJ           the vision projector (default: mmproj-BF16.gguf, unsloth's file name, next to the model or in
 #                       ~/models, else ~/models/mmproj-Qwen3.8-27B-BF16.gguf; MK_MMPROJ= turns images off)
 #   MK_IMAGE_MAX_TOKENS tokens per image (default: the mmproj's, 4096); fewer tokens encode faster
+#   MK_VIDEO_FPS        video input (input_video parts, with the mmproj; needs ffmpeg: on PATH, MK_FFMPEG, or
+#                       pip install imageio-ffmpeg): frames sampled per second (default 4, llama.cpp's)
+#   MK_VIDEO_MAX_TOKENS tokens per video frame pair (default: the image limit); fewer fit longer clips
+#   MK_FFMPEG           the ffmpeg executable (or its directory) for video input
 #   MK_HOST             listen address (default 127.0.0.1; 0.0.0.0 for other machines on the LAN)
 #   MK_DRAFT            MTP drafts per cycle (default 7; a `make MKFLAGS=` build takes at most 4)
 #   MK_EXACT_REUSE=0    turn exact reuse off: a reused prompt then appends the previous reply instead of re-prefilling it
@@ -20,9 +24,9 @@
 #   MK_MTP              the MTP draft layer from a separate GGUF of the same model (e.g. an mtp-*.gguf), for a model
 #                       file without one or instead of the file's own
 #   MK_NO_MTP=1         no MTP layer: plain decoding, depth 0 (also automatic for a model file without one)
-#   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS
+#   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS, MK_MAX_VIDEO_FRAMES
 #                       request limits: body size (default 128 MB), images per request (32), pixels per image
-#                       (100,000,000; checked before decoding)
+#                       (100,000,000; checked before decoding), video frames per request (256)
 #   MK_PYTHON           Python with jinja2 (default python3)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,7 +45,8 @@ else MMPROJ=$(ls "$(dirname "$MODEL")/mmproj-BF16.gguf" "$HOME/models/mmproj-BF1
 fi
 VA=() VS=off
 if [ -n "$MMPROJ" ] && [ -f "$MMPROJ" ] && [ -f "$HERE/libqwen38vision.so" ]; then
-    VA=(--mmproj "$MMPROJ" ${MK_IMAGE_MAX_TOKENS:+--image-max-tokens "$MK_IMAGE_MAX_TOKENS"})
+    VA=(--mmproj "$MMPROJ" ${MK_IMAGE_MAX_TOKENS:+--image-max-tokens "$MK_IMAGE_MAX_TOKENS"}
+        ${MK_VIDEO_FPS:+--video-fps "$MK_VIDEO_FPS"} ${MK_VIDEO_MAX_TOKENS:+--video-max-tokens "$MK_VIDEO_MAX_TOKENS"})
     VS="on the CPU ($(basename "$MMPROJ"))"
 fi
 echo "megakernel: $MODEL, ctx $CTX, KV q8_0${MK_KV:+ + MK_KV=$MK_KV (window ${MK_KV_WIN:-off})}, ${MK_DRAFT:-7} MTP drafts," \
