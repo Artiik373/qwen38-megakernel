@@ -15,8 +15,9 @@ divergence (saved during earlier prefills: at each generation prompt, each messa
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
 GET /health, GET /v1/models.  One request at a time.  After each request the engine keeps the GPU's
 clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a reply after a pause starts at full speed.
-Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32).
-A request whose client disconnects stops generating at the next engine cycle.
+Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32);
+the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
+whose client disconnects stops generating at the next engine cycle.
 """
 import argparse
 import base64
