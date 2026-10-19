@@ -375,6 +375,12 @@ int mk_cancel(void * hp, int on) {
     return 0;
 }
 
+// progress of a prefill running on another thread: *done of the *total prompt positions of its batched part
+// (MKEngine::prefill_progress; host counters, never waits). The server shows it while a long prompt is processed.
+void mk_prefill_progress(void * hp, int * done, int * total) {
+    static_cast<Handle *>(hp)->eng->prefill_progress(done, total);
+}
+
 // one decode cycle; writes 1..n_draft+1 tokens; returns the count (negative on error)
 int mk_step(void * hp, int * out, int cap) {
     return guarded(hp, [&](MKEngine * e) {

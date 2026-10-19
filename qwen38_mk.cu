@@ -7888,6 +7888,9 @@ struct MKEngine::Impl {
     std::atomic<int> pf_cancel{0};
     bool pf_cancelled = false;
     int pf_stop = 0; // (the position it stopped at)
+    // MKEngine::prefill_progress (read from any thread): the batched part of the running prefill() covers positions
+    // pf_from .. pf_to - 1; pf_run moves pf_pos past each chunk once the GPU finished it. Host counters only.
+    std::atomic<int> pf_from{0}, pf_to{0}, pf_pos{0};
     cudaEvent_t pf_cev[2] = {};
     std::vector<cudaEvent_t> pf_gev; // MK_PF_GAPS: timing events, 4 per chunk (start, trunk end, MTP part start, end)
 
@@ -8703,6 +8706,7 @@ struct MKEngine::Impl {
                 CK(cudaEventRecord(pf_cev[ci & 1], 0));
                 if (ci > 0) wait_event(pf_cev[(ci - 1) & 1], "a prefill chunk", std::max(wd_limit, 120.0));
             }
+            pf_pos.store(n, std::memory_order_relaxed); // (the chunks before this one are done: waited for above)
         }
         if (snaps && !pred && !sink)
             for (const Snap & q : *snaps) { // (its last piece was copied before the last chunk's MTP part)
@@ -8711,6 +8715,7 @@ struct MKEngine::Impl {
             }
         CK(cudaGetLastError());
         wait_device("the prefill tail", std::max(wd_limit, 120.0));
+        if (!pf_cancelled) pf_pos.store(n0 + N, std::memory_order_relaxed);
         if (memlog && pf_runs_seen++ == 0) mem_mark("first prefill run");
         if (pf_gaps && !pred && !sink && !pf_cancelled) { // GPU idle at the host's points: before a chunk's first kernel, before its MTP part
             double g0 = 0, g1 = 0, wall = 0;
@@ -9226,6 +9231,12 @@ void MKEngine::reset() {
 
 void MKEngine::cancel(bool on) { p_->pf_cancel.store(on ? 1 : 0); }
 
+void MKEngine::prefill_progress(int * done, int * total) const {
+    const int a = p_->pf_from.load(), b = p_->pf_to.load(), q = p_->pf_pos.load();
+    *total = std::max(b - a, 0);
+    *done = std::min(std::max(q - a, 0), *total);
+}
+
 int MKEngine::position() const { return p_->hctl.n; }
 
 void MKEngine::set_n_draft(int n) {
@@ -9381,6 +9392,13 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
     c.mtp_valid = std::min(c.mtp_valid, n0);
     size_t i = 0;
     bool end_save = !p_->exact; // a checkpoint at the end of the prompt, unless ck_exact is inside the batched part
+    { // prefill_progress: this call's batched part (an empty range while it is set: total 0)
+        const int to = batched && feed.size() >= 2 ? n0 + (int) feed.size() - 1 : n0;
+        p_->pf_to.store(n0);
+        p_->pf_from.store(n0);
+        p_->pf_pos.store(n0);
+        p_->pf_to.store(to);
+    }
     if (batched && feed.size() >= 2) {
         // all but the last token in batched kernels; the last one goes through the megakernel,
         // which produces the first output token and the MTP drafts

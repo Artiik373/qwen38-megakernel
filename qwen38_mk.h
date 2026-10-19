@@ -100,6 +100,9 @@ class MKEngine {
     // back to the last checkpoint that existed before the call (or to a reset when there is none), the draft vocabulary
     // and the image spans to what they were. Each prefill() clears the flag when it returns; cancel(false) clears it too.
     void cancel(bool on = true);
+    // Progress of the prefill() running on another thread (callable from any thread; host counters, no GPU work): *done
+    // of the *total positions of its batched part are processed. After it returns: that prefill's last values.
+    void prefill_progress(int * done, int * total) const;
     // Runs one verify+draft cycle; appends 1..n_draft+1 accepted tokens to `out`.
     int step(std::vector<int> & out);
     // Debug helper: copy of the last main-model logits row selection (argmax ids) is not kept;
