@@ -1492,5 +1492,182 @@ class ChatTemplateOptionTests(_HttpCase):
         self.assertEqual(self._main()[0:3:2], (None, []))  # (no option: the GGUF's, nothing read)
 
 
+# === con: the console (log lines with request numbers, the live status line) ===
+class _Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def _screen(out):
+    """what a terminal shows after `out`: a carriage return goes back to the start of the row, a newline starts one"""
+    rows, col = [[]], 0
+    for ch in out:
+        if ch == "\r":
+            col = 0
+        elif ch == "\n":
+            rows.append([])
+            col = 0
+        else:
+            row = rows[-1]
+            if col < len(row):
+                row[col] = ch
+            else:
+                row.append(ch)
+            col += 1
+    return ["".join(r).rstrip() for r in rows]
+
+
+class ConsoleTests(unittest.TestCase):
+    IM = 1
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mk = _load_mk_server()
+
+    def _run(self, stream, steps, columns=120):
+        con = self.mk.Console()
+        with mock.patch.object(sys, "stderr", stream), \
+                mock.patch.object(self.mk.shutil, "get_terminal_size", return_value=types.SimpleNamespace(columns=columns)):
+            for kind, text in steps:
+                (con.line if kind == "line" else con.status)(text)
+        return stream.getvalue()
+
+    def test_off_a_terminal_only_the_log_lines_are_written(self) -> None:
+        out = self._run(io.StringIO(), [("status", "#1 prefill"), ("line", "a"), ("status", "#1 decoding"), ("line", "b"),
+                                        ("status", "")])
+        self.assertEqual(out, "a\nb\n")
+
+    def test_on_a_terminal_the_status_line_is_rewritten_in_place_under_the_log_lines(self) -> None:
+        steps = [("status", "#1 prefill 10 / 100 tok"), ("status", "#1 prefill 50 / 100 tok"), ("line", "[mk-server] #1 prompt"),
+                 ("status", "#1 decoding")]
+        out = self._run(_Tty(), steps)
+        self.assertEqual(_screen(out), ["[mk-server] #1 prompt", "#1 decoding"])  # (the shorter text padded over)
+        self.assertNotIn("\x1b", out)  # (no escape sequences: any console)
+        out = self._run(_Tty(), steps + [("line", "[mk-server] #1 reply"), ("status", "")])
+        self.assertEqual(_screen(out), ["[mk-server] #1 prompt", "[mk-server] #1 reply", ""])
+
+    def test_the_status_line_is_cut_to_the_terminal_width(self) -> None:
+        text = "#1 prefill 123,456 / 200,000 tok (61%), 1,600 tok/s"
+        out = self._run(_Tty(), [("status", text)], columns=30)
+        self.assertEqual(_screen(out), [text[:29].rstrip()])  # (a full row would wrap, and \r returns to its last row only)
+        self.assertLessEqual(max(len(seg) for seg in out.split("\r")), 29)
+
+    def _server(self, every):
+        srv = object.__new__(self.mk.Server)
+        srv.eng, srv.im_start = _FakeEngine(), self.IM
+        srv.args = mock.Mock(ck_every=every, ck_msgs=1)
+        return srv
+
+    def test_the_prompt_line_says_how_the_cache_was_used(self) -> None:
+        IM = self.IM
+        first = [IM, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, IM, 5, 5, IM, 9, 9]
+        srv = self._server(8)
+        srv.load_prompt(first)
+        self.assertEqual(srv.cache_note, "nothing cached")
+        srv.load_prompt(srv.eng.sequence() + [IM, 6, IM, 9])
+        self.assertEqual(srv.cache_note, "the prompt matches 19 of the 19 cached tok: continued from there")
+        srv = self._server(8)
+        srv.load_prompt(first)
+        srv.eng.dn_c = len(srv.eng.seq) + 5  # (decoding went on: no append)
+        srv.load_prompt(first[:14] + [6, 6, IM, 9, 9])
+        self.assertEqual(srv.cache_note, "the prompt matches 14 of the 19 cached tok: resumed at the checkpoint at 12")
+        srv = self._server(0)
+        srv.load_prompt([IM, 5, 5, IM, 9])
+        srv.eng.dn_c += 3
+        srv.load_prompt([IM, 6, 6, IM, 9])
+        self.assertEqual(srv.cache_note, "CACHE MISS: the prompt matches 1 of the 6 cached tok, no checkpoint before that")
+
+    def test_progress_texts(self) -> None:
+        srv = object.__new__(self.mk.Server)
+        srv.rid = 3
+        self.assertEqual(srv.prefill_text(100, (40, 100), 2.0), "#3 prefill 40 / 100 tok (40%), 20 tok/s, ~3.00 s left | 2.00 s")
+        self.assertEqual(srv.prefill_text(100, (0, 100), 0.3), "#3 prefill 0 / 100 tok (0%) | 0.30 s")
+        for prog in (None, (0, 0)):  # (a library without mk_prefill_progress; a prefill without a batched part)
+            self.assertEqual(srv.prefill_text(100, prog, 1.5), "#3 prefill 100 tok | 1.50 s")
+        self.assertEqual(srv.decode_text(120, {"thinking": 100, "answer": 19, "tool call": 0}, 40, 119, 1.2),
+                         "#3 decoding 120 tok, 100.0 tok/s, 3.0 tok/cycle | thinking 100, answer 19 | 1.20 s")
+        self.assertEqual([self.mk.secs(s) for s in (0.4, 12.34, 125)], ["0.40 s", "12.3 s", "2 min 05 s"])
+
+    def test_the_engine_reads_the_librarys_progress_counters(self) -> None:
+        eng = object.__new__(self.mk.Engine)
+        eng.h, eng._progress = None, True
+
+        def prog(h, done, total):  # (ctypes.byref arguments: ._obj is the c_int)
+            done._obj.value, total._obj.value = 5, 9
+        eng.L = types.SimpleNamespace(mk_prefill_progress=prog)
+        self.assertEqual(eng.prefill_progress(), (5, 9))
+        eng._progress = False  # (a library before mk_prefill_progress)
+        self.assertIsNone(eng.prefill_progress())
+
+    def test_a_reset_connection_is_not_reported_other_errors_are(self) -> None:
+        httpd = object.__new__(self.mk.HTTPServer)
+
+        def report(exc):
+            err = io.StringIO()
+            with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+                try:
+                    raise exc
+                except Exception:
+                    httpd.handle_error(None, ("127.0.0.1", 5))
+            return err.getvalue()
+        for e in (ConnectionResetError(10054, "reset"), ConnectionAbortedError(), BrokenPipeError()):
+            self.assertEqual(report(e), "", e)
+        out = report(ValueError("boom"))
+        self.assertIn("error on the connection from ('127.0.0.1', 5)", out)
+        self.assertIn("ValueError: boom", out)
+
+
+class ConsoleHttpTests(_HttpCase):
+    def _log(self, fn, stream=None):
+        err = io.StringIO() if stream is None else stream
+        with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            fn()
+        return err.getvalue()
+
+    def test_each_request_logs_what_it_is_its_prompt_and_its_reply(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["a", "b"]))
+        msgs = [{"role": "user", "content": "hi"}]
+
+        def run():
+            self.assertEqual(http_.post({"messages": msgs, "model": "m1", "max_tokens": 8})[0], 200)
+            more = msgs + [{"role": "assistant", "content": "ab"}, {"role": "user", "content": "more"}]
+            self.assertEqual(http_.post({"messages": more, "stream": True})[0], 200)
+            self.assertEqual(http_.post({"messages": msgs, "top_k": "x"})[0], 400)
+        lines = [ln.split(" ", 2)[2] for ln in self._log(run).splitlines() if ln.startswith("[mk-server] ")]
+        self.assertEqual(len(lines), 7, lines)
+        n = int(lines[0].split()[0][1:])
+        samp = "temp 1 top_p 0.95 top_k 20 min_p 0"
+        want = [rf"#{n} chat 'm1': \d+ tok, 1 message \| no thinking, max_tokens 8 \| {samp}",
+                rf"#{n} prompt: 0 cached \+ \d+ prefilled in [\d.]+ s \([\d,]+ tok/s\) \| nothing cached",
+                rf"#{n} reply: 3 tok in [\d.]+ s = [\d.]+ tok/s \| answer 2 \| 2.00 tok/cycle \| finish stop \| request [\d.]+ s",
+                rf"#{n + 1} chat stream: \d+ tok, 3 messages \| no thinking \| {samp}",
+                rf"#{n + 1} prompt: (\d+) cached \+ \d+ prefilled .* \| the prompt matches \1 of the \d+ cached tok: "
+                r"continued from there",
+                rf"#{n + 1} reply: 3 tok in .* \| finish stop \| request [\d.]+ s",
+                rf"#{n + 2} 400: temperature, top_p, top_k, min_p and seed must be numbers"]
+        for w, ln in zip(want, lines):
+            self.assertRegex(ln, "^" + w + "$")
+
+    def test_a_terminal_shows_a_live_status_line_and_it_is_gone_after_the_request(self) -> None:
+        class Eng(_ChunkedEngine):
+            def prefill_progress(self):
+                return self.chunks_run * 1000, self.n_chunks * 1000
+        eng = Eng(self.mk, list("abcdefghij"), n_chunks=6, chunk_s=0.1, delay=0.1)
+        srv, http_ = self.serve(eng)
+
+        def run():
+            self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}]})[0], 200)
+            t = time.time()
+            while srv.busy() and time.time() - t < 3:  # (the status line is cleared after the reply is sent)
+                time.sleep(0.01)
+        out = self._log(run, _Tty())
+        self.assertRegex(out, r"\r#\d+ prefill [1-5],000 / 6,000 tok \(\d+%\), [\d,]+ tok/s, ~[\d.]+ s left \| [\d.]+ s")
+        self.assertRegex(out, r"\r#\d+ decoding \d+ tok, [\d.]+ tok/s, 2.0 tok/cycle \| answer \d+ \| [\d.]+ s")
+        screen = _screen(out)
+        self.assertEqual(screen[-1], "", screen)  # (the status line is gone)
+        self.assertEqual([r.split()[2].startswith("#") for r in screen[:-1]], [True] * 3, screen)
+        self.assertTrue(all(r.startswith("[mk-server] ") for r in screen[:-1]), screen)
+
+
 if __name__ == "__main__":
     unittest.main()

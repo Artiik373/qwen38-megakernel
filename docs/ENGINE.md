@@ -401,6 +401,18 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   resets without one), with the draft vocabulary as it was, so the next request answers as on a server that never saw
   it. After a disconnect during decoding the engine keeps what it generated, as after a reply cut by `max_tokens`, so the
   next request reuses or rewinds it as usual.
+- Console (stderr): every log line is `[mk-server] HH:MM:SS ...`; a generation request is numbered (`#12`) and logs
+  three lines: what it asks for (route, stream, the `model` field, prompt tokens, messages, tools, images / videos,
+  thinking, max_tokens, the sampling used), its prompt (`N cached + M prefilled in s (prefill tok/s)` and how the cache
+  was used: continued, resumed at a checkpoint, or `CACHE MISS` with how much of the cached sequence the prompt
+  matched; images and their CPU encode time) and its reply (`tok in s = tok/s` over the decode, from the first token
+  to the end of the reply; the tokens of the thinking / answer / tool call; `tok/cycle` = tokens per engine cycle, 1
+  plus the accepted MTP drafts; the share of drafts accepted; finish reason; the whole request's time). A request that
+  waits for the engine, 4xx answers and disconnects are logged with the number too. On a terminal one status line under
+  the log lines is rewritten in place (a carriage return, no escape sequences) while a request runs: image encodes,
+  the prefill's progress from the engine (`mk_prefill_progress` / `MKEngine::prefill_progress`: host counters updated
+  per prefill chunk, no device sync), its rate and the time left, then the decode's tokens, tok/s and tok/cycle. Off a
+  terminal (a log file) only the log lines are written. A client resetting an idle keep-alive connection is not logged.
 - Images: see [Images](#images-vision); video: see [Video](#video).
 
 ## KV cache

@@ -33,6 +33,7 @@ import codecs
 import contextlib
 import ctypes
 import hashlib
+import itertools
 import json
 import os
 import random
@@ -73,8 +74,80 @@ LINGER_S, LINGER_IDLE_S, LINGER_BYTES = 30.0, 5.0, 1 << 30
 LIB_MK, LIB_VISION = ("qwen38mk.dll", "qwen38vision.dll") if os.name == "nt" else ("libqwen38mk.so", "libqwen38vision.so")
 
 
+class Console:
+    """stderr: log lines, and on a terminal one status line under them that is rewritten in place while a request runs
+    (a carriage return and spaces, no escape sequences: works in any console). A log line erases the status line and it
+    is drawn again below it. Off a terminal (a log file, a pipe) only the log lines are written."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.text = ""  # the status line ("": none)
+        self.shown = 0  # columns it occupies on the screen
+
+    @staticmethod
+    def tty():
+        try:
+            return sys.stderr.isatty()
+        except (AttributeError, ValueError):  # (no stderr, a closed one)
+            return False
+
+    def _erase(self, s):
+        if self.shown:
+            s.write("\r" + " " * self.shown + "\r")
+            self.shown = 0
+
+    def _draw(self, s):
+        if self.text:
+            # one row less than the width: a line that fills the row would wrap, and \r only returns to the last row
+            t = self.text[:max(shutil.get_terminal_size((120, 24)).columns - 1, 20)]
+            s.write("\r" + t + " " * max(self.shown - len(t), 0))
+            self.shown = max(self.shown, len(t))
+
+    def line(self, text):
+        with self.lock:
+            s = sys.stderr
+            if s is None:
+                return
+            live = self.tty()
+            if live:
+                self._erase(s)
+            s.write(text + "\n")
+            if live:
+                self._draw(s)
+            s.flush()
+
+    def status(self, text):
+        """sets the status line ("": removes it); nothing off a terminal"""
+        with self.lock:
+            s = sys.stderr
+            if s is None or text == self.text or not self.tty():
+                return
+            self.text = text
+            if not text:
+                self._erase(s)
+            else:
+                self._draw(s)
+            s.flush()
+
+
+CON = Console()
+
+
 def log(*a):
-    print("[mk-server]", *a, file=sys.stderr, flush=True)
+    CON.line(" ".join(["[mk-server]", time.strftime("%H:%M:%S"), *map(str, a)]))
+
+
+def secs(s):
+    """a duration for the console: 0.42 s, 7.3 s, 2 min 05 s"""
+    if s < 10:
+        return f"{s:.2f} s"
+    if s < 60:
+        return f"{s:.1f} s"
+    return f"{int(s // 60)} min {int(s % 60):02d} s"
+
+
+def plural(n, word):
+    return f"{n:,} {word}{'' if n == 1 else 's'}"
 
 
 class Engine:
@@ -153,6 +226,10 @@ class Engine:
         self._cancel = hasattr(L, "mk_cancel")
         if self._cancel:
             L.mk_cancel.restype, L.mk_cancel.argtypes = ctypes.c_int, [vp, ctypes.c_int]
+        # prefill progress for the console (libraries before it: elapsed time only)
+        self._progress = hasattr(L, "mk_prefill_progress")
+        if self._progress:
+            L.mk_prefill_progress.restype, L.mk_prefill_progress.argtypes = None, [vp, ip, ip]
         # decode statistics; the library's build (commit, engine flags; libraries before it: unknown)
         self._stats = hasattr(L, "mk_stats")
         if self._stats:
@@ -239,6 +316,15 @@ class Engine:
             done.set()
             th.join()
             self.L.mk_cancel(self.h, 0)
+
+    def prefill_progress(self):
+        """(done, total) positions of the running prefill's batched part, callable from any thread while it runs; None
+        for a library without mk_prefill_progress"""
+        if not self._progress:
+            return None
+        d, t = ctypes.c_int(), ctypes.c_int()
+        self.L.mk_prefill_progress(self.h, ctypes.byref(d), ctypes.byref(t))
+        return d.value, t.value
 
     def set_sampling(self, temp, top_p, top_k, min_p, seed):
         if self.L.mk_set_sampling(self.h, temp, top_p, top_k, min_p, seed) < 0:
@@ -1238,6 +1324,10 @@ class Server:
     img_spans = ()  # the images of the engine's sequence: (pos, n, key); replaced, never mutated
     stop_word = None  # the stop string that ended the last reply (None: it ended otherwise)
     last_prompt = (0, 0)  # the running request's prompt: (tokens, reused tokens), once it is processed
+    rids = itertools.count(1)  # request numbers for the console
+    rid = 0  # the running (or last) request's number: "#rid" on its console lines
+    req = ("chat", None, 0.0)  # its (route, model field, start time), set by the handler when it gets the engine
+    cache_note = ""  # how load_prompt matched the last prompt against the engine's sequence (the console's prompt line)
 
     def __init__(self, args):
         self.args = args
@@ -1547,6 +1637,45 @@ class Server:
             cks.update(k for k in range(start + 1, len(toks) - 1) if toks[k] == self.im_start)
         return sorted(cks)
 
+    @contextlib.contextmanager
+    def prefill_status(self, n_new):
+        """the console's status line during a prefill call: the engine's progress (mk_prefill_progress), its rate and the
+        time left, every 0.25 s from a watcher thread (nothing for a prefill shorter than that, or off a terminal)"""
+        if not CON.tty():
+            yield
+            return
+        stop, t0 = threading.Event(), time.monotonic()
+        prog = getattr(self.eng, "prefill_progress", None)
+
+        def show():
+            while not stop.wait(0.25):
+                CON.status(self.prefill_text(n_new, prog() if prog else None, time.monotonic() - t0))
+        th = threading.Thread(target=show, name="mk-status", daemon=True)
+        th.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            th.join()
+
+    def prefill_text(self, n_new, prog, el):
+        """prog: the engine's (done, total) of the batched part, or None (a library without it: elapsed time only)"""
+        if prog and prog[1] > 0:
+            done, total = prog
+            s = f"#{self.rid} prefill {done:,} / {total:,} tok ({100 * done // total}%)"
+            if done:
+                rate = done / max(el, 1e-9)
+                s += f", {rate:,.0f} tok/s, ~{secs((total - done) / rate)} left"
+            return f"{s} | {secs(el)}"
+        return f"#{self.rid} prefill {n_new:,} tok | {secs(el)}"
+
+    def decode_text(self, n_gen, phase, steps, stepped, el):
+        s = f"#{self.rid} decoding {n_gen:,} tok, {n_gen / max(el, 1e-9):.1f} tok/s"
+        if steps:
+            s += f", {stepped / steps:.1f} tok/cycle"
+        ph = ", ".join(f"{k} {v:,}" for k, v in phase.items() if v)
+        return s + (f" | {ph}" if ph else "") + f" | {secs(el)}"
+
     def load_prompt(self, toks, images=(), gone=None):
         """brings the engine to `toks` processed, reusing what it has; returns (first token, reused count).
         images: [(pos, Vision.Image)] of the prompt. gone (the client left: () -> bool) is watched during the prefill,
@@ -1559,6 +1688,7 @@ class Server:
                 break
             lcp += 1
         lcp = min(lcp, len(toks) - 1)  # at least one token is fed (it produces the next one)
+        match, img_cut = lcp, None
         # rewind checkpoint at the last <|im_start|> (the generation prompt): a follow-up turn re-renders this turn
         # from there (thinking mode: <think>\n\n</think> instead of <think>\n), so it must not sit at the prompt's end
         gen = -1
@@ -1571,7 +1701,8 @@ class Server:
         # that is not the same image at the same position in both
         spans = [(p, im.n, im.key) for p, im in images]
         for p, _, _ in set(spans) ^ set(self.img_spans):
-            lcp = min(lcp, p)
+            if p < lcp:
+                lcp, img_cut = p, p
 
         def feed(start):  # prefill toks[start:] with the images it overlaps (encoded now, each once: Vision's cache)
             fed = [(p, im) for p, im in images if p + im.n > start]
@@ -1579,6 +1710,7 @@ class Server:
                 # the CPU encodes leave the GPU idle (up to seconds): keep its clocks up until the prefill's first launch
                 eng.keep_warm()
             imgs, armed = [], time.monotonic()
+            todo, k = sum(1 for _, im in fed if im.encode_s is None), 0
             for p, im in fed:  # (a video's frame pairs encode for seconds to minutes: a client that left stops them)
                 if imgs and im.encode_s is None:
                     if gone is not None and gone():
@@ -1586,33 +1718,42 @@ class Server:
                     if time.monotonic() - armed > 30:  # (keep-warm re-armed through long encodes)
                         eng.keep_warm()
                         armed = time.monotonic()
+                if im.encode_s is None:
+                    k += 1
+                    CON.status(f"#{self.rid} encoding image {k} / {todo} on the CPU ({im.nx}x{im.ny} tok)")
                 imgs.append((p, im.nx, im.ny, im.rows()))
-            with eng.cancel_when(gone):
+            with eng.cancel_when(gone), self.prefill_status(len(toks) - start):
                 if imgs:
                     return eng.prefill(toks[start:], gen, self.ck_positions(toks, start), imgs), start
                 return eng.prefill(toks[start:], gen, self.ck_positions(toks, start)), start
 
         self.img_spans = []  # (until the prefill succeeds)
+        had = f"the prompt matches {match:,} of the {len(seq):,} cached tok" + (
+            f" (to the image at {img_cut:,}, which differs)" if img_cut is not None else "")
         # exact reuse (an MK_EXACT engine, --exact-reuse): never append to the sequence. Its last prompt row and the
         # reply were processed by the decode kernels, whose arithmetic differs from the batched prefill's; restoring
         # the last checkpoint at or before the divergence (all of them sit inside earlier batched prefills, on the
         # absolute 32-token scan grid) and prefilling from there computes what a prefill from 0 computes, bit for bit.
         if seq and lcp >= eng.committed() and not eng.exact:
             eng.truncate(lcp)
+            self.cache_note = f"{had}: continued from there"
             r = feed(lcp)
         else:
             # the last checkpoint at or before the divergence (one inside a kept image: the image is fed again)
             ck = max((p for p in eng.checkpoints() if 0 < p <= lcp), default=0)
             if ck and eng.rewind_to(ck):
+                self.cache_note = f"{had}: resumed at the checkpoint at {ck:,}"
                 r = feed(ck)
             else:
                 eng.reset()
+                self.cache_note = f"CACHE MISS: {had}, no checkpoint before that" if seq else "nothing cached"
                 r = feed(0)
         self.img_spans = spans
         return r
 
     def sampling(self, body):
-        """top_k: absent -> DEF_TOP_K; <= 0 ("off" for llama.cpp / OpenAI-style clients) -> TOPK_MAX, the engine's
+        """sets the request's sampling on the engine; returns it as text for the console.
+        top_k: absent -> DEF_TOP_K; <= 0 ("off" for llama.cpp / OpenAI-style clients) -> TOPK_MAX, the engine's
         maximum; above TOPK_MAX -> TOPK_MAX with a one-time warning"""
         try:
             temp = float(body["temperature"] if body.get("temperature") is not None else DEF_TEMP)
@@ -1643,8 +1784,15 @@ class Server:
             self.warn_once("rep", "repetition_penalty is not supported by the megakernel and is ignored")
         if temp <= 0:
             self.eng.set_sampling(0.0, 1.0, TOPK_MAX, 0.0, seed)
+            desc = "greedy"
         else:
             self.eng.set_sampling(temp, top_p, top_k, min_p, seed)
+            desc = f"temp {temp:g} top_p {top_p:g} top_k {top_k} min_p {min_p:g}"
+            if body.get("seed") is not None and int(body["seed"]) >= 0:
+                desc += f" seed {seed}"
+        if any(pen):
+            desc += f" presence {pen[0]:g} frequency {pen[1]:g}"
+        return desc
 
     def generate(self, body, emit, gone=lambda: False):
         """runs one chat completion; emit(kind, payload) is called with ('reasoning'|'content', text) deltas.
@@ -1652,22 +1800,24 @@ class Server:
         closed its connection; asked before the prefill, during it by a watcher thread (the prefill stops at its next
         chunk) and before each engine cycle) stops it with ClientGone."""
         check_params(body)
+        CON.status(f"#{self.rid} preparing the prompt (template, tokens, media)")
         text, thinking, media = self.render(body)
         toks, images = self.tokenize_prompt(text, media)
         try:
-            return self._generate(body, emit, gone, thinking, toks, images)
+            return self._generate(body, emit, gone, thinking, toks, images, media)
         finally:
             if images:  # (the request's images stay pinned until here)
                 self.vision.release([im for _, im in images])
             if getattr(self.eng, "stats", None) is not None:  # (/metrics: the engine's counters, read while it is idle)
                 self.stats1 = self.eng.stats()
 
-    def _generate(self, body, emit, gone, thinking, toks, images):
+    def _generate(self, body, emit, gone, thinking, toks, images, media=()):
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
         try:
             max_new = int(max_new)
         except (TypeError, ValueError, OverflowError):
             raise BadRequest("max_tokens must be an integer")
+        asked = max_new
         limit = self.args.ctx - len(toks) - 16
         if limit <= 0:
             raise BadRequest(f"prompt of {len(toks)} tokens does not fit the context of {self.args.ctx}")
@@ -1676,41 +1826,75 @@ class Server:
         tools = (body.get("tools") or []) if body.get("tool_choice") != "none" else []
         stopper = StopMatcher(stop_strings(body.get("stop")))
         self.stop_word = None
-        self.sampling(body)
+        samp = self.sampling(body)
+        rid = self.rid
+        route, model, t_req = self.req
+        n_vid = sum(1 for d in media if isinstance(d, VideoBytes))
+        what = [f"{len(toks):,} tok", plural(len(body.get("messages") or []), "message")]
+        if tools:
+            what.append(plural(len(tools), "tool"))
+        if len(media) > n_vid:
+            what.append(plural(len(media) - n_vid, "image"))
+        if n_vid:
+            what.append(plural(n_vid, "video"))
+        how = ["thinking" if thinking else "no thinking"] + ([f"max_tokens {asked:,}"] if asked > 0 else [])
+        log(f"#{rid} {route}{' stream' if body.get('stream') else ''}"
+            f"{f' {str(model)[:48]!r}' if isinstance(model, str) and model else ''}: "
+            f"{', '.join(what)} | {', '.join(how)} | {samp}")
         if gone():  # (it left while the request waited for the engine)
-            log("the client disconnected before its prompt was processed")
+            log(f"#{rid} the client disconnected before its prompt was processed")
             raise ClientGone()
+        CON.status(f"#{rid} prefill")
         t0 = time.time()
+        st0 = self.eng.stats() if getattr(self.eng, "stats", None) is not None else None
         enc0 = [im.encode_s for _, im in images]
         try:
             tok, reused = self.load_prompt(toks, images, gone)
         except PrefillCancelled as e:  # (the engine kept nothing of it)
-            log(f"prompt {len(toks)} tok: the client disconnected during its prefill, stopped after {time.time() - t0:.2f} s ({e})")
+            log(f"#{rid} the client disconnected during the prefill of {len(toks):,} tok: stopped after "
+                f"{secs(time.time() - t0)} ({e})")
             raise ClientGone()
         t1 = time.time()
         self.last_prompt = (len(toks), reused)  # (an Anthropic stream's message_start reports it)
         enc = [im.encode_s for (_, im), e in zip(images, enc0) if e is None and im.encode_s is not None]
+        n_new, enc_s = len(toks) - reused, sum(enc)
+        pf_s = max(t1 - t0 - enc_s, 1e-9)
+        line = (f"#{rid} prompt: {reused:,} cached + {n_new:,} prefilled in {secs(pf_s)} ({n_new / pf_s:,.0f} tok/s)"
+                f" | {self.cache_note}")
         if images:
-            log(f"images: {len(images)} ({', '.join(f'{im.nx}x{im.ny}' for _, im in images)} tokens), "
-                f"{len(enc)} encoded on the CPU in {sum(enc):.2f} s")
+            grids = sorted({f"{im.nx}x{im.ny}" for _, im in images})
+            line += (f" | images: {len(images)} ({', '.join(grids[:3])}{', ...' if len(grids) > 3 else ''} tok grids), "
+                     f"{len(enc)} encoded on the CPU in {secs(enc_s)}")
+        CON.status(f"#{rid} decoding")
+        log(line)
         parser = OutputParser(thinking, tools)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         n_gen, finish, pending, aborted, dropped = 0, "length", [tok], False, 0
+        phase = {"thinking": 0, "answer": 0, "tool call": 0}  # generated tokens by the part of the reply they are in
+        steps = stepped = 0  # engine cycles, the tokens they produced
+        live, shown = CON.tty(), time.monotonic()
         while n_gen < max_new and not aborted:
             if not pending:
                 if gone():  # once per engine cycle: a closed connection stops the GPU work here
                     aborted = True
                     break
                 pending = self.eng.step()
+                steps += 1
+                stepped += len(pending)
+                if live and time.monotonic() - shown >= 0.25:
+                    shown = time.monotonic()
+                    CON.status(self.decode_text(n_gen, phase, steps, stepped, time.time() - t1))
             t = pending.pop(0)
             n_gen += 1
             if self.eng.is_eog(t):
                 finish = "stop"
                 break
+            mode0 = parser.mode
             for kind, delta in parser.feed(stopper.feed(dec.decode(self.eng.piece(t)))):
                 if emit(kind, delta) is False:
                     aborted = True
                     break
+            phase["thinking" if mode0 == "reasoning" else "tool call" if parser.mode == "tools" else "answer"] += 1
             if stopper.word is not None:
                 # a stop string: the reply ends at it, and the tokens after this one (the rest of the cycle's accepted
                 # drafts) are dropped. The engine's sequence keeps them, as after max_tokens: the next request finds
@@ -1718,8 +1902,7 @@ class Server:
                 finish, dropped = "stop", len(pending)
                 break
         if aborted:  # (the engine's state is that of a reply cut by max_tokens: the next request reuses it as usual)
-            log(f"prompt {len(toks)} tok ({reused} reused), {n_gen} tok in {time.time() - t1:.2f} s: the client "
-                f"disconnected, stopped")
+            log(f"#{rid} the client disconnected after {n_gen:,} generated tok ({secs(time.time() - t1)}): stopped")
             raise ClientGone()
         for kind, delta in parser.feed(stopper.feed(dec.decode(b"", final=True), final=True), final=True):
             emit(kind, delta)
@@ -1734,9 +1917,22 @@ class Server:
         if calls and not (rest and finish == "length"):
             finish = "tool_calls"
         t2 = time.time()
-        log(f"prompt {len(toks)} tok ({reused} reused) in {t1 - t0:.2f} s, {n_gen} tok in {t2 - t1:.2f} s "
-            f"({n_gen / max(t2 - t1, 1e-9):.1f} tok/s), {finish}"
-            + (f" (stop string; {dropped} tokens of the cycle dropped)" if stopper.word is not None else ""))
+        dt = max(t2 - t1, 1e-9)
+        parts = [f"{n_gen:,} tok in {secs(dt)} = {n_gen / dt:.1f} tok/s"]
+        ph = ", ".join(f"{k} {v:,}" for k, v in phase.items() if v)
+        if ph:
+            parts.append(ph)
+        if steps:  # (MTP: each engine cycle verifies the drafts and keeps the accepted ones plus one token)
+            spec = f"{stepped / steps:.2f} tok/cycle"
+            st1 = self.eng.stats() if st0 is not None else None
+            if st1 and st1[1] > st0[1]:
+                spec += f", {100 * (st1[2] - st0[2]) / (st1[1] - st0[1]):.0f}% of {st1[1] - st0[1]:,} drafts accepted"
+            parts.append(spec)
+        parts.append(f"finish {finish}" + (f" ({plural(len(calls), 'call')})" if calls else "")
+                     + (f" (stop string; {dropped} tok of the cycle dropped)" if stopper.word is not None else ""))
+        if t_req:
+            parts.append(f"request {secs(t2 - t_req)}")
+        log(f"#{rid} reply: " + " | ".join(parts))
         self.count(prompt_tokens=len(toks) - reused, prompt_tokens_reused=reused, prompt_seconds=t1 - t0,
                    tokens_predicted=n_gen, predicted_seconds=t2 - t1)
         usage = {"prompt_tokens": len(toks), "completion_tokens": n_gen, "total_tokens": len(toks) + n_gen,
@@ -1805,6 +2001,7 @@ def make_handler(srv):
             """answers an unacceptable request body (_body_length) without reading it; True if it did"""
             refused = self._body_length()[1]
             if refused:
+                log(f"{self.command} {self.path.split('?')[0]} -> {refused[0]}: {refused[1]}")
                 self._json(refused[0], {"error": {"message": refused[1], "type": "invalid_request_error"}}, close=True)
             return bool(refused)
 
@@ -1841,7 +2038,7 @@ def make_handler(srv):
                 self._text(200, srv.metrics_text(), "text/plain; version=0.0.4",
                            [("Process-Start-Time-Unix", str(int(srv.t_start)))])
             else:
-                self._json(404, {"error": {"message": "not found", "type": "not_found_error"}})
+                self._error(404, "not found")
 
         def do_POST(self):
             path = self.path.split("?")[0]
@@ -1871,9 +2068,13 @@ def make_handler(srv):
                 except BadRequest as e:
                     self._error(400, str(e), anth)
                 return
+            rid = next(srv.rids)
+            if srv.busy():
+                log(f"#{rid} {route}: waiting for #{srv.rid} (the engine runs one request at a time)")
             srv.count(requests=1, deferred=1)  # (deferred: waiting for the engine)
             with srv.lock:
                 srv.count(deferred=-1)
+                srv.rid, srv.req = rid, (route, body.get("model"), time.time())
                 try:
                     if route == "messages":
                         self._anthropic(body)
@@ -1883,21 +2084,27 @@ def make_handler(srv):
                         self._complete(body)
                 except BadRequest as e:
                     srv.count(requests_bad=1)
-                    self._error(400, str(e), anth)
-                except (BrokenPipeError, ConnectionResetError, ClientGone):
+                    self._error(400, str(e), anth, rid)
+                except (BrokenPipeError, ConnectionResetError, ClientGone) as e:
                     srv.count(requests_cancelled=1)
                     self.close_connection = True
+                    if not isinstance(e, ClientGone):  # (generate reports the disconnects it notices itself)
+                        log(f"#{rid} the client disconnected ({type(e).__name__})")
                 except Exception as e:  # engine failure: report it, keep serving
                     srv.count(requests_failed=1)
-                    log("error:", repr(e))
+                    log(f"#{rid} error:", repr(e))
                     try:
                         self._error(500, str(e), anth)
                     except Exception:
                         pass
                 finally:
+                    CON.status("")
                     srv.eng.keep_warm()  # (MK_KEEP_WARM_S: the window restarts after every request)
 
-        def _error(self, code, message, anthropic=False):
+        def _error(self, code, message, anthropic=False, rid=None):
+            """answers with an error; a 4xx is also logged (a 5xx was logged with its exception)"""
+            if code < 500:
+                log(f"#{rid} {code}: {message}" if rid else f"{self.command} {self.path.split('?')[0]} -> {code}: {message}")
             if anthropic:
                 self._json(code, {"type": "error", "error": {"type": ANTHROPIC_ERRORS.get(code, "api_error"), "message": message}})
             else:
@@ -2038,8 +2245,7 @@ def make_handler(srv):
                 if not st["started"] or isinstance(e, (BrokenPipeError, ConnectionResetError, ClientGone)):
                     raise
                 bad = isinstance(e, BadRequest)
-                if not bad:
-                    log("error:", repr(e))
+                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
                 event("error", {"type": "error", "error": {"type": "invalid_request_error" if bad else "api_error",
                                                          "message": str(e)}}, last=True)
                 return
@@ -2113,8 +2319,7 @@ def make_handler(srv):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 # the status (200) and part of the reply are out: the error is the stream's last event, OpenAI style
                 bad = isinstance(e, BadRequest)
-                if not bad:
-                    log("error:", repr(e))
+                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
                 err = {"message": str(e), "type": "invalid_request_error" if bad else "server_error", "code": 400 if bad else 500}
                 send(b"data: " + json.dumps({"error": err}, ensure_ascii=False).encode() + b"\n\n")
                 send(b"data: [DONE]\n\n", last=True)
@@ -2186,6 +2391,13 @@ class HTTPServer(ThreadingHTTPServer):
     whole answer and the end of the stream), then drains what the client still sends (linger) before closing, so the
     client is not reset in the middle of its upload and gets the answer (the reason) instead of a connection error."""
     daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        """a client that resets its connection (an idle keep-alive one at the end of its session) is not an error; other
+        exceptions are reported as the base class does, on the console"""
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return
+        log(f"error on the connection from {client_address}:\n{traceback.format_exc().rstrip()}")
 
     def shutdown_request(self, request):
         try:
@@ -2299,6 +2511,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        CON.status("")
         if "srv" in box:
             box["srv"].eng.keep_warm(False)
         httpd.server_close()

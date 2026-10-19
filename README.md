@@ -209,6 +209,11 @@ After each request the engine keeps the GPU's clocks up for `MK_KEEP_WARM_S` sec
 one-thread kernel, so a reply after a pause starts at full speed (numbers above); the driver's power settings are left
 alone. It costs power while it runs: an RTX 3090 draws ~165 W instead of 30-35 W at idle.
 
+The console shows three lines per request (what it asks for, its prompt: cached / prefilled tokens and prefill speed,
+its reply: decode speed, thinking / answer / tool-call tokens, tokens per engine cycle, drafts accepted) and, in a
+terminal, a status line updated in place with the prefill's progress and time left or the decode's speed (see
+[docs/ENGINE.md](docs/ENGINE.md#server)).
+
 ```sh
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "messages": [{"role": "user", "content": "Write quicksort in C."}], "max_tokens": 512}'
