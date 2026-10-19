@@ -115,6 +115,46 @@ class MKEngine {
     // false: no MTP layer (see the constructor's mtp): depth 0 only
     bool has_mtp() const;
 
+    // ---- conversation state in host memory: side requests and parked conversations ----
+    // Host store: pinned host memory in chunks of MK_STORE_CHUNK_MIB (default 32) MiB, allocated on first use and then kept
+    // for reuse (pinned allocation runs at ~1 GB/s under WSL2), at most `bytes` in all; 0 (the default) disables
+    // side_begin and park. A lower budget frees the unused chunks above it.
+    void store_budget(size_t bytes);
+    // allocates chunks now (within the budget) until `bytes` are free, so the next copies need not allocate
+    void store_reserve(size_t bytes);
+    struct StoreInfo {
+        size_t budget, allocated, used; // bytes: the budget, chunks allocated, chunks holding entries / a side request's rows
+        int parked;                     // parked conversations
+        double last_ms;                 // the last side_end / park / unpark: wall time, bytes copied
+        size_t last_bytes;
+        double side_ms; // the running (or last) side request: time spent copying the kept sequence's rows out
+    };
+    StoreInfo store_info() const;
+    // bytes per token of the KV cache (every slot, K and V), of the MK_KV_WIN rings, of the recurrent state (DeltaNet /
+    // conv / h ring), of one checkpoint (with its window rings under MK_EXACT)
+    void kv_sizes(size_t * per_token, size_t * rings, size_t * state, size_t * checkpoint) const;
+    // Side request (a short unrelated prompt without losing the cached sequence): side_begin() keeps the current
+    // sequence aside (its recurrent state is copied to the host store now; its KV rows and window-ring rows only when a
+    // launch of the side request is about to overwrite them, 1024 rows at a time) and leaves the engine as reset() does,
+    // with its checkpoints hidden and no new ones saved. side_end() copies everything back: the kept sequence is then
+    // bit for bit as before side_begin (returns 1), or, if the store ran out of room during the side request, the engine
+    // is reset (0: the kept sequence is lost, the next prompt is prefilled in full). side_drop(): discard it (reset).
+    // false from side_begin: no room in the store (nothing changed).
+    bool side_begin();
+    int side_end();
+    void side_drop();
+    bool side_active() const;
+    // Parked conversations: park() copies the whole sequence state (KV rows, window rings, recurrent state, the sequence,
+    // image spans, draft vocabulary, and the newest max_checkpoints checkpoints) into a new store entry and returns its id
+    // (> 0); the engine itself is unchanged. 0: the sequence is empty; -1: no room in the store. unpark(id): the engine
+    // becomes that conversation bit for bit (its current sequence is discarded) and the entry is freed; false: no such
+    // entry. park_need: the bytes park() would take now.
+    int park(int max_checkpoints);
+    bool unpark(int id);
+    bool park_drop(int id);
+    size_t park_need(int max_checkpoints) const;
+    size_t park_bytes(int id) const;
+
     // Draft depth for the following prefills and steps, 0 .. the n_draft given at construction (CLI batch mode: an engine
     // built for the deepest job runs each job at its own depth; the same launches as an engine built for that depth).
     // Without an MTP layer any depth becomes 0 (a notice, not an error).

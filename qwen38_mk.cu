@@ -6026,6 +6026,7 @@ struct MKEngine::Impl {
     // to its distance from the end E: (next - prev) / (E - prev). Old checkpoints thin out geometrically, recent ones
     // stay dense. Returns the slot of each new position (-1: dropped); evicted slots become free.
     std::vector<int> ck_assign(const std::vector<int> & want, int keep, int E) {
+        if (ck_frozen) return std::vector<int>(want.size(), -1); // (side request: the pool belongs to the kept sequence)
         struct C { int pos, slot, wi; }; // slot >= 0: existing checkpoint; wi >= 0: new (index into want)
         std::vector<C> c;
         for (int i = 0; i < (int) ck.size(); i++)
@@ -7619,6 +7620,10 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] teardown: %s\n", e.what());
         }
         ck_free(); // (checkpoint copies may still read or write device buffers)
+        for (auto & p : parked)
+            for (char * c : p.second.blob.chunks) cudaFreeHost(c);
+        for (char * c : sw_blob.chunks) cudaFreeHost(c);
+        for (char * c : hs_free) cudaFreeHost(c);
         if (pf_s2) { // (stock2 K8a)
             cudaStreamSynchronize(pf_s2);
             cudaStreamDestroy(pf_s2);
@@ -7650,6 +7655,7 @@ struct MKEngine::Impl {
     }
 
     void launch(int mode, int T, int last, int score = 0) {
+        sw_need(hctl.n + T + ndraft); // (side request: the kept sequence's rows there go to the host store first)
         kv_top = std::max(kv_top, hctl.n + T + ndraft); // rows hctl.n .. + T - 1, the MTP's draft rows after them (ring_rewind)
         Launch L{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed};
         for (int k = 0; k < MAXT - 1; k++) {
@@ -8478,6 +8484,7 @@ struct MKEngine::Impl {
                 int first = 0, const std::vector<Snap> * snaps = nullptr, const int * erow = nullptr) {
         pf_init();
         const int kv_top0 = kv_top;
+        sw_need(n0 + (int) toks.size()); // (side request)
         kv_top = std::max(kv_top, n0 + (int) toks.size()); // (ring_rewind)
         pf_cancelled = false;
         ck_scr_guard(); // the scratch may still be the source of an end save's copy
@@ -9097,6 +9104,7 @@ struct MKEngine::Impl {
                 });
             for (auto & t : th) t.join();
         }
+        sw_need(hend); // (side request)
         for (const auto & r : R) {
             CK(cudaMemcpy(r.first, b + pos, r.second, cudaMemcpyHostToDevice));
             pos += r.second;
@@ -9115,6 +9123,265 @@ struct MKEngine::Impl {
                 path.c_str(), tot / 1e9, hend, st_s, wms / 1000.0);
         return true;
     }
+    // ---- conversation state in host memory (MKEngine::side_begin / park) ----
+    // Host store: pinned host chunks of hs_chunk bytes (MK_STORE_CHUNK_MIB, default 32), allocated on first use and kept in
+    // a free list (cudaHostAlloc runs at ~1 GB/s under WSL2, a first touch of pageable memory about as slow: a chunk is
+    // paid for once), at most hs_budget bytes (MKEngine::store_budget; 0: no store). A Blob lays items (bytes of device or
+    // host memory) end to end over its chunks; blob_get copies each item back to where it came from.
+    size_t hs_chunk = (size_t) (getenv("MK_STORE_CHUNK_MIB") ? std::max(1, atoi(getenv("MK_STORE_CHUNK_MIB"))) : 32) << 20;
+    size_t hs_budget = 0, hs_alloc = 0;
+    std::vector<char *> hs_free;
+    double hs_ms = 0;      // the last side / park operation: wall time
+    size_t hs_bytes = 0;   // ... bytes it copied
+    struct Blob {
+        struct Item {
+            char * at; // device memory (async copies on stream 0), or host memory (memcpy)
+            size_t n;
+            bool host;
+        };
+        std::vector<char *> chunks;
+        std::vector<Item> items;
+        size_t used = 0;
+    };
+    char * hs_take() { // a chunk: from the free list, else a new one within the budget (nullptr: none)
+        if (!hs_free.empty()) {
+            char * c = hs_free.back();
+            hs_free.pop_back();
+            return c;
+        }
+        return hs_new();
+    }
+    char * hs_new() {
+        if (hs_alloc + hs_chunk > hs_budget) return nullptr;
+        char * c = nullptr;
+        if (cudaHostAlloc(reinterpret_cast<void **>(&c), hs_chunk, cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
+        hs_alloc += hs_chunk;
+        return c;
+    }
+    void hs_release(Blob & b) {
+        for (char * c : b.chunks) hs_free.push_back(c);
+        b = Blob();
+        hs_trim();
+    }
+    void hs_trim() { // (free chunks above the budget: after a budget cut)
+        while (hs_alloc > hs_budget && !hs_free.empty()) {
+            cudaFreeHost(hs_free.back());
+            hs_free.pop_back();
+            hs_alloc -= hs_chunk;
+        }
+    }
+    // appends n bytes at src (device memory: a device-to-host copy on stream 0, which the caller waits for; host memory:
+    // memcpy now) to b; false: the store is full (b then holds a partial item: the caller releases it)
+    bool blob_put(Blob & b, const void * src, size_t n, bool host) {
+        const char * s = static_cast<const char *>(src);
+        b.items.push_back({const_cast<char *>(s), n, host});
+        for (size_t done = 0; done < n;) {
+            const size_t ci = b.used / hs_chunk, off = b.used % hs_chunk;
+            if (ci == b.chunks.size()) {
+                char * c = hs_take();
+                if (!c) return false;
+                b.chunks.push_back(c);
+            }
+            const size_t k = std::min(n - done, hs_chunk - off);
+            if (host) memcpy(b.chunks[ci] + off, s + done, k);
+            else CK(cudaMemcpyAsync(b.chunks[ci] + off, s + done, k, cudaMemcpyDeviceToHost, 0));
+            done += k;
+            b.used += k;
+        }
+        return true;
+    }
+    // copies every item of b back (device items first, as host-to-device copies on stream 0 that the caller waits for, so
+    // that the host items' memcpy runs meanwhile)
+    void blob_get(const Blob & b) {
+        for (int pass = 0; pass < 2; pass++) {
+            size_t pos = 0;
+            for (const auto & it : b.items) {
+                if (it.host == (pass == 0)) {
+                    pos += it.n;
+                    continue;
+                }
+                for (size_t done = 0; done < it.n;) {
+                    const size_t ci = pos / hs_chunk, off = pos % hs_chunk, k = std::min(it.n - done, hs_chunk - off);
+                    if (it.host) memcpy(it.at + done, b.chunks[ci] + off, k);
+                    else CK(cudaMemcpyAsync(it.at + done, b.chunks[ci] + off, k, cudaMemcpyHostToDevice, 0));
+                    done += k;
+                    pos += k;
+                }
+            }
+        }
+    }
+    // the sequence's KV rows a .. b - 1 of every slot (values + scales, or fp16), K and V, each kv head
+    bool kv_put(Blob & bl, int a, int b) {
+        if (b <= a) return true;
+        const size_t cx = (size_t) hb.ctx, n = (size_t) (b - a);
+        for (int s = 0; s < kv_slots; s++)
+            for (int w = 0; w < 2; w++)
+                for (int g = 0; g < NKV; g++) {
+                    if (hb.kvq8) {
+                        const size_t rb = (size_t) HD * hb.kvb[w][s] / 8;
+                        if (!blob_put(bl, reinterpret_cast<char *>(hb.kvp[w][s]) + ((size_t) g * cx + a) * rb, n * rb, false) ||
+                            !blob_put(bl, hb.kvs[w][s] + ((size_t) g * cx + a) * (HD / 32), n * (HD / 32) * sizeof(__half), false))
+                            return false;
+                    } else {
+                        __half * r = static_cast<__half *>(w ? hb.vc : hb.kc) + (((size_t) s * NKV + g) * cx + a) * HD;
+                        if (!blob_put(bl, r, n * HD * sizeof(__half), false)) return false;
+                    }
+                }
+        return true;
+    }
+    // ring slots a .. b - 1 (of kvrc) of every MK_KV_WIN ring side, each kv head
+    bool ring_put(Blob & bl, int a, int b) {
+        if (hb.kvwin <= 0 || b <= a) return true;
+        const size_t rc = hb.kvrc, n = (size_t) (b - a);
+        for (int s = 0; s < kv_slots; s++)
+            for (int w = 0; w < 2; w++)
+                if (hb.kvrp[w][s])
+                    for (int g = 0; g < NKV; g++)
+                        if (!blob_put(bl, hb.kvrp[w][s] + ((size_t) g * rc + a) * HD, n * HD, false) ||
+                            !blob_put(bl, hb.kvrs[w][s] + ((size_t) g * rc + a) * (HD / 32), n * (HD / 32) * sizeof(__half), false))
+                            return false;
+        return true;
+    }
+    // the recurrent state: DeltaNet states, conv rings, h ring (what a checkpoint holds; kvgb is not needed: the next
+    // prefill refeeds every position from dn_c on)
+    bool live_put(Blob & bl) {
+        return blob_put(bl, hb.dstate, CK_NS * 4, false) && blob_put(bl, hb.conv, CK_NC * 4, false) &&
+               blob_put(bl, hb.h_hist, CK_NH * 4, false);
+    }
+    size_t kv_token_bytes() const {
+        size_t t = 0;
+        for (int s = 0; s < kv_slots; s++)
+            for (int w = 0; w < 2; w++) t += NKV * (hb.kvq8 ? (size_t) HD * hb.kvb[w][s] / 8 + (HD / 32) * sizeof(__half) : HD * sizeof(__half));
+        return t;
+    }
+    size_t ring_bytes() const {
+        size_t t = 0;
+        if (hb.kvwin > 0)
+            for (int s = 0; s < kv_slots; s++)
+                for (int w = 0; w < 2; w++)
+                    if (hb.kvrp[w][s]) t += ring_vb() + ring_sb();
+        return t;
+    }
+    // the host side of a sequence: everything a continuation reads besides the device state above
+    struct Book {
+        std::vector<int> seq, dv;
+        Ctl ctl{};
+        std::vector<Span> spans;
+        int kv_top = 0, nd_avail = 0, ndraft = 0, last_acc = 0, demoted = 0;
+        bool all_acc = true;
+    };
+    Book book_get() const {
+        Book k;
+        k.seq = seq;
+        k.dv = dv_ids;
+        k.ctl = hctl;
+        k.spans = spans;
+        k.kv_top = kv_top;
+        k.nd_avail = nd_avail;
+        k.ndraft = ndraft;
+        k.last_acc = last_acc;
+        k.demoted = demoted;
+        k.all_acc = all_acc;
+        return k;
+    }
+    void book_set(const Book & k) {
+        seq = k.seq;
+        dv_set(k.dv);
+        hctl = k.ctl;
+        CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
+        spans = k.spans;
+        rope_sync();
+        kv_top = k.kv_top;
+        nd_avail = k.nd_avail;
+        ndraft = k.ndraft;
+        last_acc = k.last_acc;
+        demoted = k.demoted;
+        all_acc = k.all_acc;
+    }
+    // the draft vocabulary as `ids` (a dv_ids saved by book_get: the base list, then the sequence's additions in order)
+    void dv_set(const std::vector<int> & ids) {
+        if (dv_in.empty()) return;
+        dv_truncate(dv_base);
+        for (size_t i = dv_base; i < ids.size(); i++) {
+            dv_in[ids[i]] = 1;
+            dv_ids.push_back(ids[i]);
+        }
+        const int k = (int) dv_ids.size() - dv_base;
+        if (k > 0) CK(cudaMemcpy(const_cast<int *>(hw.draft_ids) + dv_base, dv_ids.data() + dv_base, k * 4, cudaMemcpyHostToDevice));
+        hw.head_d.N = (int) dv_ids.size();
+        CK(cudaMemcpyToSymbol(cW, &hw.head_d.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
+    }
+    // no copy of a checkpoint save or restore in flight, nothing on the device still reading or writing the state
+    void hs_quiesce() {
+        ck_wait_restore();
+        ring_snap_guard();
+        ck_guard_state();
+        CK(cudaDeviceSynchronize());
+        for (auto & k : ck) k.pending = false;
+        ck_scr_busy = false;
+        ck_rs_src = -1;
+    }
+    // Side request (MKEngine::side_begin): the kept sequence's rows main_top = sw_top and its window ring; sw_hi rows and
+    // sw_rhi ring slots are in sw_blob. Every launch / prefill that writes rows < X calls sw_need(X) first.
+    static constexpr int SW_BLK = 1024; // rows per copy-out step
+    bool sw_on = false, sw_broken = false, ck_frozen = false;
+    int sw_top = 0, sw_hi = 0, sw_rhi = 0;
+    Blob sw_blob;
+    Book sw_book;
+    std::vector<int> sw_ckpos;
+    double sw_ms_out = 0;
+    void sw_need(int X) {
+        if (!sw_on || sw_broken) return;
+        const int up = (X + MAXT + SW_BLK - 1) / SW_BLK * SW_BLK;
+        const int want = std::max(sw_hi, std::min(sw_top, up)), rwant = hb.kvwin > 0 ? std::max(sw_rhi, std::min(hb.kvrc, up)) : 0;
+        if (want <= sw_hi && rwant <= sw_rhi) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        CK(cudaDeviceSynchronize()); // (nothing still writing those rows; the copies then run before the next kernel)
+        const size_t u0 = sw_blob.used;
+        const bool ok = kv_put(sw_blob, sw_hi, want) && ring_put(sw_blob, sw_rhi, rwant);
+        wait_device("side request copies", std::max(wd_limit, 120.0));
+        sw_hi = want;
+        sw_rhi = rwant;
+        sw_ms_out += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!ok) {
+            sw_broken = true;
+            fprintf(stderr, "[mk] side request: the host store is full at row %d: the kept sequence is dropped (a full prefill when it comes back)\n", X);
+        } else if (memlog) {
+            fprintf(stderr, "[mk-mem] side request: kept rows < %d, ring slots < %d (+%.1f MB)\n", sw_hi, sw_rhi, (sw_blob.used - u0) / 1e6);
+        }
+    }
+    // Parked conversations (MKEngine::park): a snapshot of everything above, plus up to max_cks of the newest checkpoints
+    struct Parked {
+        Blob blob;
+        Book book;
+        struct Ck {
+            int slot, pos;
+            Ctl ctl;
+            bool ring_ok;
+        };
+        std::vector<Ck> cks;
+    };
+    std::map<int, Parked> parked;
+    int park_next = 1;
+    size_t hs_used() const { // bytes of the store in use (parked entries, the side request's copies)
+        size_t n = sw_blob.chunks.size();
+        for (const auto & p : parked) n += p.second.blob.chunks.size();
+        return n * hs_chunk;
+    }
+    int seq_top() const { return std::max({kv_top, (int) seq.size(), hctl.dn_c}); }
+    std::vector<int> park_cks(int max_cks) const { // slots of the newest checkpoints, newest first
+        std::vector<int> v;
+        for (int i = 0; i < (int) ck.size(); i++)
+            if (ck[i].pos >= 0) v.push_back(i);
+        std::sort(v.begin(), v.end(), [&](int a, int b) { return ck[a].pos > ck[b].pos; });
+        if ((int) v.size() > std::max(0, max_cks)) v.resize(std::max(0, max_cks));
+        return v;
+    }
+    size_t ck_block_bytes() const { return (CK_NS + CK_NC + CK_NH) * 4; }
+
     void reset() {
         ck_rs_slot = -1;   // (a restore not issued yet is moot)
         ck_wait_restore(); // (an issued one still writes the state)
@@ -9526,6 +9793,184 @@ void MKEngine::truncate(int len) {
     p_->ring_rewind(len); // MK_KV_WIN: the dropped positions' ring slots held window rows
     seq.resize(len);
     p_->spans_cut(len);
+}
+
+// ---- conversation state in host memory: side requests (TODO #15), parked conversations (#9); Impl "host store" ----
+static double ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void MKEngine::store_budget(size_t bytes) {
+    p_->hs_budget = bytes;
+    p_->hs_trim();
+}
+
+void MKEngine::store_reserve(size_t bytes) {
+    Impl & I = *p_;
+    while (I.hs_free.size() * I.hs_chunk < bytes) {
+        char * c = I.hs_new();
+        if (!c) break;
+        I.hs_free.push_back(c);
+    }
+}
+
+MKEngine::StoreInfo MKEngine::store_info() const {
+    StoreInfo s;
+    s.budget = p_->hs_budget;
+    s.allocated = p_->hs_alloc;
+    s.used = p_->hs_used();
+    s.parked = (int) p_->parked.size();
+    s.last_ms = p_->hs_ms;
+    s.last_bytes = p_->hs_bytes;
+    s.side_ms = p_->sw_ms_out;
+    return s;
+}
+
+void MKEngine::kv_sizes(size_t * per_token, size_t * rings, size_t * state, size_t * checkpoint) const {
+    *per_token = p_->kv_token_bytes();
+    *rings = p_->ring_bytes();
+    *state = p_->ck_block_bytes();
+    *checkpoint = p_->ck_block_bytes() + p_->ring_bytes_ck;
+}
+
+bool MKEngine::side_begin() {
+    Impl & I = *p_;
+    if (I.sw_on) throw std::runtime_error("side_begin: a side request is already running");
+    const auto t0 = std::chrono::steady_clock::now();
+    I.hs_quiesce();
+    I.sw_book = I.book_get();
+    I.sw_ckpos.clear();
+    for (const auto & k : I.ck) I.sw_ckpos.push_back(k.pos);
+    I.sw_top = I.seq_top();
+    I.sw_hi = I.sw_rhi = 0;
+    I.sw_broken = false;
+    I.sw_on = true; // (from here a CUDA error drops the kept sequence: the C API calls side_drop)
+    const bool ok = I.live_put(I.sw_blob);
+    I.wait_device("side request copies", std::max(I.wd_limit, 120.0));
+    if (!ok) { // (the store is full: nothing changed)
+        I.sw_on = false;
+        I.hs_release(I.sw_blob);
+        return false;
+    }
+    for (auto & k : I.ck) k.pos = -1;
+    I.ck_frozen = true;
+    reset();
+    I.sw_ms_out = ms_since(t0);
+    return true;
+}
+
+int MKEngine::side_end() {
+    Impl & I = *p_;
+    if (!I.sw_on) throw std::runtime_error("side_end: no side request is running");
+    const auto t0 = std::chrono::steady_clock::now();
+    I.hs_quiesce();
+    if (I.sw_broken) {
+        side_drop();
+        return 0;
+    }
+    I.blob_get(I.sw_blob);
+    I.wait_device("side request copies", std::max(I.wd_limit, 120.0));
+    I.book_set(I.sw_book);
+    for (size_t k = 0; k < I.ck.size(); k++) I.ck[k].pos = I.sw_ckpos[k];
+    I.ck_frozen = false;
+    I.sw_on = false;
+    I.hs_bytes = I.sw_blob.used;
+    I.hs_release(I.sw_blob);
+    I.hs_ms = ms_since(t0);
+    return 1;
+}
+
+void MKEngine::side_drop() {
+    Impl & I = *p_;
+    if (!I.sw_on) return;
+    I.sw_on = false;
+    I.ck_frozen = false;
+    I.hs_release(I.sw_blob);
+    reset();
+}
+
+bool MKEngine::side_active() const { return p_->sw_on; }
+
+int MKEngine::park(int max_checkpoints) {
+    Impl & I = *p_;
+    if (I.sw_on) throw std::runtime_error("park: a side request is running");
+    if (I.seq.empty()) return 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    I.hs_quiesce();
+    Impl::Parked e;
+    struct Rel { // (the entry's chunks go back unless it is kept, also on an exception)
+        Impl & I;
+        Impl::Blob & b;
+        bool keep = false;
+        ~Rel() {
+            if (!keep) I.hs_release(b);
+        }
+    } rel{I, e.blob};
+    e.book = I.book_get();
+    // device state first (copies on stream 0), then the checkpoint blocks (pinned host: memcpy while those run)
+    bool ok = I.kv_put(e.blob, 0, I.seq_top()) && I.ring_put(e.blob, 0, I.hb.kvwin > 0 ? I.hb.kvrc : 0) && I.live_put(e.blob);
+    for (int si : I.park_cks(max_checkpoints)) {
+        if (!ok) break;
+        const Impl::CkSlot & s = I.ck[si];
+        ok = I.blob_put(e.blob, s.mem, I.ck_block_bytes(), !I.ck_dev) && (!s.ring_ok || I.blob_put(e.blob, s.ring, I.ring_bytes_ck, true));
+        e.cks.push_back({si, s.pos, s.ctl, s.ring_ok});
+    }
+    I.wait_device("park copies", std::max(I.wd_limit, 120.0));
+    if (!ok) return -1;
+    const int id = I.park_next++;
+    I.hs_bytes = e.blob.used;
+    I.hs_ms = ms_since(t0);
+    rel.keep = true;
+    I.parked.emplace(id, std::move(e));
+    return id;
+}
+
+bool MKEngine::unpark(int id) {
+    Impl & I = *p_;
+    if (I.sw_on) throw std::runtime_error("unpark: a side request is running");
+    auto it = I.parked.find(id);
+    if (it == I.parked.end()) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    reset(); // (the live sequence and its checkpoints go)
+    I.hs_quiesce();
+    Impl::Parked & e = it->second;
+    I.blob_get(e.blob);
+    I.wait_device("unpark copies", std::max(I.wd_limit, 120.0));
+    I.book_set(e.book);
+    for (const auto & c : e.cks) {
+        Impl::CkSlot & s = I.ck[c.slot];
+        s.pos = c.pos;
+        s.ctl = c.ctl;
+        s.ring_ok = c.ring_ok;
+        s.pending = false;
+    }
+    I.hs_bytes = e.blob.used;
+    I.hs_ms = ms_since(t0);
+    I.hs_release(e.blob);
+    I.parked.erase(it);
+    return true;
+}
+
+bool MKEngine::park_drop(int id) {
+    Impl & I = *p_;
+    auto it = I.parked.find(id);
+    if (it == I.parked.end()) return false;
+    I.hs_release(it->second.blob);
+    I.parked.erase(it);
+    return true;
+}
+
+size_t MKEngine::park_need(int max_checkpoints) const {
+    const Impl & I = *p_;
+    if (I.seq.empty()) return 0;
+    size_t n = I.kv_token_bytes() * (size_t) I.seq_top() + I.ring_bytes() + I.ck_block_bytes();
+    for (int si : I.park_cks(max_checkpoints)) n += I.ck_block_bytes() + (I.ck[si].ring_ok ? I.ring_bytes_ck : 0);
+    return (n + I.hs_chunk - 1) / I.hs_chunk * I.hs_chunk;
+}
+
+size_t MKEngine::park_bytes(int id) const {
+    auto it = p_->parked.find(id);
+    return it == p_->parked.end() ? 0 : it->second.blob.chunks.size() * p_->hs_chunk;
 }
 
 std::vector<int> MKEngine::score(const std::vector<int> & tokens) {

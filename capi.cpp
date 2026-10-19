@@ -210,7 +210,8 @@ template <class F> int guarded(void * hp, F f) {
     } catch (const MKCudaError & e) {
         g_err = e.what();
         try {
-            h->eng->reset();
+            if (h->eng->side_active()) h->eng->side_drop(); // (a side request's kept sequence goes too: never restored over an undefined state)
+            else h->eng->reset();
         } catch (const std::exception & e2) {
             g_err += std::string(" (reset after it failed too: ") + e2.what() + ")";
         }
@@ -446,6 +447,81 @@ int mk_state_digest(void * hp, unsigned long long * out, int cap) {
         return (int) v.size();
     });
 }
+
+// ---- conversation state in host memory (MKEngine::store_budget, side_begin, park; see qwen38_mk.h) ----
+// host store budget in bytes (0: off; the default); returns 0
+int mk_store_budget(void * hp, long long bytes) {
+    return guarded(hp, [&](MKEngine * e) {
+        e->store_budget((size_t) std::max(bytes, 0LL));
+        return 0;
+    });
+}
+// allocates host-store chunks now until `bytes` are free (within the budget); returns 0
+int mk_store_reserve(void * hp, long long bytes) {
+    return guarded(hp, [&](MKEngine * e) {
+        e->store_reserve((size_t) std::max(bytes, 0LL));
+        return 0;
+    });
+}
+// out[0..7]: budget, allocated, used bytes, parked entries, the last side_end / park / unpark's bytes and microseconds,
+// the side request's copy-out microseconds, bytes per KV token; returns the count written (up to cap)
+int mk_store_info(void * hp, long long * out, int cap) {
+    const MKEngine * e = static_cast<Handle *>(hp)->eng;
+    const MKEngine::StoreInfo s = e->store_info();
+    size_t pt, rings, state, ck;
+    e->kv_sizes(&pt, &rings, &state, &ck);
+    const long long v[] = {(long long) s.budget, (long long) s.allocated, (long long) s.used, s.parked, (long long) s.last_bytes,
+                           (long long) (s.last_ms * 1000.0), (long long) (s.side_ms * 1000.0), (long long) pt};
+    const int n = std::min(cap, (int) (sizeof v / sizeof v[0]));
+    for (int i = 0; i < n; i++) out[i] = v[i];
+    return n;
+}
+// bytes: per KV token, the window rings, the recurrent state, one checkpoint (MKEngine::kv_sizes)
+void mk_kv_sizes(void * hp, long long * per_token, long long * rings, long long * state, long long * checkpoint) {
+    size_t a, b, c, d;
+    static_cast<Handle *>(hp)->eng->kv_sizes(&a, &b, &c, &d);
+    *per_token = (long long) a;
+    *rings = (long long) b;
+    *state = (long long) c;
+    *checkpoint = (long long) d;
+}
+// side request: 0 started, 1 no room in the host store (nothing changed), -1 error
+int mk_side_begin(void * hp) {
+    return guarded(hp, [](MKEngine * e) { return e->side_begin() ? 0 : 1; });
+}
+// 1 the kept sequence is back, 0 it was dropped (the store ran full; the engine is reset), -1 error (dropped too)
+int mk_side_end(void * hp) {
+    return guarded(hp, [](MKEngine * e) { return e->side_end(); });
+}
+int mk_side_drop(void * hp) {
+    return guarded(hp, [](MKEngine * e) {
+        e->side_drop();
+        return 0;
+    });
+}
+int mk_side_active(void * hp) { return static_cast<Handle *>(hp)->eng->side_active() ? 1 : 0; }
+// parks a snapshot of the sequence: its id (> 0), 0 (empty sequence), -3 (no room in the store), -1 error
+int mk_park(void * hp, int max_checkpoints) {
+    return guarded(hp, [&](MKEngine * e) {
+        const int id = e->park(max_checkpoints);
+        return id < 0 ? -3 : id;
+    });
+}
+// the engine becomes parked conversation id (entry freed): 0, or -1 (no such entry / error)
+int mk_unpark(void * hp, int id) {
+    return guarded(hp, [&](MKEngine * e) {
+        if (e->unpark(id)) return 0;
+        g_err = "no parked conversation " + std::to_string(id);
+        return -1;
+    });
+}
+int mk_park_drop(void * hp, int id) {
+    return guarded(hp, [&](MKEngine * e) { return e->park_drop(id) ? 0 : -1; });
+}
+long long mk_park_need(void * hp, int max_checkpoints) {
+    return (long long) static_cast<Handle *>(hp)->eng->park_need(max_checkpoints);
+}
+long long mk_park_bytes(void * hp, int id) { return (long long) static_cast<Handle *>(hp)->eng->park_bytes(id); }
 
 // keep-warm (MK_KEEP_WARM_S): on 1 (re)starts the window now (the server: once ready and after every request), 0 stops
 // the load now. Returns the window in seconds (0: off).
