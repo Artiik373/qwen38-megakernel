@@ -1364,7 +1364,6 @@ class Server:
         self.warned = set()
         vis = (f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.backend}, {self.vision.n_threads} threads)"
                if self.vision else "")
-        self.stats0 = self.eng.stats()  # (the warm-up's cycle: /metrics counts from here)
         self.t_start = time.time()
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts{vis}")
         self.warm_s = self.eng.keep_warm()  # (MK_KEEP_WARM_S: the first reply starts at full clocks too)
@@ -1417,11 +1416,11 @@ class Server:
 
     # ---- reporting: /props, /v1/models, /slots, /metrics ----
     METRICS = ("requests", "requests_bad", "requests_failed", "requests_cancelled", "deferred", "prompt_tokens",
-               "prompt_tokens_reused", "prompt_seconds", "tokens_predicted", "predicted_seconds")
+               "prompt_tokens_reused", "prompt_seconds", "tokens_predicted", "predicted_seconds", "decode_cycles",
+               "draft_tokens", "draft_tokens_accepted")
     _mlock = threading.Lock()
     t_start = 0.0
     warm_s = 0.0
-    stats0 = stats1 = None  # engine (cycles, drafted, accepted) after the warm-up / after the last request
 
     def count(self, **kw):
         """adds to the counters of /metrics"""
@@ -1518,8 +1517,7 @@ class Server:
     def metrics_text(self):
         """GET /metrics: Prometheus text; llama-server's names (llamacpp:) where they mean the same, megakernel: else"""
         m = self.counters()
-        s0, s1 = self.stats0, self.stats1
-        cyc, drafted, accepted = ((b - a for a, b in zip(s0, s1)) if s0 and s1 else (0, 0, 0))
+        cyc, drafted, accepted = m["decode_cycles"], m["draft_tokens"], m["draft_tokens_accepted"]
         rows = [
             ("llamacpp:prompt_tokens_total", "counter", "Number of prompt tokens processed (prefilled; reused ones not).",
              m["prompt_tokens"]),
@@ -1808,8 +1806,6 @@ class Server:
         finally:
             if images:  # (the request's images stay pinned until here)
                 self.vision.release([im for _, im in images])
-            if getattr(self.eng, "stats", None) is not None:  # (/metrics: the engine's counters, read while it is idle)
-                self.stats1 = self.eng.stats()
 
     def _generate(self, body, emit, gone, thinking, toks, images, media=()):
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
@@ -1846,7 +1842,6 @@ class Server:
             raise ClientGone()
         CON.status(f"#{rid} prefill")
         t0 = time.time()
-        st0 = self.eng.stats() if getattr(self.eng, "stats", None) is not None else None
         enc0 = [im.encode_s for _, im in images]
         try:
             tok, reused = self.load_prompt(toks, images, gone)
@@ -1855,6 +1850,15 @@ class Server:
                 f"{secs(time.time() - t0)} ({e})")
             raise ClientGone()
         t1 = time.time()
+        # the engine's (cycles, drafted, accepted) counters move in its decode cycles only and restart at a reset (a full
+        # re-prefill in load_prompt): read from here, the difference is this reply's
+        st0 = self.eng.stats() if getattr(self.eng, "stats", None) is not None else None
+
+        def spent():
+            st1 = self.eng.stats() if st0 is not None else None
+            d = tuple(b - a for a, b in zip(st0, st1)) if st0 and st1 else (0, 0, 0)
+            self.count(decode_cycles=d[0], draft_tokens=d[1], draft_tokens_accepted=d[2])
+            return d
         self.last_prompt = (len(toks), reused)  # (an Anthropic stream's message_start reports it)
         enc = [im.encode_s for (_, im), e in zip(images, enc0) if e is None and im.encode_s is not None]
         n_new, enc_s = len(toks) - reused, sum(enc)
@@ -1902,6 +1906,7 @@ class Server:
                 finish, dropped = "stop", len(pending)
                 break
         if aborted:  # (the engine's state is that of a reply cut by max_tokens: the next request reuses it as usual)
+            spent()
             log(f"#{rid} the client disconnected after {n_gen:,} generated tok ({secs(time.time() - t1)}): stopped")
             raise ClientGone()
         for kind, delta in parser.feed(stopper.feed(dec.decode(b"", final=True), final=True), final=True):
@@ -1922,11 +1927,11 @@ class Server:
         ph = ", ".join(f"{k} {v:,}" for k, v in phase.items() if v)
         if ph:
             parts.append(ph)
+        _, drafted, accepted = spent()
         if steps:  # (MTP: each engine cycle verifies the drafts and keeps the accepted ones plus one token)
             spec = f"{stepped / steps:.2f} tok/cycle"
-            st1 = self.eng.stats() if st0 is not None else None
-            if st1 and st1[1] > st0[1]:
-                spec += f", {100 * (st1[2] - st0[2]) / (st1[1] - st0[1]):.0f}% of {st1[1] - st0[1]:,} drafts accepted"
+            if drafted > 0:
+                spec += f", {100 * accepted / drafted:.0f}% of {drafted:,} drafts accepted"
             parts.append(spec)
         parts.append(f"finish {finish}" + (f" ({plural(len(calls), 'call')})" if calls else "")
                      + (f" (stop string; {dropped} tok of the cycle dropped)" if stopper.word is not None else ""))

@@ -1648,6 +1648,40 @@ class ConsoleHttpTests(_HttpCase):
         for w, ln in zip(want, lines):
             self.assertRegex(ln, "^" + w + "$")
 
+    def test_draft_counts_are_per_reply_across_an_engine_reset(self) -> None:
+        """MKEngine::reset (a full re-prefill) zeroes the engine's counters: the reply line and /metrics count each reply's
+        decode cycles anyway"""
+        class Eng(_ScriptEngine):
+            st = (0, 0, 0)
+
+            def stats(self):
+                return self.st
+
+            def reset(self):
+                super().reset()
+                self.st = (0, 0, 0)
+
+            def step(self):
+                c, d, a = self.st
+                self.st = (c + 1, d + 3, a + 1)  # (3 drafts per cycle, 1 accepted)
+                return super().step()
+        srv, http_ = self.serve(Eng(["a", "b", "c", "d", "e"]))
+
+        def run():
+            for content in ("hi", "other"):  # (the second prompt diverges early: no checkpoint, the engine is reset)
+                self.assertEqual(http_.post({"messages": [{"role": "user", "content": content}]})[0], 200)
+        out = self._log(run)
+        replies = [ln for ln in out.splitlines() if " reply: " in ln]
+        self.assertEqual(len(replies), 2, out)
+        for ln in replies:
+            self.assertIn("| 2.00 tok/cycle, 33% of 9 drafts accepted |", ln)
+        self.assertIn("CACHE MISS", out)
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+        c.request("GET", "/metrics")
+        vals = dict(ln.split(" ", 1) for ln in c.getresponse().read().decode().splitlines() if ln and not ln.startswith("#"))
+        self.assertEqual([vals[f"megakernel:{k}"] for k in ("decode_cycles_total", "draft_tokens_total",
+                                                            "draft_tokens_accepted_total")], ["6", "18", "6"])
+
     def test_a_terminal_shows_a_live_status_line_and_it_is_gone_after_the_request(self) -> None:
         class Eng(_ChunkedEngine):
             def prefill_progress(self):
