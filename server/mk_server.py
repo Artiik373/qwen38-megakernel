@@ -2729,13 +2729,13 @@ class HTTPServer(ThreadingHTTPServer):
         self.close_request(request)
 
 
-def env_int(name, default):
-    """a positive integer setting from the environment (default when unset or empty)"""
+def env_int(name, default, minimum=1):
+    """an integer setting >= minimum from the environment (default when unset or empty)"""
     v = os.environ.get(name, "").strip()
     if not v:
         return default
-    if not v.isdecimal() or int(v) < 1:
-        sys.exit(f"{name}: expected a positive integer, not {v!r}")
+    if not v.isdecimal() or int(v) < minimum:
+        sys.exit(f"{name}: expected {'a positive integer' if minimum == 1 else f'an integer >= {minimum}'}, not {v!r}")
     return int(v)
 
 
@@ -2760,12 +2760,12 @@ def main():
     ap.add_argument("--exact-reuse", action="store_true",
                     help="reused requests answer exactly as fresh ones (MK_EXACT=1): restore a checkpoint and prefill "
                          "instead of appending to decoded rows (costs prompt time when a long reply is reused)")
-    ap.add_argument("--side-max", type=int, default=env_int("MK_SIDE_MAX", 8192), metavar="N",
+    ap.add_argument("--side-max", type=int, default=env_int("MK_SIDE_MAX", 8192, 0), metavar="N",
                     help="side requests: a first-turn prompt (no assistant reply in it) of at most N tokens that would discard "
                          "at least twice its length of the cached conversation (with parking on: and asks for at most 1024 "
                          "tokens) runs without evicting it: the KV rows it overwrites go to host memory and come back "
                          "after its reply (0: off; env MK_SIDE_MAX)")
-    ap.add_argument("--park-mib", type=int, default=env_int("MK_PARK_MIB", 8192), metavar="MIB",
+    ap.add_argument("--park-mib", type=int, default=env_int("MK_PARK_MIB", 8192, 0), metavar="MIB",
                     help="host memory for parked conversations: a request for another conversation parks the cached one "
                          "(KV, recurrent state, checkpoints) and it comes back bit for bit when its next request arrives; "
                          "least recently parked ones go first (allocated on first use; 0: off; env MK_PARK_MIB)")

@@ -1921,6 +1921,13 @@ class HostCacheTests(_HttpCase):
         self.assertIn("evicted the parked conversation of", log)
         self.assertEqual(self.metrics(http_)["megakernel:park_evictions_total"], "1")
 
+    def test_the_environment_can_turn_the_host_cache_off(self) -> None:
+        import os
+        with mock.patch.dict(os.environ, {"MK_SIDE_MAX": "0", "MK_MAX_BODY_MB": "0"}):
+            self.assertEqual(self.mk.env_int("MK_SIDE_MAX", 8192, 0), 0)
+            with self.assertRaises(SystemExit):  # (the other settings stay positive)
+                self.mk.env_int("MK_MAX_BODY_MB", 128)
+
     def test_the_engine_lock_serves_waiting_requests_in_arrival_order(self) -> None:
         lock, order, started = self.mk.FifoLock(), [], []
         lock.acquire()
