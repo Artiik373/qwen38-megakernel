@@ -13,8 +13,10 @@ server around it, with image and video input. It contains:
 - **The server** (`server/mk_server.py`): `/v1/chat/completions` (streaming, tools, `reasoning_content`, stop
   strings), the Anthropic Messages API (`/v1/messages`, streaming, `/v1/messages/count_tokens`: Anthropic SDK clients
   such as Claude Code), llama-server's `/health`, `/props`, `/v1/models`, `/slots`, `/metrics`, `/tokenize`,
-  `/detokenize`, `/apply-template`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints. After each
-  request the engine keeps the GPU's clocks up for a while (keep-warm), so a reply after a pause starts at full speed.
+  `/detokenize`, `/apply-template`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints.
+  Several conversations (chats, coding agents) can share the engine: requests run one at a time, and the other
+  conversations wait in host memory and come back bit for bit instead of being read again. After each request the
+  engine keeps the GPU's clocks up for a while (keep-warm), so a reply after a pause starts at full speed.
 - **The vision encoder** turns OpenAI `image_url` parts and video clips (llama-server's `input_video`) into model input.
   It runs **on the CPU** (fp32 AVX2 / FMA), so images and video cost no VRAM and the full context stays available.
 - **KV cache:** q8_0 by default. Opt-in near-lossless presets with 6-bit K and 5-bit V free about 1 GB at 120k context
@@ -129,6 +131,9 @@ inside: [docs/ENGINE.md](docs/ENGINE.md).
 - **CUDA:** 13.2 is what we build with; older 12.x versions are untested.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64 ([Windows](#windows) has its own build steps).
 - **RAM:** about 28 GB free to compile the served configuration (ptxas). The lean build needs ~19 GB.
+- **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `MK_PARK_MIB`
+  (default 8192 MiB; 1024 MiB for side requests alone when it is `0`). It is allocated as it is needed and kept until
+  the server exits.
 - **llama.cpp b10246**, built at `../llama.cpp`. The engine uses its tokenizer (libllama), and the vision library and
   reference tools use libmtmd.
 - **Python** 3.10+ with jinja2.
@@ -180,19 +185,6 @@ Some conversions drop the MTP layer (`blk.64`) the engine drafts with:
 The MTP layer only proposes drafts, which the main model verifies: output is the same with any MTP layer or none
 (greedy bit for bit), only the acceptance rate and so the speed can change.
 
-Checked on 2026-10-18 (greedy output the same at depth 0, 4 and 7; top-token agreement with llama.cpp running the same
-file, 98.7% for UD-Q4_K_XL):
-
-| file | what it needs | agreement |
-|---|---|---|
-| OrcaSAQ-2-27B-Uncensored | Q6_K `token_embd` and `output` | 99.0% |
-| Qwen3.8-27B-Uncensored-Cyber IQ4_XS (imatrix, plus-mtp) | Q8_0 `token_embd` and `output` | 99.1% |
-| Qwen3.8-27B-Uncensored-Cyber Q4_K_M | no MTP layer: depth 0, or `--mtp` with its `mtp-*-Q4_0.gguf` | 99.1% |
-| Huihui-Qwen3.8-27B-abliterated Q4_K_L | Q8_0 `token_embd` and `output`; 19.7 GB of weights, so a short context on 24 GB | 98.7% |
-
-Huihui's abliterated UD-DW-Q4_K_M ran before these changes and still does. A fine-tune's MTP layer drafted as well as
-the original's on these files (49-54% of drafts accepted at depth 7).
-
 ## Run
 
 ```sh
@@ -210,17 +202,29 @@ After each request the engine keeps the GPU's clocks up for `MK_KEEP_WARM_S` sec
 one-thread kernel, so a reply after a pause starts at full speed (numbers above); the driver's power settings are left
 alone. It costs power while it runs: an RTX 3090 draws ~165 W instead of 30-35 W at idle.
 
-Several conversations can share the engine (one request at a time, in arrival order): a request for another conversation
-parks the cached one in host memory (`MK_PARK_MIB`, default 8192 MiB, allocated on first use; `0` = off), and it comes
-back bit for bit with its next request instead of a full re-prefill (~65 ms for a 38k-token conversation instead of ~24
-s; WSL2, 2026-10-19). A short first-turn request with a short reply, such as a client's title request, runs as a side
-request (`MK_SIDE_MAX`, default 8192 tokens; `0` = off): the cached conversation stays and only the rows the side
-request overwrites go to host memory and back (~10-20 ms). Details: [docs/ENGINE.md](docs/ENGINE.md#server).
+Several conversations can share the engine. Requests run one at a time, in arrival order, and the engine switches
+conversations only between replies (a reply in progress is never paused):
+- **Parked conversations:** a request for another conversation parks the cached one in host memory (`MK_PARK_MIB`,
+  default 8192 MiB, the least recently parked one goes first when it is full; `0` = off), and it comes back bit for bit
+  with its next request instead of a full re-prefill. Parking and restoring a 12k / 38k / 120k-token conversation took
+  31 / 62 / 177 ms each way, against 7.4 / 23.9 / 98.4 s to read it again (WSL2, 2026-10-19). The first park of a large
+  conversation is slower, because page-locked memory is allocated at ~1 GB/s (5.7 s for 120k tokens); after that the
+  memory is reused.
+- **Side requests:** a new conversation's first request of at most `MK_SIDE_MAX` tokens (default 8192; `0` = off) that
+  would otherwise throw away a much longer cached conversation, such as a client's title request, runs beside it. Only
+  the rows it overwrites go to host memory and back (12-20 ms), and the cached conversation is not touched. With
+  parking on, this applies to requests that cap their reply at `max_tokens` <= 1024; other new conversations are parked
+  like any other, so their next turn is cached too.
+- **In practice:** with OpenCode 2.0.32 on native Windows (230k context, preset D), two coding sessions running at the
+  same time finished in 110 s with ~72k prompt tokens prefilled, against 242 s and ~232k with the store off
+  (2026-10-19).
+
+Details: [docs/ENGINE.md](docs/ENGINE.md#server).
 
 The console shows three lines per request (what it asks for, its prompt: cached / prefilled tokens and prefill speed,
-its reply: decode speed, thinking / answer / tool-call tokens, tokens per engine cycle, drafts accepted) and, in a
-terminal, a status line updated in place with the prefill's progress and time left or the decode's speed (see
-[docs/ENGINE.md](docs/ENGINE.md#server)).
+its reply: decode speed, thinking / answer / tool-call tokens, tokens per engine cycle, drafts accepted), a line for
+each side request, park, restore or eviction (sizes and copy times) and, in a terminal, a status line updated in place
+with the prefill's progress and time left or the decode's speed (see [docs/ENGINE.md](docs/ENGINE.md#server)).
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -260,7 +264,8 @@ What the API supports:
   the server drains the rest of the body (bounded) before it closes. A request whose client disconnects stops at the
   next prefill chunk (2048 tokens) or decode cycle, and a stopped prompt leaves nothing behind; an engine error in a
   stream ends it with an error event and `data: [DONE]`.
-- **Requests:** one at a time.
+- **Requests:** one at a time, in arrival order; the other conversations wait in host memory between their requests
+  (above).
 
 [docs/ENGINE.md](docs/ENGINE.md#server) has the details, the server's options and the engine's environment variables.
 
@@ -281,8 +286,9 @@ of the same source (fdad907), on the same model file, on 2026-10-16:
 | image encode, 196 / 300 / 1024 tokens | 0.59 / 0.81 / 3.56 s vs 0.50 / 0.80 / 3.95 s |
 
 The first chat prompt after the model load decoded faster on Windows: 220 vs 132-145 tok/s, with the same tokens. The
-likely cause is that the GPU's clocks ramp up faster there. The Windows build of 147054b (2026-10-17) passed the same
-identity checks (ids, `--kld` report, server replies) against the Linux references.
+likely cause is that the GPU's clocks ramp up faster there. Each Windows build we deploy passes the same
+identity checks (ids, `--kld` report, server replies) against the Linux references; the latest, d8183ad (2026-10-19),
+also replayed the side-request and parked-conversation tests under q8_0 and preset D.
 
 The image encoder's rows used to differ between the two builds at fp32 rounding level (relative 2e-6 to 1.3e-5, below
 either's error against an fp64 forward of the tower): its attention took e^x from the C library, and glibc's and
