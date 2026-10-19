@@ -284,7 +284,9 @@ Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `-c` con
 MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decoding; env `MK_NO_MTP=1`), `--exact-reuse`
 [off; the launchers turn it on], `--chat-template-file PATH` / `--chat-template TEMPLATE` [the GGUF's; below],
 `--ck-every n` (a checkpoint every n prompt tokens [4096], 0 = off), `--ck-msgs 1|0`
-(a checkpoint at each message start [1]), `--mmproj` (images, below), `--vision-backend auto|cpu|mtmd` [auto],
+(a checkpoint at each message start [1]), `--side-max n` (side requests up to n prompt tokens [8192], 0 = off; env
+`MK_SIDE_MAX`), `--park-mib n` (host memory for parked conversations [8192], 0 = off; env `MK_PARK_MIB`), `--park-min n`
+[1024], `--park-cks n` [2] (both below), `--mmproj` (images, below), `--vision-backend auto|cpu|mtmd` [auto],
 `--vision-threads` [0 = every logical CPU but two], `--image-min-tokens` / `--image-max-tokens` [the mmproj's],
 `--image-cache` [8; images kept between requests], `--video-fps` [4], `--video-max-tokens` [0 = the image limit],
 `--video-cache` [2; videos kept between requests], `--ffmpeg` [ffmpeg on PATH; env `MK_FFMPEG`] (video, below).
@@ -313,6 +315,31 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   not depend on where its chunks start (attention over absolute key segments, checkpoints on the absolute 32-token scan
   grid), so a reused request answers bit for bit like the same request sent fresh. The cost is the previous reply's
   re-prefill on a follow-up turn.
+- **Side requests** (`--side-max n`, default 8192): a prompt of at most n tokens without an earlier assistant reply in
+  it (a client's title request, a quick test) that would otherwise discard at least twice its length of the cached
+  sequence (with parking on, below: one that also asks for at most 1024 tokens; other new chats are parked like any
+  conversation, so their next turns find them cached) runs without evicting it (`MKEngine::side_begin` / `side_end`):
+  the engine keeps the cached sequence aside (its recurrent state, 183 MB, is copied to pinned host memory at once; its
+  KV and window-ring rows only when a launch of the side request is about to overwrite them, 1024 rows at a time), hides
+  its checkpoints and saves none, and runs the request from position 0 as a reset engine would (same reply as on a fresh
+  server). After the reply (also after a disconnect or an error) everything is copied back and the cached sequence is
+  bit for bit as before, so the next request of that conversation reuses it as usual. Cost: ~10-20 ms each way under
+  WSL2 for a 2.7k-8k-token side prompt, whatever the length of the cached sequence. If the host store runs out of room
+  during the side request, or the engine fails, the cached sequence is dropped and the next prompt is prefilled in full
+  (logged; never a corrupt cache).
+- **Parked conversations** (`--park-mib n`, default 8192 MiB; 0 = off): when a request belongs to another conversation
+  (it would discard at least `--park-min` [1024] tokens of the cached one and does not continue its last turn), the
+  cached conversation is first copied to pinned host memory (`MKEngine::park`: its KV rows, window rings, recurrent
+  state, sequence, image spans, draft vocabulary and its newest `--park-cks` [2] checkpoints; the engine keeps it too,
+  so a shared system prompt is still reused). A later request that continues a parked conversation better than the
+  cached one (by at least `--park-min` tokens) parks the cached one and restores the parked one (`MKEngine::unpark`):
+  the engine is then bit for bit as when it was parked, and its replies are the ones it would give had it never been
+  parked (greedy and sampled; with exact reuse any checkpoint gives the same bits, so fewer kept checkpoints only cost a
+  longer re-prefill after an edit). Requests run one at a time in arrival order and switch only between replies. Parked
+  conversations live within the budget, the least recently parked one evicted first (it is then prefilled again when it
+  comes back). Host memory is allocated on first use and kept for reuse (pinned allocation runs at ~1 GB/s under WSL2,
+  copies at ~26 GB/s): a 38k-token conversation (q8_0 KV, 37 KB per token) takes 1.9 GB with two checkpoints and ~65 ms
+  per park or restore (a 101.6k-token one 4.3 GB and ~150 ms), against ~24 s (~80 s) to prefill it again.
 - **Keep-warm:** after each request (and at startup) `capi.cpp` runs a one-block, 32-thread polling kernel for
   `MK_KEEP_WARM_S` seconds (default 120, 0 = off), each launch ending itself after 50 ms; the next request stops it and
   waits a few microseconds. The driver keys the P-state to utilization, so only a continuous load holds full clocks.
@@ -323,7 +350,7 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
 - Sampling (defaults in [], Unsloth's thinking-mode preset for Qwen3.8): temperature [1.0], top_p [0.95], top_k [20]
   (1..32; <= 0 means 32, the engine's maximum; above 32 is clamped with a one-time warning), min_p [0], seed,
   presence_penalty / frequency_penalty (-2..2, vLLM's semantics: the tokens generated in this response);
-  repetition_penalty is ignored (with a warning). One request at a time.
+  repetition_penalty is ignored (with a warning). One request at a time, in arrival order.
 - Request fields the engine cannot honour are a 400 naming the field, never ignored silently: `n` > 1, `logprobs` /
   `top_logprobs` / `n_probs`, `logit_bias`, `response_format` other than `{"type": "text"}`, `json_schema`, `grammar`,
   `tool_choice` other than "auto" / "none" (forcing a call needs constrained sampling), legacy `functions`,
@@ -349,12 +376,14 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   `chat_template`, `build_info` (commit and engine flags of `libqwen38mk`, from `mk_build_info`: the Makefile and
   `build.ps1` write them into `mk_build_info.h`; "unknown" for libraries built otherwise), plus an `engine` block with
   what the server knows for sure: context, KV format asked for (`auto` is resolved inside the engine), MTP layer and
-  depth, draft vocabulary, exact reuse, checkpoint settings, keep-warm window, vision encoder settings, limits, the
-  `MK_*` environment, busy, uptime. `GET /v1/models`: the model with `meta` (n_ctx, file size, n_embd). `GET /slots`:
-  one slot with `is_processing` (`?fail_on_no_slot=1`: 503 while busy). `GET /metrics` (always on): Prometheus text
-  with llama-server's `llamacpp:` names where they mean the same (prompt / predicted tokens and seconds, throughput,
-  requests processing / deferred) and `megakernel:` ones (reused prompt tokens, decode cycles, MTP drafted / accepted
-  tokens, requests received / 4xx / 5xx / cancelled by a disconnect).
+  depth, draft vocabulary, exact reuse, checkpoint settings, keep-warm window, `host_cache` (budget, side request and
+  parking settings, parked conversations and their token counts, host memory in use / allocated), vision encoder
+  settings, limits, the `MK_*` environment, busy, uptime. `GET /v1/models`: the model with `meta` (n_ctx, file size,
+  n_embd). `GET /slots`: one slot with `is_processing` (`?fail_on_no_slot=1`: 503 while busy). `GET /metrics` (always
+  on): Prometheus text with llama-server's `llamacpp:` names where they mean the same (prompt / predicted tokens and
+  seconds, throughput, requests processing / deferred) and `megakernel:` ones (reused prompt tokens, decode cycles, MTP
+  drafted / accepted tokens, requests received / 4xx / 5xx / cancelled by a disconnect, side requests and those that
+  lost the cached sequence, conversations parked / restored / evicted, parked conversations and their host memory now).
 - Anthropic Messages API (`POST /v1/messages`, streaming or not; `POST /v1/messages/count_tokens`): the request is
   translated to the chat request above and generated by the same code (as llama-server does), so a greedy reply is the
   same as through `/v1/chat/completions`. `system` (a string or text blocks, joined by blank lines; Claude Code's
@@ -404,15 +433,17 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
 - Console (stderr): every log line is `[mk-server] HH:MM:SS ...`; a generation request is numbered (`#12`) and logs
   three lines: what it asks for (route, stream, the `model` field, prompt tokens, messages, tools, images / videos,
   thinking, max_tokens, the sampling used), its prompt (`N cached + M prefilled in s (prefill tok/s)` and how the cache
-  was used: continued, resumed at a checkpoint, or `CACHE MISS` with how much of the cached sequence the prompt
-  matched; images and their CPU encode time) and its reply (`tok in s = tok/s` over the decode, from the first token
-  to the end of the reply; the tokens of the thinking / answer / tool call; `tok/cycle` = tokens per engine cycle, 1
-  plus the accepted MTP drafts; the share of drafts accepted; finish reason; the whole request's time). A request that
-  waits for the engine, 4xx answers and disconnects are logged with the number too. On a terminal one status line under
-  the log lines is rewritten in place (a carriage return, no escape sequences) while a request runs: image encodes,
-  the prefill's progress from the engine (`mk_prefill_progress` / `MKEngine::prefill_progress`: host counters updated
-  per prefill chunk, no device sync), its rate and the time left, then the decode's tokens, tok/s and tok/cycle. Off a
-  terminal (a log file) only the log lines are written. A client resetting an idle keep-alive connection is not logged.
+  was used: continued, resumed at a checkpoint, or `CACHE MISS` with how much of the cached sequence the prompt matched,
+  after a side request or a restored parked conversation when one was used; images and their CPU encode time; each park
+  / restore / eviction / side request logs a line of its own: tokens, bytes copied, ms) and its reply (`tok in s =
+  tok/s` over the decode, from the first token to the end of the reply; the tokens of the thinking / answer / tool call;
+  `tok/cycle` = tokens per engine cycle, 1 plus the accepted MTP drafts; the share of drafts accepted; finish reason;
+  the whole request's time). A request that waits for the engine, 4xx answers and disconnects are logged with the number
+  too. On a terminal one status line under the log lines is rewritten in place (a carriage return, no escape sequences)
+  while a request runs: image encodes, the prefill's progress from the engine (`mk_prefill_progress` /
+  `MKEngine::prefill_progress`: host counters updated per prefill chunk, no device sync), its rate and the time left,
+  then the decode's tokens, tok/s and tok/cycle. Off a terminal (a log file) only the log lines are written. A client
+  resetting an idle keep-alive connection is not logged.
 - Images: see [Images](#images-vision); video: see [Video](#video).
 
 ## KV cache

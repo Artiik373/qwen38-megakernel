@@ -1703,5 +1703,247 @@ class ConsoleHttpTests(_HttpCase):
         self.assertTrue(all(r.startswith("[mk-server] ") for r in screen[:-1]), screen)
 
 
+class _StoreEngine(_ScriptEngine):
+    """the host store's semantics (MKEngine::side_begin / park): snapshots of the sequence, its committed position and its
+    newest checkpoints within a byte budget (PT bytes per token, STATE of recurrent state, CK per checkpoint)"""
+
+    store = True
+    PT, STATE, CK = 1000, 1000, 500
+
+    def __init__(self, pieces, **kw):
+        super().__init__(pieces, **kw)
+        self.budget, self.entries, self.next_id, self.kept, self.side_ok, self.ops = 0, {}, 1, None, True, []
+
+    def store_budget(self, nbytes):
+        self.budget = nbytes
+
+    def store_info(self):
+        used = sum(e[3] for e in self.entries.values())
+        return {"budget": self.budget, "allocated": used, "used": used, "parked": len(self.entries), "last_bytes": 0,
+                "last_ms": 0.0, "side_ms": 0.0, "kv_token_bytes": self.PT}
+
+    def kv_sizes(self):
+        return self.PT, 0, self.STATE, self.CK
+
+    def park_need(self, k):
+        return len(self.seq) * self.PT + self.STATE + min(k, len(self.cks)) * self.CK
+
+    def park(self, k):
+        n = self.park_need(k)
+        if self.store_info()["used"] + n > self.budget:
+            return None
+        pid, self.next_id = self.next_id, self.next_id + 1
+        self.entries[pid] = (list(self.seq), self.dn_c, sorted(self.cks)[-k:] if k else [], n)
+        self.ops.append(("park", pid, len(self.seq)))
+        return pid
+
+    def unpark(self, pid):
+        seq, dn_c, cks, _ = self.entries.pop(pid)
+        self.seq, self.dn_c, self.cks = list(seq), dn_c, list(cks)
+        self.ops.append(("unpark", pid, len(seq)))
+
+    def park_drop(self, pid):
+        self.entries.pop(pid)
+        self.ops.append(("drop", pid))
+
+    def side_begin(self):
+        self.kept = (list(self.seq), self.dn_c, list(self.cks))
+        self.seq, self.dn_c, self.cks = [], 0, []
+        self.ops.append(("side_begin", len(self.kept[0])))
+        return True
+
+    def side_active(self):
+        return self.kept is not None
+
+    def side_drop(self):
+        self.kept, self.seq, self.dn_c, self.cks = None, [], 0, []
+        self.ops.append(("side_drop",))
+
+    def side_end(self):
+        (seq, dn_c, cks), self.kept = self.kept, None
+        self.ops.append(("side_end",))
+        if not self.side_ok:  # (the store ran full: the engine is reset)
+            self.seq, self.dn_c, self.cks = [], 0, []
+            return False
+        self.seq, self.dn_c, self.cks = seq, dn_c, cks
+        return True
+
+
+class HostCacheTests(_HttpCase):
+    """side requests (--side-max) and parked conversations (--park-mib) over the store's semantics"""
+
+    LONG = "a long document. " * 40  # (~690 prompt tokens with the test tokenizer: one per character)
+
+    def serve_store(self, eng, side_max=200, park_mib=0, park_min=50, park_cks=2):
+        srv, http_ = self.serve(eng)
+        srv.args.side_max, srv.args.park_mib, srv.args.park_min, srv.args.park_cks = side_max, park_mib, park_min, park_cks
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            srv.setup_store(srv.args)
+        srv.lock = self.mk.FifoLock()
+        return srv, http_
+
+    def chat(self, http_, msgs, **kw):
+        status, data = http_.post({"messages": msgs, **kw})
+        self.assertEqual(status, 200, data)
+        return json.loads(data)
+
+    def metrics(self, http_):
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+        c.request("GET", "/metrics")
+        text = c.getresponse().read().decode()
+        c.close()
+        return dict(ln.split(" ", 1) for ln in text.splitlines() if ln and not ln.startswith("#"))
+
+    def quiet(self, fn):
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            fn()
+        return err.getvalue()
+
+    def test_a_short_first_turn_prompt_runs_as_a_side_request_and_the_long_sequence_stays(self) -> None:
+        eng = _StoreEngine(["a", "b"])
+        srv, http_ = self.serve_store(eng)
+        a1 = [{"role": "user", "content": self.LONG}]
+        out = {}
+
+        def run():
+            out["r"] = self.chat(http_, a1)
+            kept = list(eng.seq)
+            self.chat(http_, [{"role": "user", "content": "a title please"}], max_tokens=4)
+            self.assertEqual(eng.seq, kept)  # (the long sequence is back)
+            a2 = a1 + [{"role": "assistant", "content": out["r"]["choices"][0]["message"]["content"]},
+                       {"role": "user", "content": "more"}]
+            out["r2"] = self.chat(http_, a2)
+        log = self.quiet(run)
+        self.assertEqual([o[0] for o in eng.ops], ["side_begin", "side_end"], log)
+        self.assertGreaterEqual(out["r2"]["usage"]["prompt_tokens_details"]["cached_tokens"], len(self.LONG), log)
+        self.assertIn("side request: the cached", log)
+        self.assertIn("side request done: the cached", log)
+        m = self.metrics(http_)
+        self.assertEqual((m["megakernel:side_requests_total"], m["megakernel:side_requests_dropped_total"]), ("1", "0"))
+
+    def test_no_side_request_when_off_after_an_assistant_reply_or_for_a_short_cached_sequence(self) -> None:
+        for side_max, msgs in ((0, [{"role": "user", "content": "hi"}]),
+                               (200, [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"},
+                                      {"role": "user", "content": "more"}])):
+            eng = _StoreEngine(["a", "b"])
+            srv, http_ = self.serve_store(eng, side_max=side_max)
+            self.quiet(lambda: (self.chat(http_, [{"role": "user", "content": self.LONG}]), self.chat(http_, msgs)))
+            self.assertEqual(eng.ops, [], side_max)
+        eng = _StoreEngine(["a", "b"])
+        srv, http_ = self.serve_store(eng)
+        self.quiet(lambda: (self.chat(http_, [{"role": "user", "content": "a short one"}]),
+                            self.chat(http_, [{"role": "user", "content": "other"}])))
+        self.assertEqual(eng.ops, [])  # (what it would discard is less than twice its own length)
+
+    def test_a_side_request_that_fails_or_overflows_the_store_still_ends_it(self) -> None:
+        eng = _StoreEngine(["a", "b", "c", "d"], fail_at=1)
+        srv, http_ = self.serve_store(eng)
+        a1 = [{"role": "user", "content": self.LONG}]
+
+        def run():
+            eng.fail_at = None
+            self.chat(http_, a1)
+            kept = list(eng.seq)
+            eng.fail_at, eng.cycles = 1, 0  # (the side request's first decode cycle fails)
+            self.assertEqual(http_.post({"messages": [{"role": "user", "content": "x"}]})[0], 500)
+            self.assertEqual(eng.seq, kept)  # (the engine's state stayed consistent: the sequence comes back)
+            eng.fail_at, eng.side_ok = None, False
+            self.chat(http_, [{"role": "user", "content": "y"}])
+            self.assertEqual(eng.seq, [])  # (the store ran full during it: dropped, reset)
+        log = self.quiet(run)
+        self.assertEqual([o[0] for o in eng.ops], ["side_begin", "side_end"] * 2, log)
+        self.assertIn("were dropped", log)
+        self.assertEqual(self.metrics(http_)["megakernel:side_requests_dropped_total"], "1")
+
+    def test_conversations_are_parked_and_come_back_at_request_boundaries(self) -> None:
+        eng = _StoreEngine(["a", "b"])
+        srv, http_ = self.serve_store(eng, side_max=0, park_mib=4)
+        a1 = [{"role": "user", "content": self.LONG}]
+        b1 = [{"role": "user", "content": self.LONG.upper()}]
+        out = {}
+
+        def run():
+            ra = self.chat(http_, a1)
+            kept_a = list(eng.seq)
+            self.chat(http_, b1)  # (another conversation: A is parked first)
+            kept_b = list(eng.seq)
+            a2 = a1 + [{"role": "assistant", "content": ra["choices"][0]["message"]["content"]}, {"role": "user", "content": "more"}]
+            out["a2"] = self.chat(http_, a2)  # (B is parked, A comes back and continues)
+            out["kept"] = (kept_a, kept_b)
+        log = self.quiet(run)
+        kept_a, kept_b = out["kept"]
+        self.assertEqual(eng.ops, [("park", 1, len(kept_a)), ("park", 2, len(kept_b)), ("unpark", 1, len(kept_a))], log)
+        self.assertEqual(out["a2"]["usage"]["prompt_tokens_details"]["cached_tokens"], len(kept_a) - 1, log)
+        self.assertIn("parked the cached conversation (a new conversation)", log)
+        self.assertIn("restored the parked conversation of", log)
+        self.assertRegex(log, r"prompt: [\d,]+ cached \+ \d+ prefilled .* \| restored a parked conversation")
+        m = self.metrics(http_)
+        self.assertEqual([m[f"megakernel:{k}"] for k in ("parks_total", "park_restores_total", "parked_conversations")],
+                         ["2", "1", "1"])
+        info = srv.engine_info()["host_cache"]
+        self.assertEqual((info["parked"], info["parked_tokens"], info["park_mib"]), (1, [len(kept_b)], 4))
+
+    def test_with_parking_on_only_a_bounded_reply_is_a_side_request(self) -> None:
+        eng = _StoreEngine(["a", "b"])
+        srv, http_ = self.serve_store(eng, park_mib=4)
+
+        def run():
+            self.chat(http_, [{"role": "user", "content": self.LONG}])
+            self.chat(http_, [{"role": "user", "content": "a title please"}], max_tokens=8)  # (side request)
+            self.chat(http_, [{"role": "user", "content": "a new chat"}])  # (no max_tokens: the cached one is parked)
+        log = self.quiet(run)
+        self.assertEqual([o[0] for o in eng.ops], ["side_begin", "side_end", "park"], log)
+
+    def test_the_conversation_coming_back_is_never_evicted_to_park_the_cached_one(self) -> None:
+        eng = _StoreEngine(["a", "b"])
+        srv, http_ = self.serve_store(eng, side_max=0, park_mib=1)  # (one ~0.7 MB entry fits)
+        a1 = [{"role": "user", "content": "A" + self.LONG}]
+
+        def run():
+            ra = self.chat(http_, a1)
+            self.chat(http_, [{"role": "user", "content": "B" + self.LONG}])  # (A parked)
+            a2 = a1 + [{"role": "assistant", "content": ra["choices"][0]["message"]["content"]}, {"role": "user", "content": "more"}]
+            self.chat(http_, a2)  # (B does not fit next to A: B is not parked, A comes back)
+        log = self.quiet(run)
+        self.assertEqual([o[:2] for o in eng.ops], [("park", 1), ("unpark", 1)], log)
+        self.assertIn("not parked", log)
+
+    def test_the_least_recently_parked_conversation_is_evicted_for_room(self) -> None:
+        eng = _StoreEngine(["a", "b"])
+        srv, http_ = self.serve_store(eng, side_max=0, park_mib=1)  # (one ~0.7 MB entry fits)
+
+        def run():
+            for c in ("A", "B", "C"):
+                self.chat(http_, [{"role": "user", "content": c + self.LONG}])
+        log = self.quiet(run)
+        self.assertEqual([o[:2] for o in eng.ops], [("park", 1), ("drop", 1), ("park", 2)], log)
+        self.assertIn("evicted the parked conversation of", log)
+        self.assertEqual(self.metrics(http_)["megakernel:park_evictions_total"], "1")
+
+    def test_the_engine_lock_serves_waiting_requests_in_arrival_order(self) -> None:
+        lock, order, started = self.mk.FifoLock(), [], []
+        lock.acquire()
+
+        def worker(i):
+            started.append(i)
+            with lock:
+                order.append(i)
+        ths = []
+        for i in range(6):
+            th = threading.Thread(target=worker, args=(i,))
+            th.start()
+            ths.append(th)
+            while len(started) <= i:  # (each waits before the next arrives)
+                time.sleep(0.001)
+            time.sleep(0.02)
+        self.assertTrue(lock.locked())
+        lock.release()
+        for th in ths:
+            th.join(5)
+        self.assertEqual(order, list(range(6)))
+        self.assertFalse(lock.locked())
+
+
 if __name__ == "__main__":
     unittest.main()

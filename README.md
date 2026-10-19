@@ -88,7 +88,8 @@ Upstream's engine (open-jet 2993f47, 4 drafts) ran the same scripts on this card
 - Greedy token ids are identical at 0, 4 and 7 drafts. With sampling, the verification keeps the token distribution of
   sampling without drafts (chi-square and PIT tests).
 - With exact reuse on (`--exact-reuse`, set by the launchers), a reused prefix (an edit or a follow-up turn) answers bit
-  for bit like a fresh prefill of the whole conversation.
+  for bit like a fresh prefill of the whole conversation. A parked conversation restored from host memory, and a
+  conversation kept through a side request, continue bit for bit as if nothing else had run in between.
 - The output is not byte-identical to llama.cpp's, whose arithmetic is ordered and rounded differently. Scored against
   llama.cpp's own next-token distributions (13,299 positions of code and prose; reference: llama.cpp generating token by
   token with its q8_0 KV cache), the engine agrees on 98.737% of the top tokens with a mean KL divergence of 0.00119
@@ -208,6 +209,13 @@ an NVMe disk (2026-10-16).
 After each request the engine keeps the GPU's clocks up for `MK_KEEP_WARM_S` seconds (default 120, `0` = off) with a
 one-thread kernel, so a reply after a pause starts at full speed (numbers above); the driver's power settings are left
 alone. It costs power while it runs: an RTX 3090 draws ~165 W instead of 30-35 W at idle.
+
+Several conversations can share the engine (one request at a time, in arrival order): a request for another conversation
+parks the cached one in host memory (`MK_PARK_MIB`, default 8192 MiB, allocated on first use; `0` = off), and it comes
+back bit for bit with its next request instead of a full re-prefill (~65 ms for a 38k-token conversation instead of ~24
+s; WSL2, 2026-10-19). A short first-turn request with a short reply, such as a client's title request, runs as a side
+request (`MK_SIDE_MAX`, default 8192 tokens; `0` = off): the cached conversation stays and only the rows the side
+request overwrites go to host memory and back (~10-20 ms). Details: [docs/ENGINE.md](docs/ENGINE.md#server).
 
 The console shows three lines per request (what it asks for, its prompt: cached / prefilled tokens and prefill speed,
 its reply: decode speed, thinking / answer / tool-call tokens, tokens per engine cycle, drafts accepted) and, in a

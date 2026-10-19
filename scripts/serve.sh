@@ -15,6 +15,11 @@
 #   MK_DRAFT            MTP drafts per cycle (default 7; a `make MKFLAGS=` build takes at most 4)
 #   MK_EXACT_REUSE=0    turn exact reuse off: a reused prompt then appends the previous reply instead of re-prefilling it
 #                       (faster follow-up turns, but not bit-identical to the same request sent fresh)
+#   MK_SIDE_MAX         side requests: a first-turn prompt of at most this many tokens (default 8192; 0 = off) that would
+#                       discard a much longer cached conversation runs without evicting it (the KV rows it overwrites are
+#                       kept in host memory and come back after its reply)
+#   MK_PARK_MIB         host memory for parked conversations (default 8192 MiB, allocated on first use; 0 = off): a request
+#                       for another conversation parks the cached one, and it comes back bit for bit with its next request
 #   MK_PF_CAP           prefill chunk tokens (default 2048; 1024 above 96k context: 0.34 GB less VRAM, prefill ~4.5% slower)
 #   MK_KV, MK_KV_WIN    low-bit KV cache (opt-in), preset D': MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048 (6-bit K, 5-bit V,
 #                       8-bit MTP layer and recent window: ~1.0 GB less VRAM at 120k, ~162k context in the same VRAM,

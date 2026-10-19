@@ -30,6 +30,7 @@ import argparse
 import base64
 import binascii
 import codecs
+import collections
 import contextlib
 import ctypes
 import hashlib
@@ -235,6 +236,17 @@ class Engine:
         if self._stats:
             lp = ctypes.POINTER(ctypes.c_long)
             L.mk_stats.restype, L.mk_stats.argtypes = None, [vp, lp, lp, lp]
+        # conversation state in host memory: side requests and parked conversations (libraries before it: neither)
+        self.store = hasattr(L, "mk_park")
+        if self.store:
+            ll, llp, ci = ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong), ctypes.c_int
+            for name, res, args in (("mk_store_budget", ci, [vp, ll]), ("mk_store_reserve", ci, [vp, ll]),
+                                    ("mk_store_info", ci, [vp, llp, ci]), ("mk_kv_sizes", None, [vp, llp, llp, llp, llp]),
+                                    ("mk_side_begin", ci, [vp]), ("mk_side_end", ci, [vp]), ("mk_side_drop", ci, [vp]),
+                                    ("mk_side_active", ci, [vp]), ("mk_park", ci, [vp, ci]), ("mk_unpark", ci, [vp, ci]),
+                                    ("mk_park_drop", ci, [vp, ci]), ("mk_park_need", ll, [vp, ci])):
+                f = getattr(L, name)
+                f.restype, f.argtypes = res, args
         self.n_vocab = 0  # (libraries before mk_n_vocab: unknown)
         if hasattr(L, "mk_n_vocab"):
             L.mk_n_vocab.restype, L.mk_n_vocab.argtypes = ctypes.c_int, [vp]
@@ -397,6 +409,65 @@ class Engine:
         if not self.pool:
             return pos == self.checkpoint_pos() and self.rewind_to_checkpoint()
         return self.L.mk_rewind_to(self.h, pos) == 0
+
+    # ---- host store: side requests, parked conversations (MKEngine::store_budget, side_begin, park) ----
+    def store_budget(self, nbytes):
+        if self.L.mk_store_budget(self.h, nbytes) < 0:
+            raise self._err("host store")
+
+    def store_info(self):
+        """{budget, allocated, used, parked, last_bytes, last_ms, side_ms, kv_token_bytes}"""
+        out = (ctypes.c_longlong * 8)()
+        n = self.L.mk_store_info(self.h, out, 8)
+        keys = ("budget", "allocated", "used", "parked", "last_bytes", "last_us", "side_us", "kv_token_bytes")
+        d = dict(zip(keys, out[:n]))
+        d["last_ms"], d["side_ms"] = d.pop("last_us", 0) / 1e3, d.pop("side_us", 0) / 1e3
+        return d
+
+    def kv_sizes(self):
+        """bytes: (per KV token, the window rings, the recurrent state, one checkpoint)"""
+        v = [ctypes.c_longlong() for _ in range(4)]
+        self.L.mk_kv_sizes(self.h, *[ctypes.byref(x) for x in v])
+        return tuple(x.value for x in v)
+
+    def side_begin(self):
+        """True: the sequence is kept aside (the engine looks reset); False: no room in the host store"""
+        r = self.L.mk_side_begin(self.h)
+        if r < 0:
+            raise self._err("side request")
+        return r == 0
+
+    def side_end(self):
+        """True: the kept sequence is back bit for bit; False: it was dropped (the store ran full: the engine is reset)"""
+        r = self.L.mk_side_end(self.h)
+        if r < 0:
+            raise self._err("side request")
+        return r == 1
+
+    def side_active(self):
+        return self.L.mk_side_active(self.h) == 1
+
+    def side_drop(self):
+        self.L.mk_side_drop(self.h)
+
+    def park(self, max_cks):
+        """a snapshot of the sequence in the host store: its id, or None (no room)"""
+        r = self.L.mk_park(self.h, max_cks)
+        if r == -3:
+            return None
+        if r < 0:
+            raise self._err("park")
+        return r or None
+
+    def unpark(self, pid):
+        if self.L.mk_unpark(self.h, pid) < 0:
+            raise self._err("restore")
+
+    def park_drop(self, pid):
+        self.L.mk_park_drop(self.h, pid)
+
+    def park_need(self, max_cks):
+        return self.L.mk_park_need(self.h, max_cks)
 
 
 class Vision:
@@ -1317,6 +1388,54 @@ ANTHROPIC_ERRORS = {400: "invalid_request_error", 404: "not_found_error", 413: "
 # ---------------------------------------------------------------------------------------------
 
 
+class FifoLock:
+    """the engine's lock: requests get it in the order they arrive (threading.Lock wakes an arbitrary waiter)"""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._tickets = itertools.count()
+        self._turn = 0
+        self._held = False
+
+    def acquire(self):
+        with self._cv:
+            t = next(self._tickets)
+            self._cv.wait_for(lambda: self._turn == t and not self._held)
+            self._held = True
+        return True
+
+    def release(self):
+        with self._cv:
+            self._held = False
+            self._turn += 1
+            self._cv.notify_all()
+
+    def locked(self):
+        return self._held
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+class Parked:
+    """a conversation parked in the engine's host store (Engine.park): what the server matches prompts against"""
+
+    def __init__(self, pid, seq, cks, committed, img_spans, gen, nbytes):
+        self.id, self.seq, self.cks, self.committed = pid, seq, cks, committed
+        self.img_spans, self.gen, self.nbytes, self.t = img_spans, gen, nbytes, time.time()
+
+
+SIDE_STORE_MIB = 1024  # host store of side requests when parking is off (--park-mib 0)
+SIDE_REPLY_MAX = 1024  # with parking on, a side request asks for at most this many tokens (Server.cache_switch)
+
+
+def mib(n):
+    return f"{n / 2**20:,.0f} MiB"
+
+
 class Server:
     vision = None   # Vision (--mmproj), else text only
     decoder = None  # VideoDecoder (an ffmpeg was found): video input with the vision encoder
@@ -1328,6 +1447,15 @@ class Server:
     rid = 0  # the running (or last) request's number: "#rid" on its console lines
     req = ("chat", None, 0.0)  # its (route, model field, start time), set by the handler when it gets the engine
     cache_note = ""  # how load_prompt matched the last prompt against the engine's sequence (the console's prompt line)
+    # host cache (Engine.store): parked conversations by id, least recently parked first (None: no store); the running
+    # side request's kept state (None: none); the live sequence's generation prompt position (-1: none; a request whose
+    # prompt matches up to it continues the live conversation)
+    parked = None
+    store_mib = 0
+    side = None
+    live_gen = -1
+    store_gauge = (0, 0, 0, ())  # (parked, bytes in use, bytes allocated, their token counts): /metrics and /props read it
+    cache_pre = ""  # what the host cache did for the running request (before cache_note on the prompt line)
 
     def __init__(self, args):
         self.args = args
@@ -1359,8 +1487,9 @@ class Server:
             self.vis_start, self.vis_end, self.img_pad = (i[0] for i in ids)
             self.setup_video(args)
         self.warm_up()
+        self.setup_store(args)
         self.model_id = os.path.basename(args.model)
-        self.lock = threading.Lock()
+        self.lock = FifoLock()
         self.warned = set()
         vis = (f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.backend}, {self.vision.n_threads} threads)"
                if self.vision else "")
@@ -1384,6 +1513,168 @@ class Server:
         self.eng.reset()
         if self.vision:
             self.vision.warm_up()
+
+    def setup_store(self, args):
+        """host memory for side requests and parked conversations (--side-max, --park-mib; an engine without the host
+        store: neither)"""
+        side, park = getattr(args, "side_max", 0), getattr(args, "park_mib", 0)
+        if not getattr(self.eng, "store", False) or not (side > 0 or park > 0):
+            if (side > 0 or park > 0) and not getattr(self.eng, "store", False):
+                log(f"side requests / parked conversations off: {args.lib} has no host store (mk_park): rebuild it")
+            return
+        self.parked = collections.OrderedDict()
+        self.store_mib = max(park, SIDE_STORE_MIB if side > 0 else 0)
+        self.eng.store_budget(self.store_mib << 20)
+        pt, rings, state, ck = self.eng.kv_sizes()
+        log(f"host cache (allocated on first use, at most {self.store_mib:,} MiB): side requests "
+            f"{f'up to {side:,} tok' if side > 0 else 'off'}, parked conversations "
+            f"{f'up to {park:,} MiB, {args.park_cks} checkpoints each' if park > 0 else 'off'} ({pt:,} B per token, "
+            f"{mib(state)} recurrent state, {mib(ck)} per checkpoint)")
+
+    # ---- host cache: side requests (TODO #15) and parked conversations (#9), switched at request boundaries ----
+    def resume_point(self, seq, committed, cks, cached_spans, toks, spans):
+        """how load_prompt would continue `toks` (image spans `spans`) on the cached `seq`: (common prefix, the image
+        position that cut it or None, the position it resumes at, 'append' | 'checkpoint' | 'reset')"""
+        lcp = 0
+        for a, b in zip(seq, toks):
+            if a != b:
+                break
+            lcp += 1
+        lcp = min(lcp, len(toks) - 1)
+        match, img_cut = lcp, None
+        for p, _, _ in set(spans) ^ set(cached_spans):
+            if p < lcp:
+                lcp, img_cut = p, p
+        if seq and lcp >= committed and not self.eng.exact:
+            return match, img_cut, lcp, "append"
+        ck = max((p for p in cks if 0 < p <= lcp), default=0)
+        return match, img_cut, ck, "checkpoint" if ck else "reset"
+
+    def cache_switch(self, toks, spans, first_turn, max_tokens=-1):
+        """before load_prompt's own matching: brings back a parked conversation that this prompt continues better than
+        the live one (parking the live one), or runs the request as a side request, or parks the live conversation when
+        the request would discard it. Requests switch only here, between replies. With parking on, only a request whose
+        reply is bounded (0 < max_tokens <= SIDE_REPLY_MAX: a title, a one-off question) is a side request: a new chat's
+        first turn is parked like any conversation, so its next turns find it cached."""
+        eng, a = self.eng, self.args
+        self.cache_pre = ""
+        seq = eng.sequence()
+        live = self.resume_point(seq, eng.committed(), eng.checkpoints(), self.img_spans, toks, spans)
+        lost = len(seq) - live[2]  # cached positions the normal path would discard
+        cont = self.live_gen >= 0 and live[0] >= self.live_gen  # (diverges in the live one's generation prompt / reply)
+        if a.park_mib > 0 and self.parked:
+            best = None
+            for e in self.parked.values():
+                r = self.resume_point(e.seq, e.committed, e.cks, e.img_spans, toks, spans)
+                if r[2] >= live[2] + a.park_min and (best is None or r[2] > best[1][2]):
+                    best = (e, r)
+            if best:
+                self.park_live(seq, "another conversation came back", keep=best[0].id)
+                self.unpark(best[0])
+                return
+        side = a.side_max > 0 and first_turn and len(toks) <= a.side_max and not cont
+        if side and lost >= max(2 * len(toks), a.park_min) and (a.park_mib <= 0 or 0 < max_tokens <= SIDE_REPLY_MAX):
+            self.side_start(seq, len(toks))
+            return
+        if a.park_mib > 0 and not cont and lost >= a.park_min:
+            self.park_live(seq, "a new conversation")
+
+    def store_update(self):
+        """refreshes store_gauge (on the request thread: /metrics and /props never call into the engine)"""
+        info = self.eng.store_info()
+        self.store_gauge = (len(self.parked), info["used"], info["allocated"], tuple(len(e.seq) for e in self.parked.values()))
+        return info
+
+    def make_room(self, need, budget, keep=None):
+        """evicts parked conversations, least recently parked first (never `keep`, the one about to be restored), until
+        `need` more bytes fit in `budget`"""
+        while self.eng.store_info()["used"] + need > budget:
+            pid = next((p for p in self.parked if p != keep), None)
+            if pid is None:
+                return
+            e = self.parked.pop(pid)
+            self.eng.park_drop(pid)
+            self.count(park_evictions=1)
+            self.store_update()
+            log(f"#{self.rid} evicted the parked conversation of {len(e.seq):,} tok ({mib(e.nbytes)}, least recently "
+                f"parked) to make room")
+
+    def park_live(self, seq, why, keep=None):
+        """a snapshot of the live conversation into the host store (the engine keeps it too); keep: a parked one that must
+        stay (it is restored next)"""
+        eng, a = self.eng, self.args
+        if len(seq) < a.park_min:
+            return
+        need, budget = eng.park_need(a.park_cks), a.park_mib << 20
+        if need > budget:
+            log(f"#{self.rid} not parked: the cached {len(seq):,} tok need {mib(need)} of host memory "
+                f"(--park-mib {a.park_mib:,})")
+            return
+        self.make_room(need, budget, keep)
+        cks = sorted(eng.checkpoints())[-a.park_cks:] if a.park_cks > 0 else []
+        pid = eng.park(a.park_cks)
+        if pid is None:
+            log(f"#{self.rid} not parked: no room in the host store for the cached {len(seq):,} tok ({mib(need)})")
+            return
+        self.parked[pid] = Parked(pid, seq, cks, eng.committed(), self.img_spans, self.live_gen, need)
+        info = self.store_update()
+        self.count(parks=1)
+        log(f"#{self.rid} parked the cached conversation ({why}): {len(seq):,} tok, {mib(info['last_bytes'])} copied in "
+            f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} of {a.park_mib:,} MiB")
+
+    def unpark(self, e):
+        """the engine becomes the parked conversation e (its entry is freed)"""
+        eng = self.eng
+        try:
+            eng.unpark(e.id)
+        except RuntimeError:  # (an engine error: the entry goes too, with its host memory)
+            self.parked.pop(e.id, None)
+            eng.park_drop(e.id)
+            self.store_update()
+            raise
+        del self.parked[e.id]
+        self.img_spans, self.live_gen = e.img_spans, e.gen
+        info = self.store_update()
+        self.count(park_restores=1)
+        self.cache_pre = f"restored a parked conversation ({len(e.seq):,} tok); "
+        log(f"#{self.rid} restored the parked conversation of {len(e.seq):,} tok: {mib(info['last_bytes'])} copied in "
+            f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} in use")
+
+    def side_start(self, seq, n):
+        """runs the request as a side request: the live sequence stays cached (Engine.side_begin; side_finish brings it
+        back after the reply)"""
+        eng = self.eng
+        pt, rings, state, _ = eng.kv_sizes()  # (room for what the request may overwrite: its prompt and a reply)
+        self.make_room(state + rings + pt * min(len(seq), n + 4096), self.store_mib << 20)
+        if not eng.side_begin():
+            log(f"#{self.rid} side request: no room in the host store: the cached {len(seq):,} tok are not kept")
+            return
+        self.side = (len(seq), self.img_spans, self.live_gen)
+        self.count(side_requests=1)
+        self.cache_pre = f"side request: the cached {len(seq):,} tok are kept aside; "
+
+    def side_finish(self):
+        """after a side request (also one that failed or whose client left): the kept sequence comes back"""
+        if self.side is None:
+            return
+        n, spans, gen = self.side
+        self.side, eng = None, self.eng
+        ok = False
+        try:
+            ok = eng.side_active() and eng.side_end()
+        except RuntimeError as e:
+            log(f"#{self.rid} side request: {e}")
+            eng.side_drop()  # (whatever is left of it: the engine starts over)
+        info = self.store_update()
+        if ok:
+            self.img_spans, self.live_gen = spans, gen
+            log(f"#{self.rid} side request done: the cached {n:,} tok are back ({mib(info['last_bytes'])}: kept in "
+                f"{info['side_ms']:.0f} ms, back in {info['last_ms']:.0f} ms)")
+        else:
+            self.img_spans, self.live_gen = [], -1
+            self.count(side_dropped=1)
+            log(f"#{self.rid} side request: the cached {n:,} tok were dropped (the host store ran full, or an engine "
+                f"error): the next request prefills its prompt in full")
 
     def setup_video(self, args):
         """video input (input_video / video_url parts): needs the vision library's frame pairs (mkv_frames_load) and an
@@ -1417,7 +1708,8 @@ class Server:
     # ---- reporting: /props, /v1/models, /slots, /metrics ----
     METRICS = ("requests", "requests_bad", "requests_failed", "requests_cancelled", "deferred", "prompt_tokens",
                "prompt_tokens_reused", "prompt_seconds", "tokens_predicted", "predicted_seconds", "decode_cycles",
-               "draft_tokens", "draft_tokens_accepted")
+               "draft_tokens", "draft_tokens_accepted", "side_requests", "side_dropped", "parks", "park_restores",
+               "park_evictions")
     _mlock = threading.Lock()
     t_start = 0.0
     warm_s = 0.0
@@ -1464,6 +1756,11 @@ class Server:
             "checkpoints": {"pool": bool(g(e, "pool", False)), "every": g(a, "ck_every"), "messages": bool(g(a, "ck_msgs")),
                             "slots": int(os.environ.get("MK_CK_SLOTS") or 8)},
             "keep_warm_s": self.warm_s, "prefill_cancel": bool(g(e, "_cancel", False)),
+            "host_cache": None if self.parked is None else {
+                "budget_mib": self.store_mib, "side_max": g(a, "side_max"), "park_mib": g(a, "park_mib"),
+                "park_min": g(a, "park_min"), "park_checkpoints": g(a, "park_cks"), "parked": self.store_gauge[0],
+                "parked_tokens": list(self.store_gauge[3]), "used_mib": round(self.store_gauge[1] / 2**20, 1),
+                "allocated_mib": round(self.store_gauge[2] / 2**20, 1)},
             "vision": None if v is None else {
                 "mmproj": os.path.basename(str(g(a, "mmproj", ""))), "backend": g(v, "backend"),
                 "threads": g(v, "n_threads"), "image_min_tokens": g(a, "image_min_tokens"),
@@ -1541,6 +1838,16 @@ class Server:
              m["requests_failed"]),
             ("megakernel:requests_cancelled_total", "counter", "Generation requests whose client disconnected.",
              m["requests_cancelled"]),
+            ("megakernel:side_requests_total", "counter", "Side requests (the cached sequence kept in host memory).",
+             m["side_requests"]),
+            ("megakernel:side_requests_dropped_total", "counter", "Side requests after which the cached sequence was lost.",
+             m["side_dropped"]),
+            ("megakernel:parks_total", "counter", "Conversations parked in host memory.", m["parks"]),
+            ("megakernel:park_restores_total", "counter", "Parked conversations brought back.", m["park_restores"]),
+            ("megakernel:park_evictions_total", "counter", "Parked conversations evicted (host memory budget).",
+             m["park_evictions"]),
+            ("megakernel:parked_conversations", "gauge", "Conversations parked in host memory now.", self.store_gauge[0]),
+            ("megakernel:host_cache_bytes", "gauge", "Host memory in use by parked conversations.", self.store_gauge[1]),
         ]
         return "".join(f"# HELP {n} {h}\n# TYPE {n} {t}\n{n} {v:g}\n" if isinstance(v, float) else
                        f"# HELP {n} {h}\n# TYPE {n} {t}\n{n} {v}\n" for n, t, h, v in rows)
@@ -1674,11 +1981,15 @@ class Server:
         ph = ", ".join(f"{k} {v:,}" for k, v in phase.items() if v)
         return s + (f" | {ph}" if ph else "") + f" | {secs(el)}"
 
-    def load_prompt(self, toks, images=(), gone=None):
+    def load_prompt(self, toks, images=(), gone=None, first_turn=False, max_tokens=-1):
         """brings the engine to `toks` processed, reusing what it has; returns (first token, reused count).
         images: [(pos, Vision.Image)] of the prompt. gone (the client left: () -> bool) is watched during the prefill,
-        which then stops at a chunk boundary with PrefillCancelled (Engine.cancel_when)"""
+        which then stops at a chunk boundary with PrefillCancelled (Engine.cancel_when). first_turn: the prompt has no
+        earlier assistant reply; max_tokens: the request's (-1: none); both for cache_switch's side request rule"""
         eng = self.eng
+        self.cache_pre = ""
+        if self.parked is not None:  # (the host cache: --side-max / --park-mib)
+            self.cache_switch(toks, [(p, im.n, im.key) for p, im in images], first_turn, max_tokens)
         seq = eng.sequence()
         lcp = 0
         for a, b in zip(seq, toks):
@@ -1747,6 +2058,8 @@ class Server:
                 self.cache_note = f"CACHE MISS: {had}, no checkpoint before that" if seq else "nothing cached"
                 r = feed(0)
         self.img_spans = spans
+        self.live_gen = gen
+        self.cache_note = self.cache_pre + self.cache_note
         return r
 
     def sampling(self, body):
@@ -1806,6 +2119,7 @@ class Server:
         finally:
             if images:  # (the request's images stay pinned until here)
                 self.vision.release([im for _, im in images])
+            self.side_finish()  # (a side request: the cached sequence comes back, also after an error or a disconnect)
 
     def _generate(self, body, emit, gone, thinking, toks, images, media=()):
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
@@ -1843,8 +2157,9 @@ class Server:
         CON.status(f"#{rid} prefill")
         t0 = time.time()
         enc0 = [im.encode_s for _, im in images]
+        first_turn = not any(isinstance(m, dict) and m.get("role") == "assistant" for m in body.get("messages") or [])
         try:
-            tok, reused = self.load_prompt(toks, images, gone)
+            tok, reused = self.load_prompt(toks, images, gone, first_turn, asked)
         except PrefillCancelled as e:  # (the engine kept nothing of it)
             log(f"#{rid} the client disconnected during the prefill of {len(toks):,} tok: stopped after "
                 f"{secs(time.time() - t0)} ({e})")
@@ -2445,6 +2760,21 @@ def main():
     ap.add_argument("--exact-reuse", action="store_true",
                     help="reused requests answer exactly as fresh ones (MK_EXACT=1): restore a checkpoint and prefill "
                          "instead of appending to decoded rows (costs prompt time when a long reply is reused)")
+    ap.add_argument("--side-max", type=int, default=env_int("MK_SIDE_MAX", 8192), metavar="N",
+                    help="side requests: a first-turn prompt (no assistant reply in it) of at most N tokens that would discard "
+                         "at least twice its length of the cached conversation (with parking on: and asks for at most 1024 "
+                         "tokens) runs without evicting it: the KV rows it overwrites go to host memory and come back "
+                         "after its reply (0: off; env MK_SIDE_MAX)")
+    ap.add_argument("--park-mib", type=int, default=env_int("MK_PARK_MIB", 8192), metavar="MIB",
+                    help="host memory for parked conversations: a request for another conversation parks the cached one "
+                         "(KV, recurrent state, checkpoints) and it comes back bit for bit when its next request arrives; "
+                         "least recently parked ones go first (allocated on first use; 0: off; env MK_PARK_MIB)")
+    ap.add_argument("--park-min", type=int, default=1024, metavar="N",
+                    help="conversations of fewer tokens are not parked; a parked one comes back when its prompt reuses at "
+                         "least N more tokens than the cached one's")
+    ap.add_argument("--park-cks", type=int, default=2, metavar="N",
+                    help="checkpoints kept with a parked conversation (the newest; with exact reuse any checkpoint gives "
+                         "the same bits, fewer only mean more re-prefill after an edit)")
     ap.add_argument("--chat-template-file", dest="chat_template", action=ChatTemplateArg, metavar="PATH",
                     help="Jinja chat template file to use instead of the GGUF's (as llama-server), e.g. another "
                          "template for a fine-tune of the same model")
@@ -2479,6 +2809,9 @@ def main():
         ap.error("--video-fps: expected a rate in (0, 30]")
     if args.video_max_tokens and args.video_max_tokens < max(8, args.image_min_tokens):
         ap.error("--video-max-tokens: expected 0 or at least 8 (and --image-min-tokens)")
+    for k in ("side_max", "park_mib", "park_min", "park_cks"):
+        if getattr(args, k) < 0:
+            ap.error(f"--{k.replace('_', '-')}: expected a number >= 0")
     args.chat_template_src = None  # (before the port opens: a bad template fails at once, not after the model load)
     if args.chat_template:
         try:
