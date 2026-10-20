@@ -145,6 +145,29 @@ static std::vector<std::string> split_line(const std::string & s, bool & ok) {
     return v;
 }
 
+// token ids from a whitespace-separated text file (--prompt-ids, --score), each checked against the vocabulary
+static std::vector<int> read_ids(const std::string & path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot read " + path);
+    std::vector<int> ids;
+    long long id;
+    while (f >> id) {
+        if (id < 0 || id >= MKEngine::n_vocab())
+            throw std::runtime_error(path + ": token id " + std::to_string(id) + " out of range (vocabulary " +
+                                     std::to_string(MKEngine::n_vocab()) + ")");
+        ids.push_back((int) id);
+    }
+    if (!f.eof()) throw std::runtime_error(path + ": item " + std::to_string(ids.size() + 1) + " is not a token id");
+    return ids;
+}
+
+// The run's output is complete: leave without the engine's ~900 device frees and the CUDA runtime's teardown, which can
+// hang on a dying driver (the process exit frees everything). Every output stream is flushed first.
+[[noreturn]] static void leave(int code) {
+    fflush(nullptr);
+    std::quick_exit(code);
+}
+
 static int run(int argc, char ** argv);
 
 // engine errors (bad arguments, a prompt over the context, non-sticky CUDA errors) end the run with a message and
@@ -294,9 +317,10 @@ static int run(int argc, char ** argv) {
             i = j + 1;
         }
         size_t longest = 0;
+        std::vector<size_t> lens; // (of the reference's sequences)
         {
             ls::Session probe(kld_file, "", {}, MKEngine::n_vocab());
-            for (const ls::Seq & q : probe.seqs()) longest = std::max(longest, q.tok.size());
+            for (const ls::Seq & q : probe.seqs()) longest = std::max(longest, q.tok.size()), lens.push_back(q.tok.size());
         }
         // --kld-images: "MKIMG01\0", n_embd, count (int32), then per image seq, pos, nx, ny (int32) and its rows
         // ([nx * ny][n_embd] fp32)
@@ -314,12 +338,23 @@ static int run(int argc, char ** argv) {
                 fprintf(stderr, "%s: not an image rows file of this model\n", kld_images.c_str());
                 return 1;
             }
+            if (hdr[1] < 0 || hdr[1] > 65536) {
+                fprintf(stderr, "%s: bad image count %d\n", kld_images.c_str(), hdr[1]);
+                return 1;
+            }
             kimg.resize(hdr[1]);
             for (KldImage & k : kimg) {
                 int v[4];
                 bool ok = fread(v, sizeof(v), 1, f) == 1;
                 if (ok) {
                     k.seq = v[0], k.pos = v[1], k.nx = v[2], k.ny = v[3];
+                    // (an image lies inside its sequence; score_logits checks it against the batched part)
+                    if (k.seq < 0 || k.seq >= (int) lens.size() || k.nx < 1 || k.ny < 1 || k.pos < 0 ||
+                        (long long) k.pos + (long long) k.nx * k.ny > (long long) lens[k.seq]) {
+                        fprintf(stderr, "%s: image %zu (sequence %d, position %d, %d x %d) is not inside its sequence\n",
+                                kld_images.c_str(), (size_t) (&k - kimg.data()), k.seq, k.pos, k.nx, k.ny);
+                        return 1;
+                    }
                     k.rows.resize((size_t) k.nx * k.ny * hdr[0]);
                     ok = fread(k.rows.data(), sizeof(float), k.rows.size(), f) == k.rows.size();
                 }
@@ -387,21 +422,14 @@ static int run(int argc, char ** argv) {
         };
         const std::string sys = reasoning_line().empty() ? "" : "<|im_start|>system\n" + reasoning_line() + "<|im_end|>\n";
         const std::string text = J.raw ? J.prompt : sys + "<|im_start|>user\n" + J.prompt + "<|im_end|>\n" + gen_prompt_of(J);
-        std::vector<int> ids = tokenize(text);
-        if (!J.prompt_ids_file.empty()) {
-            std::ifstream f(J.prompt_ids_file);
-            ids.clear();
-            int id;
-            while (f >> id) ids.push_back(id);
-        }
+        std::vector<int> ids = tokenize(text); // (also loads the vocabulary, which the decode loop reads)
+        if (!J.prompt_ids_file.empty()) ids = read_ids(J.prompt_ids_file);
         return ids;
     };
     if (!score_file.empty()) {
         const std::vector<int> prompt_ids = prompt_of(job0);
-        std::ifstream f(score_file);
-        std::vector<int> cont;
-        int id;
-        while (f >> id) cont.push_back(id);
+        const std::vector<int> cont = read_ids(score_file);
+        if (prompt_ids.empty() || cont.empty()) throw std::runtime_error("--score needs a prompt and at least one continuation token");
         std::vector<int> all = prompt_ids;
         all.insert(all.end(), cont.begin(), cont.end());
         std::vector<int> pred = eng.score(all);
