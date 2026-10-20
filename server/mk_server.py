@@ -1891,6 +1891,7 @@ class Parked:
 SIDE_STORE_MIB = 1024  # host store of side requests when parking is off (--park-mib 0)
 SIDE_REPLY_MAX = 1024  # with parking on, a side request asks for at most this many tokens (Server.cache_switch)
 SIDE_PARK_CKS = 1  # checkpoints kept with a side request's conversation (its generation prompt's: where a follow-up resumes)
+SIDE_KEEP_MAX = 4  # side requests' conversations kept at most (the oldest goes first): most are titles, never continued
 
 
 def mib(n):
@@ -2098,13 +2099,15 @@ class Server:
                 pid = next((p for p in self.parked if p != keep), None)
             if pid is None:
                 return False
-            e = self.parked.pop(pid)
-            self.eng.park_drop(pid)
-            self.count(park_evictions=1)
-            self.store_update()
-            log(f"#{self.rid} evicted the parked conversation of {len(e.seq):,} tok ({mib(e.nbytes)}, least recently "
-                f"parked{', a side request' if e.side else ''}) to make room")
+            self.evict(pid, f"least recently parked{', a side request' if self.parked[pid].side else ''}) to make room")
         return True
+
+    def evict(self, pid, why):
+        e = self.parked.pop(pid)
+        self.eng.park_drop(pid)
+        self.count(park_evictions=1)
+        self.store_update()
+        log(f"#{self.rid} evicted the parked conversation of {len(e.seq):,} tok ({mib(e.nbytes)}, {why}")
 
     def park_live(self, seq, why, keep=None):
         """a snapshot of the live conversation into the host store (the engine keeps it too); keep: a parked one that must
@@ -2184,6 +2187,9 @@ class Server:
         try:
             if eng.side_active():
                 if self.side_keep() and self.side_ready and eng.checkpoints():
+                    sides = [p for p, e in self.parked.items() if e.side]  # (least recently parked first)
+                    for p in sides[:max(0, len(sides) - SIDE_KEEP_MAX + 1)]:
+                        self.evict(p, f"the oldest of {SIDE_KEEP_MAX} kept side request conversations)")
                     own = (list(eng.sequence()), sorted(eng.checkpoints())[-SIDE_PARK_CKS:], eng.committed(), self.img_spans,
                            self.live_gen, eng.park_need(SIDE_PARK_CKS))
                     # (no room: other kinds of parked conversations are not evicted for it)

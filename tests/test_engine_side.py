@@ -129,8 +129,11 @@ class SideConversationTests(base._HttpCase):
         self.assertTrue(dropped and not set(real) & set(dropped), (dropped, real))  # side entries went, never A or B
         self.assertIn(("unpark", real[0]), [o[:2] for o in eng.ops], log)
         self.assertGreaterEqual(out["a2"]["usage"]["prompt_tokens_details"]["cached_tokens"], len(self.LONG), log)
-        self.assertIn(", a side request) to make room", log)
         self.assertEqual(self.side_ops(eng).count("side_end_park"), 40, log)
+        # at most SIDE_KEEP_MAX side conversations stay: the oldest goes before the next one is parked
+        self.assertEqual(len(dropped), 40 - self.mk.SIDE_KEEP_MAX, log)
+        self.assertIn(f"the oldest of {self.mk.SIDE_KEEP_MAX} kept side request conversations", log)
+        self.assertEqual(sum(e.side for e in srv.parked.values()), self.mk.SIDE_KEEP_MAX)
 
     def test_no_room_for_the_side_conversation_keeps_only_the_live_one(self) -> None:
         eng = _SideEngine(["a", "b"])
