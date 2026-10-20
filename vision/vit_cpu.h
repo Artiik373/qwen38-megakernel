@@ -30,8 +30,9 @@ class Vit {
     Vit(const std::string & mmproj, const Params & p);
     ~Vit();
 
-    // llama.cpp's smart resize: the size an image of w x h is resized to (multiples of 32); max_tokens > 0: that limit
-    // instead of Params::max_tokens (video frames)
+    // llama.cpp's smart resize: the size an image of w x h is resized to (multiples of 32; past an aspect ratio of
+    // max_tokens the long side is cut to keep within max_tokens); max_tokens > 0: that limit instead of
+    // Params::max_tokens (video frames)
     void target_size(int w, int h, int & tw, int & th, int max_tokens = 0) const;
     // RGB8 (nx * ny * 3, as stb_image decodes it) -> llama.cpp's preprocessed image: bilinear resize to target_size,
     // u8, then (x / 255 - mean) / std; fp32, HWC. preprocess = resize, then normalize.

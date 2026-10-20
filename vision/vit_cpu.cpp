@@ -718,6 +718,17 @@ void Vit::target_size(int width, int height, int & tw, int & th, int max_tokens)
         h_bar = ceil_by(height * beta);
         w_bar = ceil_by(width * beta);
     }
+    // past an aspect ratio of max_pixels / f^2 the clamp of the short side to f above leaves more than max_pixels (a
+    // 1,000,000 x 1 image -> 2,048,000 x 32 = 64,000 tokens of 4096: hours of encoding, ~16 GB; llama.cpp's formula has
+    // the same hole): the long side is cut to fit, so no image or frame yields more than its max tokens (a second cut,
+    // of the other side, only when a min_tokens above max_tokens made the short side alone too long). Sizes within the
+    // limit are not changed.
+    for (int cut = 0; cut < 2 && (long long) h_bar * w_bar > max_pixels; cut++) {
+        if (h_bar <= w_bar)
+            w_bar = std::max(f, max_pixels / h_bar / f * f);
+        else
+            h_bar = std::max(f, max_pixels / w_bar / f * f);
+    }
     tw = w_bar;
     th = h_bar;
 }

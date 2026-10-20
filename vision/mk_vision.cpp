@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -69,6 +70,39 @@ int default_threads() {
     return hw >= 8 ? hw - 2 : std::max(1, hw - 1);
 }
 
+// the image tokens of libmtmd's smart resize of a w x h image (mtmd-image.cpp calc_size_preserved_ratio, float arithmetic
+// as there; Qwen-VL: 32 x 32 pixels per token). Past an aspect ratio of max_tokens its clamp of the short side to 32
+// gives more than max_tokens (1,000,000 x 1 -> 64,000 tokens of 4096, hours of encoding), so the mtmd backend refuses
+// those images and frames; the cpu backend cuts them to fit (Vit::target_size).
+long long mtmd_resize_tokens(int width, int height, int min_tokens, int max_tokens) {
+    const int f = 32;
+    const long long max_pixels = (long long) max_tokens * f * f, min_pixels = (long long) min_tokens * f * f;
+    auto round_by = [f](float x) { return static_cast<int>(std::round(x / static_cast<float>(f))) * f; };
+    auto ceil_by = [f](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
+    auto floor_by = [f](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
+    int h_bar = std::max(f, round_by((float) height));
+    int w_bar = std::max(f, round_by((float) width));
+    if ((long long) h_bar * w_bar > max_pixels) {
+        const auto beta = std::sqrt(static_cast<float>((long long) height * width) / max_pixels);
+        h_bar = std::max(f, floor_by(height / beta));
+        w_bar = std::max(f, floor_by(width / beta));
+    } else if ((long long) h_bar * w_bar < min_pixels) {
+        const auto beta = std::sqrt(static_cast<float>(min_pixels) / ((long long) height * width));
+        h_bar = ceil_by(height * beta);
+        w_bar = ceil_by(width * beta);
+    }
+    return (long long) (h_bar / f) * (w_bar / f);
+}
+
+// the mtmd backend's check of an image or frame size (an empty string: fine)
+std::string mtmd_size_error(const char * what, int w, int h, int min_tokens, int max_tokens) {
+    const long long n = mtmd_resize_tokens(w, h, min_tokens, max_tokens);
+    if (n <= max_tokens) return "";
+    return std::string(what) + " of " + std::to_string(w) + " x " + std::to_string(h) + " pixels: its aspect ratio gives " +
+           std::to_string(n) + " image tokens with the mtmd vision backend, over the limit of " + std::to_string(max_tokens) +
+           " (the cpu backend cuts such images to fit)";
+}
+
 bool cpu_has_avx2_fma() {
 #if defined(_WIN32) && defined(_M_X64)
     return mkv_win::avx2_fma();
@@ -83,6 +117,7 @@ bool cpu_has_avx2_fma() {
 struct mkv_ctx {
     int backend = 0; // MKV_BACKEND_CPU or MKV_BACKEND_MTMD
     long long max_pixels = 0; // MK_IMAGE_MAX_PIXELS
+    int min_tokens = 8, max_tokens = 4096; // mtmd: the resize's image-token limits (mtmd_size_error)
     int n_embd = 0;
     int n_threads = 0;
     // mtmd
@@ -171,6 +206,8 @@ mkv_ctx * mkv_new(const char * mmproj, const char * text_model, struct mkv_param
         cp.warmup = false; // (the first encode pays the graph allocation, ~10 ms)
         cp.image_min_tokens = params.min_tokens > 0 ? params.min_tokens : -1;
         cp.image_max_tokens = params.max_tokens > 0 ? params.max_tokens : -1;
+        if (params.min_tokens > 0) c->min_tokens = params.min_tokens; // (else the projector's 8 / 4096, as above)
+        if (params.max_tokens > 0) c->max_tokens = params.max_tokens;
         c->mt = mtmd_init_from_file(mmproj, c->vocab, cp);
         if (!c->mt) throw std::runtime_error(std::string("cannot load the mmproj: ") + mmproj);
         if (!mtmd_support_vision(c->mt)) throw std::runtime_error("the mmproj has no vision encoder");
@@ -241,6 +278,8 @@ mkv_image * mkv_image_load(mkv_ctx * c, const unsigned char * data, size_t len) 
         return im;
     }
 #endif
+    g_err = mtmd_size_error("image", w, h, c->min_tokens, c->max_tokens);
+    if (!g_err.empty()) return nullptr;
     mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_buf(c->mt, data, len, false);
     if (!bw.bitmap) {
         g_err = "cannot decode the image";
@@ -348,6 +387,8 @@ mkv_image * mkv_frames_load(mkv_ctx * c, const unsigned char * rgb0, const unsig
         g_err = "the mtmd backend resizes video frames with the image token limit only (no per-frame max_tokens)";
         return nullptr;
     }
+    g_err = mtmd_size_error("frame", nx, ny, c->min_tokens, c->max_tokens);
+    if (!g_err.empty()) return nullptr;
     try {
         return frames_mtmd(c, rgb0, rgb1, nx, ny);
     } catch (const std::exception & e) {

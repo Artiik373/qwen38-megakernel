@@ -499,7 +499,12 @@ python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj mmproj-BF16.
   newlines, none next to an image), each image becomes `<|vision_start|>`, its rows, `<|vision_end|>`, and decoding /
   preprocessing (stb_image; smart resize to multiples of 32 px within 8 .. 4096 tokens, the padded bilinear resize,
   normalisation) are llama.cpp's bit for bit: same token counts and pixels as `llama-server --mmproj`
-  (`--image-min-tokens` / `--image-max-tokens` set the limits; fewer tokens encode faster).
+  (`--image-min-tokens` / `--image-max-tokens` set the limits; fewer tokens encode faster). One exception, where
+  llama.cpp's smart resize breaks its own limit: past an aspect ratio of the token limit (4096:1 by default) it clamps
+  the short side up to 32 px after scaling, so a 1,000,000 x 1 PNG of a few KB became 64,000 tokens (hours of CPU
+  encoding, ~16 GB); here the long side is cut so the image gets at most the limit (4096 x 1 tokens; the cpu encoder,
+  and video frames with their limit too), and the mtmd backend, which resizes inside libmtmd, refuses such an image
+  (400). Every image within the limit keeps llama.cpp's size and pixels (sizes checked on 1M sizes, rows bitwise).
 - **Engine** (`MKImage`, `MKEngine::prefill(tokens, cks, ck_exact, images)`, `mk_prefill_img`): an image's positions
   take its fp32 rows instead of token embeddings (`pk_embed_img`; the MTP block takes them too, as llama.cpp does) and
   llama.cpp's Qwen-VL M-RoPE positions (IMROPE: t / row / column per frequency, the text after an image continuing at
