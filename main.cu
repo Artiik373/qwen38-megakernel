@@ -388,7 +388,7 @@ static int run(int argc, char ** argv) {
             ses.report(piece);
             fflush(stdout);
         }
-        return 0;
+        leave(0);
     }
 
     int nd_engine = job0.n_draft; // batch: the engine's depth is the deepest job's (each job sets its own)
@@ -401,7 +401,7 @@ static int run(int argc, char ** argv) {
     eng.set_penalty(job0.pres, job0.freq);
     if (bench_phases) {
         eng.bench_phases();
-        return 0;
+        leave(0);
     }
 
     // chat template of the model (llama.cpp renders the same): with thinking, an optional reasoning-effort
@@ -441,7 +441,7 @@ static int run(int argc, char ** argv) {
         }
         printf("SCORE agree %d / %d (%.2f%%), first disagreement at continuation index %d\n", agree, total,
                100.0 * agree / total, first_bad);
-        return 0;
+        leave(0);
     }
 
     // one job: prompt (+ an optional second turn), output to stdout, stats to stderr
@@ -532,7 +532,7 @@ static int run(int argc, char ** argv) {
             const int f2 = open((J.out + ".err").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (f1 < 0 || f2 < 0) {
                 fprintf(stderr, "cannot write %s.out / .err\n", J.out.c_str());
-                return 1;
+                leave(1);
             }
             dup2(f1, 1);
             dup2(f2, 2);
@@ -555,11 +555,10 @@ static int run(int argc, char ** argv) {
             close(o1);
             close(o2);
             fprintf(stderr, "[mk] batch job %zu / %zu (%s) %s in %.2f s\n", k + 1, jobs.size(), J.out.c_str(), failed ? "FAILED" : "done", sj);
-            if (failed) return 1;
+            if (failed) leave(1);
         }
         fprintf(stderr, "[mk] batch: %zu jobs in %.2f s after the load\n", jobs.size(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count());
     }
-    llama_model_free(lm);
-    return 0;
+    leave(0); // (no llama_model_free: as the engine, freed by the exit)
 }

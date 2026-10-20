@@ -182,6 +182,7 @@ struct Uploader {
     cudaError_t err = cudaSuccess;
     double busy_s = 0; // time spent in the copies (worker or caller)
     size_t bytes = 0;
+    double wd_s = 0; // watchdog (MK_WATCHDOG): a wait that sees no copy finish for wd_s seconds ends the process (0: off)
     void start(bool want_async) {
         if (!want_async) return;
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
@@ -231,17 +232,41 @@ struct Uploader {
         cv.notify_one();
         return ++queued;
     }
+    // cvd.wait(l, pred), under the watchdog: a GPU or driver that stops completing copies (the runtime's own waits never
+    // time out) becomes a message and exit code 3, as Impl::wait_event does for the run-time waits
+    template <class P> void wait_done(std::unique_lock<std::mutex> & l, P pred) {
+        if (!(wd_s > 0)) {
+            cvd.wait(l, pred);
+            return;
+        }
+        uint64_t seen = done;
+        auto t0 = lclk::now();
+        while (!pred()) {
+            cvd.wait_for(l, std::chrono::milliseconds(250));
+            if (done != seen) {
+                seen = done;
+                t0 = lclk::now();
+            } else if (!pred() && lsec(t0) > wd_s) {
+                fprintf(stderr,
+                        "[mk] watchdog: the weight upload finished no copy within %g s (%llu of %llu done). The device or its "
+                        "driver is stuck: exiting with code 3.\n",
+                        wd_s, (unsigned long long) done, (unsigned long long) queued);
+                fflush(stderr);
+                std::_Exit(3);
+            }
+        }
+    }
     void wait(uint64_t seq) { // the copies up to seq are done (their sources are free)
         if (!async || !seq) return;
         std::unique_lock<std::mutex> l(mu);
-        cvd.wait(l, [&] { return done >= seq || err != cudaSuccess; });
+        wait_done(l, [&] { return done >= seq || err != cudaSuccess; });
         raise();
     }
     void finish() { // every copy done; the worker stops
         if (!async) return;
         {
             std::unique_lock<std::mutex> l(mu);
-            cvd.wait(l, [&] { return done >= queued || err != cudaSuccess; });
+            wait_done(l, [&] { return done >= queued || err != cudaSuccess; });
             stop = true;
         }
         cv.notify_all();

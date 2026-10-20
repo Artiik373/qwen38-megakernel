@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -6977,6 +6978,7 @@ struct MKEngine::Impl {
         CK(cudaEventCreateWithFlags(&wd_ev, cudaEventDisableTiming));
         if (const char * w = getenv("MK_WATCHDOG")) wd_limit = atof(w);
         if (const char * w = getenv("MK_WATCHDOG_SPIN")) wd_spin_s = atof(w);
+        upl.wd_s = wd_limit > 0.0 ? std::max(wd_limit, 120.0) : 0.0; // (the weight upload: as the prefill chunks)
         if (const char * f = getenv("MK_FAULT")) {
             const std::string s = f;
             const size_t c = s.find(':');
