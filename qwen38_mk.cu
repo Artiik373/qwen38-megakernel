@@ -130,6 +130,18 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #if MK_K5 && MK_GSYNC != 0
 #error "MK_K5 needs MK_GSYNC=0 (its split barrier is form 0's arrival / poll on the same counter)"
 #endif
+// MK_C1 (review idea C1-I1, compile-time; 0 = the code without it): the ffn_gu -> ffn_down grid barrier becomes per-chunk
+// waits. ffn_down (resid_wv) runs in WV_S split-K chunks of G = gridDim / WV_S blocks, and chunk kc reads only the gate /
+// up tiles 272 kc .. 272 kc + 271; ffn_gu_wv deals exactly those tiles to chunk kc's blocks, each block counts its
+// arrival on the chunk's counter, and resid_wv waits for its own chunk's G arrivals before it reads cB.qa. Bitwise exact
+// (the same tiles and arithmetic; only which block computes a gate / up tile and when ffn_down starts change). Layers whose
+// gate and up are both on dp4a at T <= 5 (ffn_gu: warp-cyclic rows, every block feeds every chunk) keep the barrier.
+#ifndef MK_C1
+#define MK_C1 0
+#endif
+#if MK_C1 && !MK_WV
+#error "MK_C1 needs MK_WV=1 (the split-K ffn_down it waits in)"
+#endif
 // MK_K2_TB (stockfix K2): tokens per batch of resid_wv's last-arrival combine (their partial loads issued together; 8 beat 4
 // by 0.5-0.8 us per call at 38k, no new spills)
 #ifndef MK_K2_TB
@@ -4691,6 +4703,16 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_RESID_SOUT);
             dl++;
         }
+#if MK_C1
+        // C1: no grid barrier between gate / up and ffn_down: each ffn_down chunk waits for its own gate / up tiles
+        // (resid_wv role bit 1). Not with a dp4a ffn_gu (T <= 5, gate and up both off the wv layout).
+        if (WIDE || ((W.fg.fm || W.fu.fm) && W.fd.fm)) {
+            ffn_gu_wv<T>(W, true);
+            resid_wv<T, true, FF>(W.fd, cB.qa, wnext, 3);
+            gsync(epoch, PH_FFN_DOWN);
+            continue;
+        }
+#endif
         if constexpr (WIDE) ffn_gu_wv<T>(W);
         else if (W.fg.fm || W.fu.fm) ffn_gu_wv<T>(W);
         else ffn_gu<T>(W, sm);
@@ -5047,6 +5069,9 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
         cB.prof[0] = gtimer() << 8;
         s_bar_k = 0;
     }
+#if MK_C1
+    if (threadIdx.x == 0) s_c1n = 0; // (C1 split edges passed: c1_wait's target)
+#endif
     switch (P.T) {
         case 1: run_main<1>(P, sm, epoch); break;
         case 2: run_main<2>(P, sm, epoch); break;
@@ -7310,6 +7335,9 @@ struct MKEngine::Impl {
 #if MK_K5
         fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order (MK_K5=1)\n");
 #endif
+#if MK_C1
+        fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier (MK_C1=1)\n");
+#endif
         hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
         {
             const size_t rows = (size_t) kv_slots * NKV * hb.ctx; // (no MTP block: no slot N_ATT_SLOTS - 1)
@@ -7467,7 +7495,11 @@ struct MKEngine::Impl {
         hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
         hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
         hb.pcnt = nullptr;   // 0.5 MB for the presence / frequency penalty, allocated by the first set_penalty
+#if MK_C1
+        hb.bar = dalloc<unsigned>(C1_WORDS); // count word | go word | C1's per-chunk counters, each on its own line
+#else
         hb.bar = dalloc<unsigned>(2 * GS_GO); // count word | go word (gsync form 1 / 2, the gsync bench) on its own line
+#endif
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
 #if MK_WV
@@ -7733,7 +7765,11 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] MK_TEST_NAN: NaN K scales before decode launch %d\n", test_nan_n);
         }
 #endif
+#if MK_C1
+        CK(cudaMemsetAsync(hb.bar, 0, C1_WORDS * 4)); // (bench launches use only the first two lines)
+#else
         CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
+#endif
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
         wd_T = T;

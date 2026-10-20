@@ -1135,10 +1135,48 @@ __device__ __forceinline__ void glu_store(int j, const float (&act)[T]) {
     }
 }
 
-// FFN gate / up: warp item = tile j of gate and of up -> silu(g) * u quantised per 16-chunk (chunk j) for ffn_down
+#if MK_C1
+// C1 (MK_C1): per-chunk readiness of cB.qa between ffn_gu_wv and ffn_down's resid_wv. Chunk kc's counter is the word
+// cB.bar + C1_W0 + GS_GO kc (own 128-byte line; zeroed with the barrier words before every launch). Each of the chunk's G
+// producer blocks release-adds 1 after its gate / up tiles (c1_arrive); the chunk's consumers (the same G blocks)
+// acquire-poll it until it reaches G x the number of split edges this launch has passed (s_c1n, thread 0 of each block
+// of chunks 0 .. WV_S - 1; mk_cycle zeroes it). Cumulative, never reset within a launch: the next edge's adds come only
+// after the PH_FFN_DOWN grid barrier, which every consumer reaches after its wait, so a count of G e is reached exactly
+// when edge e's producers have all arrived.
+constexpr int C1_W0 = 2 * GS_GO, C1_WORDS = C1_W0 + WV_S * GS_GO; // (cB.bar words incl. gsync's count / go lines)
+static_assert((FF / 16) % WV_S == 0, "gate / up tiles per ffn_down chunk");
+static_assert(SM_TOTAL + 32 <= 99 * 1024, "mk_cycle's dynamic + static shared memory (+ s_c1n)");
+__shared__ unsigned s_c1n;
+__device__ __forceinline__ void c1_arrive(int kc) {
+    __syncthreads(); // (every warp's q16 stores of the block's tiles before thread 0's release)
+    if (threadIdx.x == 0) asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(cB.bar + C1_W0 + GS_GO * kc) : "memory");
+}
+__device__ __forceinline__ void c1_wait(int kc, int G) {
+    if (threadIdx.x == 0) {
+        const unsigned e = ++s_c1n * (unsigned) G;
+        const unsigned * w = cB.bar + C1_W0 + GS_GO * kc;
+        unsigned v;
+        do {
+            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(w) : "memory");
+        } while (v < e);
+    }
+    __syncthreads();
+}
+#endif
+
+// FFN gate / up: warp item = tile j of gate and of up -> silu(g) * u quantised per 16-chunk (chunk j) for ffn_down.
+// c1 (MK_C1): the tiles of ffn_down chunk kc go to that chunk's blocks (resid_wv: G = gridDim / WV_S blocks per chunk;
+// blocks past WV_S G take none), and each block arrives on its chunk's counter after its tiles (no grid barrier follows).
 template <int T>
+#if MK_C1
+__device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tq = lane & 3;
+    const int G1 = gridDim.x / WV_S, kc1 = blockIdx.x / G1;
+    if (c1 && kc1 >= WV_S) return;
+#else
 __device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tq = lane & 3;
+#endif
 #if MK_WV_Q6F // (every main-layer Q6_K is FM: the q32 tiles need the per-chunk qsum table)
     const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.fg.type == T_Q6K || W.fu.type == T_Q6K);
 #else
@@ -1146,7 +1184,17 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
 #endif
     const float * s_rs = misc(nullptr);
     constexpr int NJ = FF / 16;
+#if MK_C1
+    int t0 = NJ * blockIdx.x / gridDim.x, t1 = NJ * (blockIdx.x + 1) / gridDim.x;
+    if (c1) {
+        constexpr int NJC = NJ / WV_S;
+        const int bi = blockIdx.x - kc1 * G1;
+        t0 = NJC * kc1 + NJC * bi / G1;
+        t1 = NJC * kc1 + NJC * (bi + 1) / G1;
+    }
+#else
     const int t0 = NJ * blockIdx.x / gridDim.x, t1 = NJ * (blockIdx.x + 1) / gridDim.x;
+#endif
     const bool gw = W.fg.fm, uw = W.fu.fm;
     for (int j = t0 + (NW - 1 - warp); j < t1; j += NW) {
         float act[T];
@@ -1184,6 +1232,9 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
         }
         glu_store<T>(j, act);
     }
+#if MK_C1
+    if (c1) c1_arrive(kc1);
+#endif
 }
 
 // Output rows with the residual add (out: K = VD, ffn_down: K = FF, X16 = its per-16 activations), split-K WV_S chunks
@@ -1200,6 +1251,9 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
     const int G = gridDim.x / WV_S, b = blockIdx.x;
     if (b >= WV_S * G) return;
     const int kc = b / G, bi = b - kc * G;
+#if MK_C1
+    if (role & 2) c1_wait(kc, G); // (C1: ffn_down after ffn_gu_wv's c1 dealing, no grid barrier: this chunk's tiles of in)
+#endif
 #if MK_MAXT > 5
 #if MK_WV_Q6F
     const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false, nullptr, X16 && wv_min2(Wm.type), !X16 && Wm.type == T_Q6K);
@@ -1211,7 +1265,11 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
 #endif
     constexpr int NTILE = D / 16;
     const int t0 = NTILE * bi / G, t1 = NTILE * (bi + 1) / G;
+#if MK_C1
+    unsigned * cnt = cB.wvcnt + (role & 1) * (D / 32); // (role bit 1: the C1 wait above)
+#else
     unsigned * cnt = cB.wvcnt + role * (D / 32);
+#endif
     float * x = cB.x;
     for (int tile = t0 + (NW - 1 - warp); tile < t1; tile += NW) {
 #if MK_MAXT > 5 && MK_WV_OUT
