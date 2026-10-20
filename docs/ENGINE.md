@@ -726,10 +726,12 @@ placed a color change at the right time after 30 s of feed.
 - **Per-chunk waits before ffn_down** (`MK_C1`, on in every `MK_WV` build): ffn_down runs in four split-K chunks, and
   each chunk's blocks compute exactly the gate / up tiles that chunk reads, count them on the chunk's own counter and
   wait only for that, instead of a grid barrier over all blocks. Bitwise exact; decode +0.4% at 38k, +0.6% at 101.6k and
-  +0.4% on short prompts (A-B-A, 2026-10-20). `-DMK_EGRESS=1` (off by default) also drops the per-launch device-to-host
-  copy and barrier reset: the kernel writes its control block to mapped host memory and the barrier counts carry over
-  between launches. Bitwise exact; on Linux decode +1.0..1.3% at 38k, +0.7..1.2% at 101.6k and +1.0..1.3% on short
-  prompts (two A-B-As, 2026-10-20); 2 MiB more VRAM.
+  +0.4% on short prompts (A-B-A, 2026-10-20).
+- **No per-launch copy or barrier reset** (`MK_EGRESS`, on in every `MK_WV` build): the kernel writes its control block
+  to mapped host memory instead of a device-to-host copy per launch, the barrier counts carry over between launches
+  instead of being zeroed, and new draft-vocabulary rows are uploaded asynchronously. Bitwise exact; decode on Linux
+  +1.0..1.3% at 38k, +0.7..1.2% at 101.6k and +1.0..1.3% on short prompts (two A-B-As), natively on Windows +1.0% at
+  38k, +0.8% at 101.6k and +1.0% on short prompts (2026-10-20); 2 MiB more VRAM. `-DMK_EGRESS=0` builds without it.
 - **Attention**: split-K flash decoding with tensor-core MMAs (Q.K^T and P.V in fp16 with fp32 accumulation, online
   softmax) over 32-position K/V tiles; the chunk boundaries depend on the context length only, so greedy output does
   not depend on the draft depth. With the q8 cache (`attn_core_q8`) each block runs a three-deep software pipeline with

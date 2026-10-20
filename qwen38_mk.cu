@@ -144,7 +144,8 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #if MK_C1 && !MK_WV
 #error "MK_C1 needs MK_WV=1 (the split-K ffn_down it waits in)"
 #endif
-// MK_EGRESS (compete C4's host egress, agent_xdec's e2caa08 bit 2; compile-time, 0 = the code without it): block 0 copies
+// MK_EGRESS (compete C4's host egress, agent_xdec's e2caa08 bit 2; compile-time, on in every MK_WV build, 0 = the code
+// without it): block 0 copies
 // the launch's Ctl to a mapped host mirror after the launch's last grid barrier (step() reads the mirror instead of a
 // device-to-host copy), the barrier counts run on across launches (each launch starts from the counts the previous one
 // left, kept in cB.bar words; wrap-safe compares) so launch() zeroes them only once, and dv_add uploads asynchronously
@@ -152,9 +153,10 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 // build (fewer copy-engine switches per launch). Linux A-B-A 2026-10-20 (served flags, -d 7, two timing holds): decode
 // +0.97 / +1.28% at 38k, +0.74 / +1.20% at 101.6k, +1.05 / +1.34% short; in MK_PROFILE the DRAM-bound phases run ~1-2%
 // faster per call too (cause not established; agent_xdec's 10-17 run, with its resid_wv change, saw no change).
+// Native Windows A-B-A 2026-10-20 (same commit, the flag only): +1.0% at 38k, +0.8% at 101.6k, +1.0% short.
 // +16 B mk_cycle stack frame (+2 MiB local memory).
 #ifndef MK_EGRESS
-#define MK_EGRESS 0
+#define MK_EGRESS MK_WV
 #endif
 // MK_K2_TB (stockfix K2): tokens per batch of resid_wv's last-arrival combine (their partial loads issued together; 8 beat 4
 // by 0.5-0.8 us per call at 38k, no new spills)
