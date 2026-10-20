@@ -722,6 +722,10 @@ placed a color change at the right time after 30 s of feed.
 - **Split barrier before the DeltaNet core** (`MK_K5=1`, served build): the 48 DeltaNet heads go to the first 48 blocks
   that finish the DeltaNet projections; they load the head's state and replay its accepted drafts before waiting for
   the rest. Bitwise exact; decode +1.1% at 38k and +0.75% at 101.6k context (A-B-A, 2026-10-17).
+- **Per-chunk waits before ffn_down** (`MK_C1`, on in every `MK_WV` build): ffn_down runs in four split-K chunks, and
+  each chunk's blocks compute exactly the gate / up tiles that chunk reads, count them on the chunk's own counter and
+  wait only for that, instead of a grid barrier over all blocks. Bitwise exact; decode +0.4% at 38k, +0.6% at 101.6k and
+  +0.4% on short prompts (A-B-A, 2026-10-20).
 - **Attention**: split-K flash decoding with tensor-core MMAs (Q.K^T and P.V in fp16 with fp32 accumulation, online
   softmax) over 32-position K/V tiles; the chunk boundaries depend on the context length only, so greedy output does
   not depend on the draft depth. With the q8 cache (`attn_core_q8`) each block runs a three-deep software pipeline with

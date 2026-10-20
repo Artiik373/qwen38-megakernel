@@ -130,14 +130,16 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #if MK_K5 && MK_GSYNC != 0
 #error "MK_K5 needs MK_GSYNC=0 (its split barrier is form 0's arrival / poll on the same counter)"
 #endif
-// MK_C1 (review idea C1-I1, compile-time; 0 = the code without it): the ffn_gu -> ffn_down grid barrier becomes per-chunk
-// waits. ffn_down (resid_wv) runs in WV_S split-K chunks of G = gridDim / WV_S blocks, and chunk kc reads only the gate /
-// up tiles 272 kc .. 272 kc + 271; ffn_gu_wv deals exactly those tiles to chunk kc's blocks, each block counts its
-// arrival on the chunk's counter, and resid_wv waits for its own chunk's G arrivals before it reads cB.qa. Bitwise exact
-// (the same tiles and arithmetic; only which block computes a gate / up tile and when ffn_down starts change). Layers whose
-// gate and up are both on dp4a at T <= 5 (ffn_gu: warp-cyclic rows, every block feeds every chunk) keep the barrier.
+// MK_C1 (review idea C1-I1, compile-time; on in every MK_WV build, 0 = the code without it): the ffn_gu -> ffn_down grid
+// barrier becomes per-chunk waits. ffn_down (resid_wv) runs in WV_S split-K chunks of G = gridDim / WV_S blocks, and
+// chunk kc reads only the gate / up tiles 272 kc .. 272 kc + 271; ffn_gu_wv deals exactly those tiles to chunk kc's
+// blocks, each block counts its arrival on the chunk's counter, and resid_wv waits for its own chunk's G arrivals before
+// it reads cB.qa. Bitwise exact (the same tiles and arithmetic; only which block computes a gate / up tile and when
+// ffn_down starts change). Layers whose gate and up are both on dp4a at T <= 5 (ffn_gu: warp-cyclic rows, every block
+// feeds every chunk) keep the barrier. A-B-A 2026-10-20 (served flags, -d 7): decode +0.41% at 38k, +0.59% at 101.6k,
+// +0.44% short; MK_PROFILE ffn_gu + ffn_down -3.3 .. -3.6 us per layer at T 7 / 8.
 #ifndef MK_C1
-#define MK_C1 0
+#define MK_C1 MK_WV
 #endif
 #if MK_C1 && !MK_WV
 #error "MK_C1 needs MK_WV=1 (the split-K ffn_down it waits in)"
