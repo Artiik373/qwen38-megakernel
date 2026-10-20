@@ -90,8 +90,9 @@ Upstream's engine (open-jet 2993f47, 4 drafts) ran the same scripts on this card
 - Greedy token ids are identical at 0, 4 and 7 drafts. With sampling, the verification keeps the token distribution of
   sampling without drafts (chi-square and PIT tests).
 - With exact reuse on (`--exact-reuse`, set by the launchers), a reused prefix (an edit or a follow-up turn) answers bit
-  for bit like a fresh prefill of the whole conversation. A parked conversation restored from host memory, and a
-  conversation kept through a side request, continue bit for bit as if nothing else had run in between.
+  for bit like a fresh prefill of the whole conversation, greedy and sampled with the same seed (the draft vocabulary is
+  rebuilt as a fresh prefill builds it). A parked conversation restored from host memory, and a conversation kept
+  through a side request, continue bit for bit as if nothing else had run in between.
 - The output is not byte-identical to llama.cpp's, whose arithmetic is ordered and rounded differently. Scored against
   llama.cpp's own next-token distributions (13,299 positions of code and prose; reference: llama.cpp generating token by
   token with its q8_0 KV cache), the engine agrees on 98.737% of the top tokens with a mean KL divergence of 0.00119
@@ -213,8 +214,10 @@ conversations only between replies (a reply in progress is never paused):
 - **Side requests:** a new conversation's first request of at most `MK_SIDE_MAX` tokens (default 8192; `0` = off) that
   would otherwise throw away a much longer cached conversation, such as a client's title request, runs beside it. Only
   the rows it overwrites go to host memory and back (12-20 ms), and the cached conversation is not touched. With
-  parking on, this applies to requests that cap their reply at `max_tokens` <= 1024; other new conversations are parked
-  like any other, so their next turn is cached too.
+  parking on, this applies to requests that cap their reply at `max_tokens` <= 1024 (other new conversations are parked
+  like any other), and the side request's own conversation is parked after its reply too, so a follow-up turn with a
+  capped reply continues it beside the cached conversation again instead of reading it again. These short
+  conversations are the first to go when host memory is full: they never push out a parked conversation.
 - **In practice:** with OpenCode 2.0.32 on native Windows (230k context, preset D), two coding sessions running at the
   same time finished in 110 s with ~72k prompt tokens prefilled, against 242 s and ~232k with the store off
   (2026-10-19).

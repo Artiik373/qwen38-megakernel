@@ -141,7 +141,10 @@ second user turn appended to the conversation), `--score ids.txt` (teacher-force
 (`--ref-out`, `--score-path`, `--kld-images`: see [Correctness](#correctness)), `--state-dir dir` (post-prefill state
 files: the first prompt's prefill is restored from there when a file of the same prompt, binary, model and settings
 exists, else saved), `--digest` (a hash of the state after the first prefill), `--batch jobs.txt` (one job per line,
-one model load).
+one model load). Token ids read from files (`--prompt-ids`, `--score`, a `--kld` reference's sequences and records)
+must lie in the vocabulary, and `--kld-images` rows inside their sequence: anything else is refused with a message
+before it is used. After its output the CLI leaves without freeing the engine's memory one buffer at a time (the
+process exit frees it; ~900 frees could hang on a failing driver).
 
 Environment variables for runs (read at load):
 - `MK_KV`, `MK_KV_WIN`: low-bit KV cache ([KV cache](#kv-cache)).
@@ -150,9 +153,9 @@ Environment variables for runs (read at load):
 - `MK_EXACT=1`: exact reuse (the server sets it with `--exact-reuse`; see [Server](#server)).
 - `MK_CK_SLOTS=n`: DeltaNet checkpoint slots in pinned host memory (default 8; the CLI keeps 1 unless set).
 - `MK_KEEP_WARM_S=s`: keep-warm window after each server request (default 120, 0 = off; [Server](#server)).
-- `MK_WATCHDOG=s`: seconds a decode launch may take before the engine stops with an error (default 60; prefill chunks
-  and checkpoint copies get at least 120 s; 0 = plain blocking waits). A GPU fault the CUDA runtime does not report
-  becomes an error message and exit code 3 instead of a hang.
+- `MK_WATCHDOG=s`: seconds a decode launch may take before the engine stops with an error (default 60; prefill chunks,
+  checkpoint copies and the weight upload, where no copy may take longer, get at least 120 s; 0 = plain blocking waits).
+  A GPU fault the CUDA runtime does not report becomes an error message and exit code 3 instead of a hang.
 - `MK_POLICY`: the draft-depth policy ([How it works](#how-it-works)).
 - `MK_STATE_WARM_MS=ms`: GPU warm-up before decoding from a restored state file (`--state-dir`; default 1000, 0 = off).
 
@@ -356,19 +359,34 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   restores the last checkpoint at or before the divergence and prefills from there. The prefill computes rows that do
   not depend on where its chunks start (attention over absolute key segments, checkpoints on the absolute 32-token scan
   grid), so a reused request answers bit for bit like the same request sent fresh. The cost is the previous reply's
-  re-prefill on a follow-up turn.
+  re-prefill on a follow-up turn. The draft vocabulary (the draft head's rows: the base list, then the tokens the
+  sequence added) goes along: a rewind or truncate rebuilds it as a fresh prefill of the kept prefix builds it, and the
+  next prefill extends it as a fresh prefill of the whole prompt would, so the drafts, and with them a sampled reply with
+  a fixed seed, are those of the request sent fresh too (before, the abandoned reply's tokens stayed in it).
 - **Side requests** (`--side-max n`, default 8192): a prompt of at most n tokens without an earlier assistant reply in
   it (a client's title request, a quick test) that would otherwise discard at least twice its length of the cached
   sequence (with parking on, below: one that also asks for at most 1024 tokens; other new chats are parked like any
   conversation, so their next turns find them cached) runs without evicting it (`MKEngine::side_begin` / `side_end`):
   the engine keeps the cached sequence aside (its recurrent state, 183 MB, is copied to pinned host memory at once; its
   KV and window-ring rows only when a launch of the side request is about to overwrite them, 1024 rows at a time), hides
-  its checkpoints and saves none, and runs the request from position 0 as a reset engine would (same reply as on a fresh
-  server). After the reply (also after a disconnect or an error) everything is copied back and the cached sequence is
-  bit for bit as before, so the next request of that conversation reuses it as usual. Cost: ~10-20 ms each way under
-  WSL2 for a 2.7k-8k-token side prompt, whatever the length of the cached sequence. If the host store runs out of room
-  during the side request, or the engine fails, the cached sequence is dropped and the next prompt is prefilled in full
-  (logged; never a corrupt cache).
+  its checkpoints, and runs the request from position 0 as a reset engine would (same reply as on a fresh server). The
+  side request saves its generation prompt's checkpoint in the same pool: a slot holding one of the cached sequence's
+  checkpoints is copied to host memory first. After the reply (also after a disconnect or an error) everything is
+  copied back and the cached sequence is bit for bit as before, so the next request of that conversation reuses it as
+  usual. Cost: ~10-20 ms each way under WSL2 for a 2.7k-8k-token side prompt, whatever the length of the cached
+  sequence. If the host store runs out of room during the side request, or the engine fails, the cached sequence is
+  dropped and the next prompt is prefilled in full (logged; never a corrupt cache).
+- **Side conversations** (with parking on): after a side request whose prompt was processed, its own conversation is
+  parked first (`MKEngine::side_end_park`: as a parked conversation, below, with its one checkpoint), then the cached
+  sequence comes back. A later request that continues it (it matches up to that conversation's generation prompt) and
+  would be a side request but for its earlier turns runs as a side request again, resumed from the parked conversation
+  (`MKEngine::side_unpark`: the cached sequence stays aside, only the rows the short conversation needs move), so a chat
+  with a capped reply keeps its prefix cached beside a long conversation, and its replies are those of the same
+  conversation on a fresh server. These entries are evicted before any other parked conversation, and parking one never
+  evicts anything but another of them. Cost under WSL2 (q8 KV, a 1.5k-token side conversation, chunks already
+  allocated): ~25-30 ms to park it (0.4 GB: its rows, recurrent state and checkpoint) and ~8 ms to copy the slot its
+  checkpoint takes, ~25-35 ms to continue it (`side_unpark`); preset D's window rings about double that. Re-reading it
+  instead would take ~0.9 s at 1.5k tokens and ~5 s at 8k.
 - **Parked conversations** (`--park-mib n`, default 8192 MiB; 0 = off): when a request belongs to another conversation
   (it would discard at least `--park-min` [1024] tokens of the cached one and does not continue its last turn), the
   cached conversation is first copied to pinned host memory (`MKEngine::park`: its KV rows, window rings, recurrent
@@ -429,13 +447,15 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   `build.ps1` write them into `mk_build_info.h`; "unknown" for libraries built otherwise), plus an `engine` block with
   what the server knows for sure: context, KV format asked for (`auto` is resolved inside the engine), MTP layer and
   depth, draft vocabulary, exact reuse, checkpoint settings, keep-warm window, `host_cache` (budget, side request and
-  parking settings, parked conversations and their token counts, host memory in use / allocated), vision encoder
+  parking settings, parked conversations and their token counts, how many of them are side conversations and whether
+  side conversations are kept, host memory in use / allocated), vision encoder
   settings, limits, the `MK_*` environment, busy, uptime. `GET /v1/models`: the model with `meta` (n_ctx, file size,
   n_embd). `GET /slots`: one slot with `is_processing` (`?fail_on_no_slot=1`: 503 while busy). `GET /metrics` (always
   on): Prometheus text with llama-server's `llamacpp:` names where they mean the same (prompt / predicted tokens and
   seconds, throughput, requests processing / deferred) and `megakernel:` ones (reused prompt tokens, decode cycles, MTP
   drafted / accepted tokens, requests received / 4xx / 5xx / cancelled by a disconnect, side requests and those that
-  lost the cached sequence, conversations parked / restored / evicted, parked conversations and their host memory now).
+  lost the cached sequence, side conversations parked / resumed, conversations parked / restored / evicted, parked
+  conversations and their host memory now).
 - Anthropic Messages API (`POST /v1/messages`, streaming or not; `POST /v1/messages/count_tokens`): the request is
   translated to the chat request above and generated by the same code (as llama-server does), so a greedy reply is the
   same as through `/v1/chat/completions`. `system` (a string or text blocks, joined by blank lines; Claude Code's
@@ -517,9 +537,9 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   prefill chunk (`mk_cancel` / `MKEngine::cancel`: a host flag read between chunks of 2048 tokens, no device sync); the
   chunk running and the one queued behind it finish, so the engine is free 1-2 chunks later. Nothing of a stopped
   prefill counts: the engine drops the checkpoints it saved and goes back to the last checkpoint from before it (or
-  resets without one), with the draft vocabulary as it was, so the next request answers as on a server that never saw
-  it. After a disconnect during decoding the engine keeps what it generated, as after a reply cut by `max_tokens`, so the
-  next request reuses or rewinds it as usual.
+  resets without one), with the draft vocabulary as it was at that position, so the next request answers as on a server
+  that never saw it. After a disconnect during decoding the engine keeps what it generated, as after a reply cut by
+  `max_tokens`, so the next request reuses or rewinds it as usual.
 - Console (stderr): every log line is `[mk-server] HH:MM:SS ...`; a generation request is numbered (`#12`) and logs
   three lines: what it asks for (route, stream, the `model` field, prompt tokens, messages, tools, images / videos,
   thinking, max_tokens, the sampling used), its prompt (`N cached + M prefilled in s (prefill tok/s)` and how the cache
