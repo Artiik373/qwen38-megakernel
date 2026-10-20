@@ -584,7 +584,12 @@ library, a video request gets a 400 naming what is missing. Any container / code
   llama.cpp's default) into RGB24, as llama.cpp's mtmd-helper does (`-vf fps=4.000000 -pix_fmt rgb24`), read as a PPM
   stream so that no ffprobe is needed: the same frames, byte for byte, as llama.cpp's command. Each frame is resized
   like an image (smart resize; `--video-max-tokens` caps a frame's tokens, default the image limit). A decode that
-  takes over 300 s, or a clip ffmpeg cannot read, is a 400.
+  takes over 300 s, or a clip ffmpeg cannot read, is a 400. Frames over `MK_IMAGE_MAX_PIXELS` are a 400 as images are,
+  checked from each frame's header before it is read, and ffmpeg does not decode frames past the limit plus 8 Mpx
+  (`-max_pixels`; the slack covers its decoders' row alignment; its default takes frames up to 2^31 pixels, so a clip of
+  a few hundred KB declaring 40,000 x 40,000 frames meant 4.8 GB of RGB per frame). Measured 2026-10-19: a
+  clip of 11000 x 10000 frames took 5.2 s, 0.66 GB in the server and 2 GB in ffmpeg before its frames were refused;
+  now 0.05 s and ~50 MB.
 - **Prompt, as llama.cpp b10246 builds it:** the clip's media marker becomes the text `Video:`, then the frames with a
   timestamp text after each frame that reaches the next 5 s mark (`[0m0.00s]` after frame 0, `[0m5.00s]` after the
   frame at 5 s, ...; float arithmetic as llama.cpp's), each text tokenized on its own. Consecutive frames merge in

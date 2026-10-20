@@ -2,11 +2,15 @@
 text in message content, video frame sizes. Fake engines and the test server come from test_mk_server.py."""
 import email.message
 import http.client
+import io
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -463,6 +467,98 @@ class EngineTokenizeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             e.tokenize("ab", special=False)
         self.assertEqual(e.controls(), {})
+
+
+# === C3-3: video frame size before the pixel limit ===
+class _Reads(io.BytesIO):
+    """a stream that records the sizes asked of read()"""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.asked = []
+
+    def read(self, n=-1):
+        self.asked.append(n)
+        return super().read(n)
+
+
+class _Proc:
+    """subprocess.Popen of a fake ffmpeg: stdout / stderr from bytes"""
+
+    def __init__(self, out, err=b"", code=0):
+        self.stdout, self.stderr, self.returncode = io.BufferedReader(io.BytesIO(out)), io.BytesIO(err), code
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _ppm(w, h, v=0):
+    return b"P6\n%d %d\n255\n" % (w, h) + bytes([v]) * (w * h * 3)
+
+
+class VideoFrameSizeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mk = base._load_mk_server()
+
+    def test_a_frame_over_the_limit_is_refused_from_its_header(self) -> None:
+        f = _Reads(b"P6\n40000 40000\n255\n" + bytes(64))
+        with self.assertRaises(self.mk.FrameTooLarge) as cm:
+            self.mk.read_ppm(f, 100_000_000)
+        self.assertIn("40000 x 40000 pixels: over the limit of 100000000 pixels (MK_IMAGE_MAX_PIXELS)", str(cm.exception))
+        self.assertLessEqual(max(f.asked), 1)  # (the header only: the 4.8 GB of pixels are never asked for)
+        self.assertEqual(self.mk.read_ppm(io.BytesIO(_ppm(100, 100, 3)), 10_000), (100, 100, bytes([3]) * 30000))
+        self.assertEqual(self.mk.read_ppm(io.BytesIO(_ppm(5, 5)))[:2], (5, 5))  # (no limit)
+
+    def _frames(self, proc, limit=10_000):
+        dec = self.mk.VideoDecoder("ffmpeg")
+        with mock.patch.object(self.mk.subprocess, "Popen", return_value=proc) as popen, \
+                mock.patch.object(self.mk, "IMAGE_MAX_PIXELS", limit):
+            out = list(dec.frames(b"video", 4.0, 10))
+        return out, popen.call_args[0][0]
+
+    def test_the_decoder(self) -> None:
+        out, cmd = self._frames(_Proc(_ppm(100, 100) * 2))
+        self.assertEqual(len(out), 2)
+        # (ffmpeg's decoder: an input option, with room for the decoders' row alignment)
+        self.assertEqual(cmd[cmd.index("-max_pixels") + 1], str(10000 + self.mk.VideoDecoder.MAX_PIXELS_SLACK))
+        self.assertLess(cmd.index("-max_pixels"), cmd.index("-i"))
+        self.assertEqual(self._frames(_Proc(_ppm(2, 2)), limit=10 ** 12)[1][cmd.index("-max_pixels") + 1], str(2 ** 31 - 1))
+        with self.assertRaises(self.mk.BadRequest) as cm:  # (a frame read past the limit: an ffmpeg without it)
+            self._frames(_Proc(_ppm(100, 100) + b"P6\n200 200\n255\n"))
+        self.assertIn("frame of 200 x 200 pixels: over the limit of 10000 pixels (MK_IMAGE_MAX_PIXELS)", str(cm.exception))
+        err = b"[png @ 0x1] [IMGUTILS @ 0x2] Picture size 300x200 exceeds specified max pixel count 10000, see ...\n"
+        for out in (b"", _ppm(100, 100)):  # (ffmpeg refused every frame, or one after smaller ones)
+            with self.assertRaises(self.mk.BadRequest) as cm:
+                self._frames(_Proc(out, err, 69))
+            self.assertIn("frames of about 300 x 200 pixels: over the limit of 10000 pixels", str(cm.exception))
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "no ffmpeg on PATH")
+    def test_real_clips_over_the_limit(self) -> None:
+        def clip(size):
+            with tempfile.TemporaryDirectory() as d:
+                p = os.path.join(d, "c.mkv")
+                subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c=red:s={size}:r=1", "-frames:v",
+                                "2", "-c:v", "png", p], check=True, timeout=60)
+                with open(p, "rb") as f:
+                    return f.read()
+        dec = self.mk.VideoDecoder(shutil.which("ffmpeg"))
+        small, big = clip("1100x1000"), clip("3200x3000")
+        with mock.patch.object(self.mk, "IMAGE_MAX_PIXELS", 1_100_000):  # (exactly the frame: decoded, 1152 x 1000 aligned)
+            self.assertEqual({(w, h) for w, h, _ in dec.frames(small, 4.0, 100)}, {(1100, 1000)})
+        with mock.patch.object(self.mk, "IMAGE_MAX_PIXELS", 1_000_000):
+            with self.assertRaises(self.mk.BadRequest) as cm:  # (ffmpeg decodes it within the slack: read_ppm refuses)
+                list(dec.frames(small, 4.0, 100))
+            self.assertIn("frame of 1100 x 1000 pixels: over the limit of 1000000 pixels", str(cm.exception))
+            with self.assertRaises(self.mk.BadRequest) as cm:  # (ffmpeg does not decode it)
+                list(dec.frames(big, 4.0, 100))
+            self.assertIn("frames of about 3200 x 3000 pixels: over the limit of 1000000 pixels", str(cm.exception))
 
 
 if __name__ == "__main__":

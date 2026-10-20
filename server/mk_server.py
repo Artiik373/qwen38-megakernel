@@ -67,6 +67,7 @@ MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64
 MAX_IMAGES = 32  # MK_MAX_IMAGES: images per request
 MAX_STOP, MAX_STOP_LEN = 64, 1024  # stop strings per request, characters per stop string
 MAX_VIDEO_FRAMES = 256  # MK_MAX_VIDEO_FRAMES: video frames per request (all of its videos; 64 s at 4 fps)
+IMAGE_MAX_PIXELS = 100_000_000  # MK_IMAGE_MAX_PIXELS (the vision library's too): larger video frames are not decoded
 VIDEO_DECODE_S = 300  # a video's ffmpeg decode is stopped after this many seconds (400)
 VIDEO_TS_MS = 5000  # llama.cpp's video timestamp interval (mtmd_helper_video_init_params_default)
 # lingering close (HTTPServer.shutdown_request): what a client still sends after the server's last answer is read and
@@ -756,8 +757,13 @@ def video_parts(frames, fps):
         yield "frames", (pend, None)
 
 
-def read_ppm(f):
-    """the next binary PPM (P6, maxval 255) of a stream: (width, height, rgb bytes), None at its end"""
+class FrameTooLarge(ValueError):
+    pass
+
+
+def read_ppm(f, max_pixels=None):
+    """the next binary PPM (P6, maxval 255) of a stream: (width, height, rgb bytes), None at its end; a frame of more
+    than max_pixels pixels is refused from its header (FrameTooLarge), before its data is read"""
     def token():
         t = b""
         while True:
@@ -784,6 +790,8 @@ def read_ppm(f):
     w, h = int(w), int(h)
     if not (0 < w <= 65535 and 0 < h <= 65535):
         raise ValueError(f"bad PPM size {w} x {h}")
+    if max_pixels and w * h > max_pixels:
+        raise FrameTooLarge(f"frame of {w} x {h} pixels: over the limit of {max_pixels} pixels (MK_IMAGE_MAX_PIXELS)")
     data = f.read(w * h * 3)
     if len(data) != w * h * 3:
         raise ValueError("truncated frame")
@@ -811,7 +819,12 @@ def find_ffmpeg(explicit=None):
 
 class VideoDecoder:
     """video file bytes -> RGB24 frames through an ffmpeg executable, sampled by ffmpeg's fps filter as llama.cpp's
-    mtmd-helper does (`-vf fps=F`, rgb24), but read as a PPM stream (each frame carries its size: no ffprobe needed)"""
+    mtmd-helper does (`-vf fps=F`, rgb24), but read as a PPM stream (each frame carries its size: no ffprobe needed).
+    Frames over MK_IMAGE_MAX_PIXELS are refused as images are: read_ppm checks each frame's header before reading it,
+    and ffmpeg's decoder gets `-max_pixels` (its default is INT_MAX pixels: a crafted clip of 40,000 x 40,000 frames
+    would be decoded, 4.8 GB of rgb24 each) with MAX_PIXELS_SLACK more, as decoders check their row-aligned size
+    (1100 x 1000 counts as 1152 x 1000), so that every frame within the limit decodes."""
+    MAX_PIXELS_SLACK = 1 << 23  # (a 64-column and 64-row alignment of frames up to 65535 x 65535)
 
     def __init__(self, exe):
         self.exe = exe
@@ -839,7 +852,8 @@ class VideoDecoder:
             path = os.path.join(d, "input")
             with open(path, "wb") as f:
                 f.write(data)
-            cmd = [self.exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file", "-i", path,
+            cmd = [self.exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file",
+                   "-max_pixels", str(min(IMAGE_MAX_PIXELS + self.MAX_PIXELS_SLACK, 2 ** 31 - 1)), "-i", path,
                    "-an", "-sn", "-vf", f"fps={fps:.6f}", "-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "pipe:1"]
             try:
                 p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -865,7 +879,9 @@ class VideoDecoder:
             try:
                 while True:
                     try:
-                        fr = read_ppm(p.stdout)
+                        fr = read_ppm(p.stdout, IMAGE_MAX_PIXELS)
+                    except FrameTooLarge as e:
+                        raise BadRequest(f"video: {e}")
                     except ValueError as e:
                         if killed.is_set():
                             break
@@ -884,8 +900,14 @@ class VideoDecoder:
                 p.stdout.close()
                 p.wait()
                 th.join(5)
+                if not th.is_alive():
+                    p.stderr.close()
             if killed.is_set():
                 raise BadRequest(f"video: decoding took over {timeout} s")
+            big = re.search(r"Picture size (\d+)x(\d+) exceeds specified max pixel count", err.decode(errors="replace"))
+            if big:  # (-max_pixels: ffmpeg did not decode a frame, also after others of a smaller size)
+                raise BadRequest(f"video: frames of about {big[1]} x {big[2]} pixels: over the limit of {IMAGE_MAX_PIXELS} "
+                                 f"pixels (MK_IMAGE_MAX_PIXELS)")
             if n == 0:
                 msg = err.decode(errors="replace").strip().splitlines()
                 raise BadRequest("video: no frames decoded" + (f" ({msg[-1][:300]})" if msg else ""))
@@ -3042,7 +3064,7 @@ def env_int(name, default, minimum=1):
 
 
 def main():
-    global MAX_BODY_MB, MAX_IMAGES, MAX_VIDEO_FRAMES
+    global MAX_BODY_MB, MAX_IMAGES, MAX_VIDEO_FRAMES, IMAGE_MAX_PIXELS
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
@@ -3148,6 +3170,8 @@ def main():
     MAX_BODY_MB = env_int("MK_MAX_BODY_MB", MAX_BODY_MB)
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     MAX_VIDEO_FRAMES = env_int("MK_MAX_VIDEO_FRAMES", MAX_VIDEO_FRAMES)
+    if args.mmproj:  # (the vision library checks images against it; the video decoder, frames)
+        IMAGE_MAX_PIXELS = env_int("MK_IMAGE_MAX_PIXELS", IMAGE_MAX_PIXELS)
     if args.exact_reuse:
         os.environ["MK_EXACT"] = "1"  # read by the engine at construction
     # the port opens first (a busy port fails before the model loads); until the load is done every request gets a 503
