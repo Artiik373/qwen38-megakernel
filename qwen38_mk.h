@@ -87,7 +87,9 @@ class MKEngine {
     int committed() const;
     // Each prefill saves a checkpoint at the end of its prompt (or at ck_at, and at cks); rewinding to one
     // drops everything after it (also tokens before the committed position) and the checkpoints after it, so a
-    // prompt that diverges anywhere after the checkpoint can be re-fed from there.
+    // prompt that diverges anywhere after the checkpoint can be re-fed from there. A rewind or truncate also sets the
+    // draft vocabulary to what a fresh prefill of the kept prefix builds, and the next prefill extends it as a fresh
+    // prefill of the whole sequence would: the drafts (and so sampled replies) match the same prompt sent fresh.
     // checkpoints(): positions of the checkpoints (ascending); rewind_to(pos): restores the one at pos (false: none);
     // checkpoint_pos() / rewind_to_checkpoint(): the last one (-1 / false: none).
     std::vector<int> checkpoints() const;
@@ -98,7 +100,8 @@ class MKEngine {
     // read between chunks, no GPU work, callable from any thread. That prefill() then waits for the chunks already on
     // the GPU and throws MKCancelled, with nothing of it kept: the sequence, the recurrent state and the checkpoints go
     // back to the last checkpoint that existed before the call (or to a reset when there is none), the draft vocabulary
-    // and the image spans to what they were. Each prefill() clears the flag when it returns; cancel(false) clears it too.
+    // and the image spans to what they were at that position. Each prefill() clears the flag when it returns;
+    // cancel(false) clears it too.
     void cancel(bool on = true);
     // Progress of the prefill() running on another thread (callable from any thread; host counters, no GPU work): *done
     // of the *total positions of its batched part are processed. After it returns: that prefill's last values.
@@ -110,6 +113,9 @@ class MKEngine {
     std::vector<float> last_hidden();
     // Test helper (exact-reuse probes): 64-bit digests of the sequence state, layout in qwen38_mk.cu (state_digest).
     std::vector<unsigned long long> state_digest();
+    // Test helper: the draft vocabulary's rows (token ids) as the device holds them, checked against the host's list
+    // (throws if they differ); empty without a draft vocabulary.
+    std::vector<int> draft_vocab();
     // MK_EXACT=1 at construction: prefill results independent of the chunking (see qwen38_mk.cu `exact`).
     bool exact() const;
     // false: no MTP layer (see the constructor's mtp): depth 0 only

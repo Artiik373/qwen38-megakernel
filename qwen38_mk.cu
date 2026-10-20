@@ -6101,6 +6101,10 @@ struct MKEngine::Impl {
     std::vector<int> dv_ids;
     std::vector<uint8_t> dv_in;
     int dv_base = 0;
+    // dv_ids is what a fresh prefill of seq[0, dv_n) builds (the base list, then ONE dv_add of its text tokens), or -1:
+    // not (step's additions). A rewind / truncate rebuilds it that way, and a prefill continuing at dv_n rebuilds it over
+    // the whole new sequence, so a reused prefix drafts (and samples) exactly as the same prompt sent fresh.
+    int dv_n = 0;
 
     // Adds the tokens not yet in the draft head's vocabulary (appends their ids).
     void dv_add(const int * toks, size_t n) {
@@ -6119,7 +6123,25 @@ struct MKEngine::Impl {
         m.N = (int) dv_ids.size();
         CK(cudaMemcpyToSymbol(cW, &m.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
-    void dv_reset() { dv_truncate(dv_base); }
+    void dv_reset() {
+        dv_truncate(dv_base);
+        dv_n = 0;
+    }
+    // dv as a fresh prefill of seq[0, n) with image spans sp builds it (positions inside an image hold placeholder ids:
+    // skipped, as prefill skips them)
+    void dv_rebuild(int n, const std::vector<Span> & sp) {
+        dv_reset();
+        dv_n = n;
+        if (dv_in.empty()) return;
+        std::vector<int> text;
+        text.reserve((size_t) n);
+        size_t k = 0;
+        for (int q = 0; q < n; q++) {
+            while (k < sp.size() && sp[k].pos + sp[k].n() <= q) k++;
+            if (k == sp.size() || q < sp[k].pos) text.push_back(seq[q]);
+        }
+        dv_add(text.data(), text.size());
+    }
     // back to the first n ids (n >= dv_base, even: the size after a dv_add; a cancelled prefill's additions)
     void dv_truncate(size_t n) {
         if (dv_in.empty() || dv_ids.size() <= n) return;
@@ -9270,13 +9292,14 @@ struct MKEngine::Impl {
         std::vector<int> seq, dv;
         Ctl ctl{};
         std::vector<Span> spans;
-        int kv_top = 0, nd_avail = 0, ndraft = 0, last_acc = 0, demoted = 0;
+        int kv_top = 0, nd_avail = 0, ndraft = 0, last_acc = 0, demoted = 0, dv_n = 0;
         bool all_acc = true;
     };
     Book book_get() const {
         Book k;
         k.seq = seq;
         k.dv = dv_ids;
+        k.dv_n = dv_n;
         k.ctl = hctl;
         k.spans = spans;
         k.kv_top = kv_top;
@@ -9290,6 +9313,7 @@ struct MKEngine::Impl {
     void book_set(const Book & k) {
         seq = k.seq;
         dv_set(k.dv);
+        dv_n = k.dv_n;
         hctl = k.ctl;
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
         spans = k.spans;
@@ -9615,6 +9639,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
     } clear_cancel{p_};
     const std::vector<Span> spans0 = p_->spans;
     const size_t dv0 = p_->dv_ids.size();
+    const int dvn0 = p_->dv_n;
     std::vector<int> ck0;
     for (const auto & k : p_->ck) ck0.push_back(k.pos);
     auto stop_if_cancelled = [&] {
@@ -9627,11 +9652,16 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
             else if (s.pos >= 0 && (best < 0 || s.pos > p_->ck[best].pos)) best = (int) k;
         }
         p_->spans = spans0;
-        p_->dv_truncate(dv0);
         const int back = best >= 0 ? p_->ck[best].pos : 0;
         if (best >= 0) {
             p_->ck_restore(best);
             p_->spans_cut(back);
+            if (back < s0 || dvn0 == s0) { // (as a fresh prefill of seq[0, back) has it)
+                p_->dv_rebuild(back, p_->spans);
+            } else {
+                p_->dv_truncate(dv0);
+                p_->dv_n = dvn0;
+            }
         } else {
             reset();
         }
@@ -9641,7 +9671,10 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
     p_->pcnt_clear(); // a new response: the penalties count its generated tokens only
     if (p_->fault_at && ++p_->fault_seen == p_->fault_at) p_->fault_now = true;
     seq.insert(seq.end(), tokens.begin(), tokens.end());
-    if (images.empty()) {
+    const bool dv_fresh = p_->dv_n == s0; // (after a reset, rewind or truncate: as a fresh prefill of seq[0, end) builds it)
+    if (dv_fresh) {
+        p_->dv_rebuild(end, nsp);
+    } else if (images.empty()) {
         p_->dv_add(tokens.data(), tokens.size());
     } else { // (the draft vocabulary takes the prompt's text tokens, not the image rows' placeholder ids)
         std::vector<int> text;
@@ -9652,6 +9685,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         }
         p_->dv_add(text.data(), text.size());
     }
+    if (!dv_fresh) p_->dv_n = -1;
     p_->spans = nsp;
     p_->rope_sync();
     const int * er = erow.empty() ? nullptr : erow.data();
@@ -9782,6 +9816,7 @@ bool MKEngine::rewind_to(int pos) {
     if (si < 0 || pos > (int) p_->seq.size()) return false;
     p_->ck_restore(si);
     p_->spans_cut(pos);
+    p_->dv_rebuild(pos, p_->spans); // (the abandoned continuation's tokens leave the draft vocabulary)
     return true;
 }
 bool MKEngine::rewind_to_checkpoint() { return rewind_to(checkpoint_pos()); }
@@ -9793,6 +9828,7 @@ void MKEngine::truncate(int len) {
     p_->ring_rewind(len); // MK_KV_WIN: the dropped positions' ring slots held window rows
     seq.resize(len);
     p_->spans_cut(len);
+    p_->dv_rebuild(len, p_->spans);
 }
 
 // ---- conversation state in host memory: side requests (TODO #15), parked conversations (#9); Impl "host store" ----
@@ -10103,6 +10139,7 @@ int MKEngine::step(std::vector<int> & out) {
     for (int i = 0; i < c.n_out; i++) out.push_back(c.out[i]);
     p_->seq.insert(p_->seq.end(), c.out, c.out + c.n_out);
     p_->dv_add(c.out, c.n_out);
+    p_->dv_n = -1;
     p_->all_acc = c.n_acc == T - 1;
     p_->last_acc = c.n_acc;
     stats.cycles++;
@@ -10123,6 +10160,17 @@ std::vector<float> MKEngine::last_hidden() {
 }
 
 bool MKEngine::exact() const { return p_->exact; }
+
+std::vector<int> MKEngine::draft_vocab() {
+    const Impl & I = *p_;
+    if (I.dv_in.empty()) return {};
+    int n = 0;
+    CK(cudaMemcpyFromSymbol(&n, cW, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
+    std::vector<int> v((size_t) std::max(n, 0));
+    if (n > 0) CK(cudaMemcpy(v.data(), I.hw.draft_ids, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost));
+    if (v != I.dv_ids || I.hw.head_d.N != n) throw std::runtime_error("draft vocabulary: the device's rows differ from the host's list");
+    return v;
+}
 
 bool MKEngine::has_mtp() const { return p_->has_mtp; }
 

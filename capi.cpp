@@ -454,6 +454,16 @@ int mk_rewind_to(void * hp, int pos) {
 }
 // 1 if the engine runs MK_EXACT (exact reuse: restore a checkpoint instead of appending to decoded rows)
 int mk_exact(void * hp) { return static_cast<Handle *>(hp)->eng->exact() ? 1 : 0; }
+// test helper: MKEngine::draft_vocab (the device's draft-vocabulary rows, checked against the host's list) into out (up
+// to cap ids); returns the count (0: no draft vocabulary), -1 on error
+int mk_draft_vocab(void * hp, int * out, int cap) {
+    return guarded(hp, [&](MKEngine * e) {
+        const auto v = e->draft_vocab();
+        if (out)
+            for (int i = 0; i < std::min((int) v.size(), cap); i++) out[i] = v[i];
+        return (int) v.size();
+    });
+}
 // test helper: MKEngine::state_digest into out (up to cap words); returns the word count (negative on error)
 int mk_state_digest(void * hp, unsigned long long * out, int cap) {
     return guarded(hp, [&](MKEngine * e) {
