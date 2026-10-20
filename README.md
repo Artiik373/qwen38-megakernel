@@ -251,7 +251,9 @@ What the API supports:
   and OpenAI `tools`; `--chat-template-file` replaces it, as in llama-server (`MK_CHAT_TEMPLATE_FILE` in the launchers).
   Example: a fine-tune whose GGUF ships Qwen's original template answers a `developer` message, a second system
   message, a turn without a user query or `reasoning_effort` "high" with a 400; unsloth's template (the one in its
-  Qwen3.8-27B GGUFs) takes all four.
+  Qwen3.8-27B GGUFs) takes all four. As in llama-server, `--chat-template-kwargs` sets defaults for every request
+  (e.g. thinking off: `MK_CHAT_TEMPLATE_KWARGS='{"enable_thinking": false}'`) and `--reasoning-format none` leaves the
+  thinking in `content` instead of `reasoning_content` (`MK_REASONING_FORMAT`; a request's `reasoning_format` wins).
 - **Images:** base64 `data:` URLs only; at most 4096 tokens each (`--image-max-tokens`), also at extreme aspect ratios,
   where llama.cpp's resize goes past its limit (a 1,000,000 x 1 PNG: 64,000 tokens).
 - **Video:** `input_video` parts (`{"data": <base64>}`, as llama-server) or `video_url` parts with a base64 `data:` URL;

@@ -285,6 +285,8 @@ Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `--allow
 MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decoding; env `MK_NO_MTP=1`), `--exact-reuse`
 [off; the launchers turn it on], `--chat-template-file PATH` / `--chat-template TEMPLATE` [the GGUF's; below],
 `--content-specials text|parse` [text; below],
+`--reasoning-format auto|deepseek|deepseek-legacy|none` [auto; env `MK_REASONING_FORMAT`],
+`--chat-template-kwargs JSON` [none; env `MK_CHAT_TEMPLATE_KWARGS`] (both below),
 `--ck-every n` (a checkpoint every n prompt tokens [4096], 0 = off), `--ck-msgs 1|0`
 (a checkpoint at each message start [1]), `--side-max n` (side requests up to n prompt tokens [8192], 0 = off; env
 `MK_SIDE_MAX`), `--park-mib n` (host memory for parked conversations [8192], 0 = off; env `MK_PARK_MIB`), `--park-min n`
@@ -293,6 +295,14 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
 `--image-cache` [8; images kept between requests], `--video-fps` [4], `--video-max-tokens` [0 = the image limit],
 `--video-cache` [2; videos kept between requests], `--ffmpeg` [ffmpeg on PATH; env `MK_FFMPEG`] (video, below).
 
+- **Reasoning format and template defaults** (llama-server's options): `--reasoning-format` / a request's
+  `reasoning_format`: `auto` and `deepseek` return the thinking as `reasoning_content` (streamed too; what the server
+  always did), `none` leaves it in `content` as generated (with the `<think>` the prompt opened it with, then
+  `</think>` and the answer), `deepseek-legacy` does both (a stream sends it in `content` only, as llama-server).
+  `/v1/messages` replies keep their thinking blocks. `--chat-template-kwargs '{"enable_thinking": false}'`: defaults
+  under every request's `chat_template_kwargs` (and its top-level `reasoning_effort`); the keys are the ones the server
+  hands to the template, `enable_thinking`, `preserve_thinking`, `reasoning_effort` (others: refused at startup). For
+  clients that cannot send `chat_template_kwargs`.
 - Prompts are rendered with the chat template stored in the GGUF (jinja2): `chat_template_kwargs`
   `enable_thinking` / `preserve_thinking` / `reasoning_effort`, OpenAI `tools`. Reasoning is streamed as
   `reasoning_content`, Qwen's XML tool calls are returned as structured `tool_calls`. A parameter's value runs to its

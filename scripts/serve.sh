@@ -34,8 +34,10 @@
 #                       file without one or instead of the file's own
 #   MK_NO_MTP=1         no MTP layer: plain decoding, depth 0 (also automatic for a model file without one)
 #   MK_CHAT_TEMPLATE_FILE  a Jinja chat template file used instead of the GGUF's (--chat-template-file, as llama-server)
+#   MK_CHAT_TEMPLATE_KWARGS  defaults under every request's chat_template_kwargs, e.g. '{"enable_thinking": false}'
 #   MK_CONTENT_SPECIALS special-token text (<|im_end|>, ...) inside messages: text (default: tokenized as text, so content
 #                       cannot forge turns) or parse (as the special tokens, as llama-server does)
+#   MK_REASONING_FORMAT auto (default: the thinking as reasoning_content), none (left in the content), deepseek-legacy
 #   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS, MK_MAX_VIDEO_FRAMES
 #                       request limits: body size (default 128 MB), images per request (32), pixels per image
 #                       (100,000,000; checked before decoding), video frames per request (256)

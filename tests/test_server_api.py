@@ -343,6 +343,84 @@ class ContextOverflowTests(_HttpCase):
         self.assertLess(len(lib.freed) + len(lib.live), 8)  # (stopped decoding images)
 
 
+THINK = TEMPLATE.replace("assistant\n{% endif %}", "assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}")
+
+
+class ReasoningFormatTests(_HttpCase):
+    """G6: --reasoning-format / reasoning_format (auto = deepseek = what the server always did), --chat-template-kwargs
+    defaults under the request's"""
+
+    PIECES = ["Hmm", ".</think>", "\n\nFour"]
+
+    def _chat(self, http_, body, stream):
+        body = {"messages": [{"role": "user", "content": "2+2?"}], "chat_template_kwargs": {"enable_thinking": True},
+                "max_tokens": 50, **body}
+        if not stream:
+            status, data = http_.post(body)
+            self.assertEqual(status, 200, data)
+            m = json.loads(data)["choices"][0]["message"]
+            return m.get("content"), m.get("reasoning_content")
+        _, events = _sse(http_.raw(_request({**body, "stream": True}), until=b"0\r\n\r\n"))
+        deltas = [c["delta"] for e in events[:-1] for c in json.loads(e)["choices"]]
+        return ("".join(d.get("content") or "" for d in deltas),
+                "".join(d.get("reasoning_content") or "" for d in deltas) or None)
+
+    def test_formats(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(self.PIECES))
+        srv.template = self.mk.make_template(THINK)
+        inline = "<think>\nHmm.</think>\n\nFour"
+        want = {None: {False: ("Four", "Hmm."), True: ("Four", "Hmm.")},
+                "auto": {False: ("Four", "Hmm."), True: ("Four", "Hmm.")},
+                "deepseek": {False: ("Four", "Hmm."), True: ("Four", "Hmm.")},
+                "none": {False: (inline, None), True: (inline, None)},
+                "deepseek-legacy": {False: (inline, "Hmm."), True: (inline, None)}}
+        for fmt, by_stream in want.items():
+            for stream, w in by_stream.items():
+                body = {} if fmt is None else {"reasoning_format": fmt}
+                self.assertEqual(self._chat(http_, body, stream), w, (fmt, stream))
+        # the server's default; a request's own wins; thinking off: nothing to keep inline
+        srv.args.reasoning_format = "none"
+        self.assertEqual(self._chat(http_, {}, False), (inline, None))
+        self.assertEqual(self._chat(http_, {"reasoning_format": "auto"}, True), ("Four", "Hmm."))
+        self.assertEqual(self._chat(http_, {"chat_template_kwargs": {"enable_thinking": False}}, False)[1], None)
+        # Anthropic replies keep their thinking blocks
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+        c.request("POST", "/v1/messages", json.dumps({"max_tokens": 50, "thinking": {"type": "enabled", "budget_tokens": 1024},
+                                                     "messages": [{"role": "user", "content": "2+2?"}]}))
+        o = json.loads(c.getresponse().read())
+        c.close()
+        self.assertEqual([b["type"] for b in o["content"]], ["thinking", "text"])
+        status, data = http_.post({"messages": [{"role": "user", "content": "x"}], "reasoning_format": "raw"})
+        self.assertEqual((status, json.loads(data)["error"]["message"].split(":")[0]), (400, "reasoning_format"))
+
+    def test_template_kwargs_defaults(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        srv.template = self.mk.make_template(THINK.replace("{% endfor %}", "{% endfor %}[{{ reasoning_effort }}]"))
+        prompt = lambda body: json.loads(_post(http_.port, "/apply-template", {"messages": [{"role": "user", "content": "q"}],
+                                                                               **body})[1])["prompt"]
+        self.assertTrue(prompt({}).endswith("[]<|im_start|>assistant\n"))
+        srv.args.chat_template_kwargs = {"enable_thinking": True, "reasoning_effort": "low"}
+        self.assertTrue(prompt({}).endswith("[low]<|im_start|>assistant\n<think>\n"))
+        self.assertTrue(prompt({"chat_template_kwargs": {"enable_thinking": False}}).endswith("[low]<|im_start|>assistant\n"))
+        self.assertTrue(prompt({"reasoning_effort": "high"}).endswith("[high]<|im_start|>assistant\n<think>\n"))
+        self.assertTrue(prompt({"reasoning_effort": "none"}).endswith("[low]<|im_start|>assistant\n"))
+        status, data = _post(http_.port, "/apply-template", {"messages": [], "chat_template_kwargs": "x"})
+        self.assertEqual(status, 400, data)
+
+    def test_options(self) -> None:
+        import contextlib
+        import io
+        from unittest import mock
+        for argv in (["--reasoning-format", "raw"], ["--chat-template-kwargs", "{"], ["--chat-template-kwargs", "[1]"],
+                     ["--chat-template-kwargs", '{"add_vision_id": true}']):
+            err = io.StringIO()
+            with mock.patch.object(self.mk.sys, "argv", ["mk_server.py", "-m", "x.gguf", *argv]), \
+                    contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                self.mk.main()
+            self.assertEqual(cm.exception.code, 2, argv)
+            self.assertIn(argv[0], err.getvalue())
+
+
 class SdkStreamTests(_HttpCase):
     """the official SDKs' stream accumulators rebuild the streamed calls (skipped when the SDK is not installed)"""
 

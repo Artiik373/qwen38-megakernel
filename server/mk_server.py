@@ -1354,6 +1354,13 @@ SAMPLER_OFF = {"mirostat": _off(0), "typical_p": _off(1, True), "typ_p": _off(1,
                "min_tokens": _off(0), "n_probs": _off(0)}
 
 
+# llama-server's --reasoning-format values: auto = deepseek (reasoning_content, streamed too: what the server always did),
+# deepseek-legacy (the content keeps the thinking block too; a stream only there), none (the thinking stays in the content)
+REASONING_FORMATS = ("auto", "deepseek", "deepseek-legacy", "none")
+# the chat_template_kwargs the server hands to the template
+TEMPLATE_KWARGS = ("enable_thinking", "preserve_thinking", "reasoning_effort")
+
+
 def check_params(body):
     """400 for the request fields the server cannot honour (they would change the output and need engine work, e.g.
     logprobs, n > 1, constrained sampling): never ignored silently. Harmless ones (user, metadata, store, samplers,
@@ -1393,6 +1400,10 @@ def check_params(body):
         if not ok(body.get(k)):
             bad(k, f"{body.get(k)!r} is not supported: the megakernel samples with temperature, top_k, top_p, min_p "
                    "and the presence / frequency penalties only")
+    if body.get("reasoning_format") is not None and body["reasoning_format"] not in REASONING_FORMATS:
+        bad("reasoning_format", f"one of {', '.join(REASONING_FORMATS)}")
+    if body.get("chat_template_kwargs") is not None and not isinstance(body["chat_template_kwargs"], dict):
+        bad("chat_template_kwargs", "an object")
 
 
 def stop_strings(v, field="stop"):
@@ -1453,10 +1464,13 @@ class StopMatcher:
 class OutputParser:
     """Splits the generated text into reasoning (before </think>), content and tool calls (from the first <tool_call>:
     ToolCallParser). calls: the tool calls' stream events too, as ("tool_call", delta) with delta in the shape of an
-    OpenAI stream's delta.tool_calls[] entry; one: parallel_tool_calls false."""
+    OpenAI stream's delta.tool_calls[] entry; one: parallel_tool_calls false. inline (reasoning_format): "only" (none):
+    the thinking block stays in the content as generated, with the <think> the prompt opened it with; "both"
+    (deepseek-legacy): there and as reasoning."""
 
-    def __init__(self, thinking, tools, calls=False, one=False):
+    def __init__(self, thinking, tools, calls=False, one=False, inline=None):
         self.mode = "reasoning" if thinking else "content_start"
+        self.inline, self.opened = inline if thinking else None, False
         self.tools = tools
         self.tc = ToolCallParser(tools, calls, one) if tools else None
         self.buf = ""
@@ -1477,13 +1491,13 @@ class OutputParser:
             if self.mode == "reasoning":
                 i = self.buf.find("</think>")
                 if i >= 0:
-                    out.append(("reasoning", self.buf[:i]))
+                    self._think(out, self.buf[:i], True)
                     self.buf = self.buf[i + len("</think>"):]
-                    self.mode = "content_start"
+                    self.mode = "content" if self.inline else "content_start"  # (inline: the text as generated)
                     continue
                 keep = 0 if final else len("</think>") - 1
                 if len(self.buf) > keep:
-                    out.append(("reasoning", self.buf[:len(self.buf) - keep]))
+                    self._think(out, self.buf[:len(self.buf) - keep], False)
                     self.buf = self.buf[len(self.buf) - keep:]
                 break
             if self.mode == "content_start":
@@ -1528,6 +1542,14 @@ class OutputParser:
         out = [(k, t) for k, t in out if t]
         self.content_seen = self.content_seen or any(k == "content" for k, _ in out)
         return out
+
+    def _think(self, out, text, end):
+        """reasoning text (end: up to its </think>)"""
+        if self.inline != "only":
+            out.append(("reasoning", text))
+        if self.inline:
+            out.append(("content", ("" if self.opened else "<think>\n") + text + ("</think>" if end else "")))
+            self.opened = True
 
     def unparsed(self, streamed=False):
         """the tool-call markup that is not a complete call (ToolCallParser.unparsed), as the rest of the content: the
@@ -2253,7 +2275,9 @@ class Server:
         ctx = dict(messages=normalize_messages(body.get("messages") or [], media), add_generation_prompt=True)
         if body.get("tools"):
             ctx["tools"] = body["tools"]
-        for k in ("enable_thinking", "preserve_thinking", "reasoning_effort"):
+        for k, v in (getattr(self.args, "chat_template_kwargs", None) or {}).items():  # (--chat-template-kwargs: under them)
+            kw.setdefault(k, v)
+        for k in TEMPLATE_KWARGS:
             if k in kw:
                 ctx[k] = kw[k]
         try:
@@ -2598,8 +2622,12 @@ class Server:
                      f"{len(enc)} encoded on the CPU in {secs(enc_s)}")
         CON.status(f"#{rid} decoding")
         log(line)
-        # a stream gets the tool calls as they are generated (ToolCallParser's events)
-        parser = OutputParser(thinking, tools, bool(body.get("stream")), body.get("parallel_tool_calls") is False)
+        # a stream gets the tool calls as they are generated (ToolCallParser's events). reasoning_format (OpenAI route; an
+        # Anthropic reply has its thinking blocks): none -> the thinking stays in the content, deepseek-legacy -> both
+        # (a stream: in the content only, as llama-server)
+        fmt = "auto" if route == "messages" else body.get("reasoning_format") or getattr(self.args, "reasoning_format", "auto")
+        inline = {"none": "only", "deepseek-legacy": "only" if body.get("stream") else "both"}.get(fmt)
+        parser = OutputParser(thinking, tools, bool(body.get("stream")), body.get("parallel_tool_calls") is False, inline)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         n_gen, finish, pending, aborted, dropped = 0, "length", [tok], False, 0
         phase = {"thinking": 0, "answer": 0, "tool call": 0}  # generated tokens by the part of the reply they are in
@@ -3405,6 +3433,15 @@ def main():
     ap.add_argument("--chat-template", dest="chat_template", action=ChatTemplateArg, metavar="TEMPLATE",
                     help="the chat template itself (Jinja source; 'chatml': llama.cpp's ChatML) instead of the GGUF's; "
                          "the last of --chat-template / --chat-template-file wins")
+    ap.add_argument("--reasoning-format", default=os.environ.get("MK_REASONING_FORMAT") or "auto", metavar="FORMAT",
+                    help="llama-server's: auto / deepseek (the thinking as reasoning_content, streamed too: the default), "
+                         "deepseek-legacy (also left in the content; a stream: only there), none (left in the content); "
+                         "a request's reasoning_format wins; Anthropic replies keep their thinking blocks "
+                         "(env MK_REASONING_FORMAT)")
+    ap.add_argument("--chat-template-kwargs", default=os.environ.get("MK_CHAT_TEMPLATE_KWARGS") or None, metavar="JSON",
+                    help="defaults for every request's chat_template_kwargs (a JSON object of "
+                         + ", ".join(TEMPLATE_KWARGS) + "; the request's own win), e.g. '{\"enable_thinking\": false}' "
+                         "(env MK_CHAT_TEMPLATE_KWARGS)")
     ap.add_argument("--mmproj", default=None,
                     help="vision projector GGUF (e.g. mmproj-*.gguf): image_url inputs, encoded on the CPU (no VRAM)")
     ap.add_argument("--vision-lib", default=os.path.join(os.path.dirname(HERE), LIB_VISION))
@@ -3438,6 +3475,20 @@ def main():
             ap.error(f"--{k.replace('_', '-')}: expected a number >= 0")
     if args.content_specials not in ("text", "parse"):  # (an MK_CONTENT_SPECIALS default is not checked by choices)
         ap.error(f"MK_CONTENT_SPECIALS: expected text or parse, not {args.content_specials!r}")
+    if args.reasoning_format not in REASONING_FORMATS:
+        ap.error(f"--reasoning-format: one of {', '.join(REASONING_FORMATS)}, not {args.reasoning_format!r}")
+    if args.chat_template_kwargs is not None:
+        try:
+            kw = json.loads(args.chat_template_kwargs)
+        except ValueError as e:
+            ap.error(f"--chat-template-kwargs: not JSON ({e})")
+        if not isinstance(kw, dict) or set(kw) - set(TEMPLATE_KWARGS):
+            ap.error(f"--chat-template-kwargs: a JSON object of {', '.join(TEMPLATE_KWARGS)} (the keys the server hands to "
+                     "the template)")
+        args.chat_template_kwargs = kw
+        log(f"chat template kwargs: {json.dumps(kw)} (under each request's)")
+    if args.reasoning_format != "auto":
+        log(f"reasoning format: {args.reasoning_format}")
     args.chat_template_src = None  # (before the port opens: a bad template fails at once, not after the model load)
     if args.chat_template:
         try:
