@@ -251,7 +251,9 @@ struct Uploader {
         st = nullptr;
         raise();
     }
-    ~Uploader() {
+    // the worker stops after the copy it is running (the queued ones are dropped): a failed load calls it before the
+    // buffers those copies read are freed
+    void halt() {
         if (!async) return;
         {
             std::lock_guard<std::mutex> l(mu);
@@ -259,8 +261,11 @@ struct Uploader {
         }
         cv.notify_all();
         th.join();
+        async = false;
         if (st) cudaStreamDestroy(st);
+        st = nullptr;
     }
+    ~Uploader() { halt(); }
     void run() {
         for (;;) {
             Job j;

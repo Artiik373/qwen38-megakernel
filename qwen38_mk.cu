@@ -6898,6 +6898,12 @@ struct MKEngine::Impl {
 
     Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_, const std::string & mtp_)
         : file(path), ctx(ctx_), ndraft(ndraft_), nd_avail(ndraft_), n_draft_max(ndraft_), n_draft_cap(ndraft_), kv_mode(kv_mode_) {
+        // a refused file (a throw anywhere below) unwinds this body before the members go: the upload worker stops first,
+        // so no queued copy reads a buffer a destroyed member owned (own_keep, wv_probes: declared after upl)
+        struct UplHalt {
+            Uploader & u;
+            ~UplHalt() { u.halt(); }
+        } upl_halt{upl};
         model_path = path;
         if (file.strs["general.architecture"] != "qwen35") throw std::runtime_error("expected qwen35 architecture");
         // block_count NLA: the 64 layers + the MTP layer; NL: a conversion without the MTP layer (M3)
