@@ -293,6 +293,22 @@ int mk_tokenize(void * hp, const char * text, int len, int * out, int cap) {
     return llama_tokenize(h->vocab, text, len, out, cap, false, true);
 }
 
+// mk_tokenize with llama_tokenize's flags: add_special: the vocabulary's BOS / EOS where it adds them; parse_special: the
+// text of control tokens (<|im_start|>, <|im_end|>, ...) becomes those tokens, else it is plain text (user-defined tokens
+// such as <think> are matched either way, as in llama.cpp and Hugging Face tokenizers)
+int mk_tokenize2(void * hp, const char * text, int len, int * out, int cap, int add_special, int parse_special) {
+    auto * h = static_cast<Handle *>(hp);
+    return llama_tokenize(h->vocab, text, len, out, cap, add_special != 0, parse_special != 0);
+}
+
+// a token's llama_token_attr bits (LLAMA_TOKEN_ATTR_CONTROL 8, _USER_DEFINED 16, _UNKNOWN 1, ...; the control and unknown
+// ones are what parse_special decides on); -1 for an id outside the vocabulary
+int mk_token_attr(void * hp, int tok) {
+    const llama_vocab * vocab = static_cast<Handle *>(hp)->vocab;
+    if (tok < 0 || tok >= llama_vocab_n_tokens(vocab)) return -1;
+    return (int) llama_vocab_get_attr(vocab, tok);
+}
+
 // token -> its bytes (special tokens rendered as text); returns the byte count
 int mk_piece(void * hp, int tok, char * buf, int cap) {
     auto * h = static_cast<Handle *>(hp);

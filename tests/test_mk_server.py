@@ -1270,7 +1270,6 @@ class ExtraRouteTests(_HttpCase):
                          [{"id": 104, "piece": "h"}, {"id": 5, "piece": "\x05"}, {"id": 300, "piece": ""}])
         self.assertEqual(self._post(http_, "/tokenize", {"content": [150], "with_pieces": True})[1]["tokens"],
                          [{"id": 150, "piece": [255]}])
-        self.assertEqual(self._post(http_, "/tokenize", {"content": "x", "parse_special": False})[0], 400)
         self.assertEqual(self._post(http_, "/detokenize", {"tokens": [104, 105]}), (200, {"content": "hi"}))
         self.assertEqual(self._post(http_, "/detokenize", {"tokens": [104, 999]})[0], 400)
         body = {"messages": [{"role": "user", "content": "hi"}]}

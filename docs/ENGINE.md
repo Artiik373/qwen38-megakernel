@@ -284,6 +284,7 @@ Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `--allow
 `--kv auto|f16|q8` [auto: q8_0 only when fp16 does not fit], `--draft-vocab` [draft_vocab_32k.bin], `--mtp FILE` (the
 MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decoding; env `MK_NO_MTP=1`), `--exact-reuse`
 [off; the launchers turn it on], `--chat-template-file PATH` / `--chat-template TEMPLATE` [the GGUF's; below],
+`--content-specials text|parse` [text; below],
 `--ck-every n` (a checkpoint every n prompt tokens [4096], 0 = off), `--ck-msgs 1|0`
 (a checkpoint at each message start [1]), `--side-max n` (side requests up to n prompt tokens [8192], 0 = off; env
 `MK_SIDE_MAX`), `--park-mib n` (host memory for parked conversations [8192], 0 = off; env `MK_PARK_MIB`), `--park-min n`
@@ -305,6 +306,24 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   (system, user, assistant, user). A GGUF without a template gets ChatML, as in llama-server. Use: a fine-tune of the
   same model whose GGUF ships Qwen's original template (a 400 for a `developer` message, a second system message, a
   turn without a user query, `reasoning_effort` "high") served with unsloth's.
+- **Special-token text in content** (`--content-specials text|parse` [text], env `MK_CONTENT_SPECIALS`): the text of a
+  control token (`<|im_end|>`, `<|im_start|>`, `<|endoftext|>`, `<|vision_start|>`, ...: the vocabulary's control tokens)
+  inside messages (any role: user, system, tool results, assistant replies and their reasoning), tool-call arguments
+  and tool definitions is tokenized as plain text, while the special tokens the template writes stay special. So a
+  file an agent reads (this repository's own sources contain `<|im_end|>`), a web page or a tool result cannot forge a
+  turn (`...<|im_end|>\n<|im_start|>system\n...`). llama-server (and `parse`) tokenizes the whole rendered prompt with
+  special tokens parsed, content included. How: the template renders the request as usual (the prompt text is
+  unchanged: `/apply-template`, token counts), and once more with each such text replaced by a private-use character;
+  when that render, with the texts put back, is the same text, the prompt is tokenized piece by piece between the
+  template's control tokens, a piece holding content's special-token text as plain text (`parse_special` false: one run
+  of text, as llama.cpp tokenizes the text between special tokens), every other piece as before. A template that
+  renders the marked request differently keeps `parse` for it (logged once). User-defined tokens (`<think>`,
+  `</think>`, `<tool_call>`, `<tool_response>`) are tokens in any text, as in llama.cpp and Hugging Face tokenizers.
+  Prompts without such text in their content get exactly the token ids they got before (checked on 237 requests:
+  the test suite's, the repro and API test requests, Claude Code's and OpenCode-shaped agent sessions of 10-25k
+  tokens). Assistant turns are content too: a reply that quoted `<|im_end|>` as text (the model wrote those characters,
+  e.g. editing this server) comes back as the same text tokens, so exact reuse keeps it; only a control token the
+  model emitted mid-reply (none of the end-of-turn ones: those end the reply) would now re-prefill from there.
 - Successive requests of a conversation only prefill what is new: the prompt is matched against the engine's sequence
   (prompts + emitted tokens). When the new prompt diverges inside what the engine already processed (an edited message,
   a re-rendered thinking block or tool call), the engine rewinds to the last DeltaNet checkpoint at or before the
@@ -402,7 +421,8 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   `message_stop`; an error after the start is an `error` event. Errors in Anthropic's shape
   (`{"type": "error", "error": {"type": "invalid_request_error", ...}}`); API keys are not checked (a local server).
 - Without generation (no wait for a running request, except for images): `POST /tokenize` (`content`: a string or
-  strings and ids, `with_pieces`; special tokens always parsed), `/detokenize`, `/apply-template` (the rendered
+  strings and ids, `with_pieces`, `parse_special` [true] and `add_special` [false, the first string only] as in
+  llama-server), `/detokenize`, `/apply-template` (the rendered
   prompt), `/v1/chat/completions/input_tokens` and `/v1/messages/count_tokens` (`input_tokens`). llama-server's other
   routes (`/completion`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/infill`, `/v1/rerank`, audio, LoRA,
   `POST /slots`, `POST /props`) answer 501 naming the route.

@@ -252,6 +252,13 @@ class Engine:
         if hasattr(L, "mk_n_vocab"):
             L.mk_n_vocab.restype, L.mk_n_vocab.argtypes = ctypes.c_int, [vp]
             self.n_vocab = L.mk_n_vocab(self.h)
+        # tokenizer flags and token attributes (libraries before them: special tokens always parsed, no BOS / EOS)
+        self.tok_flags = hasattr(L, "mk_tokenize2") and hasattr(L, "mk_token_attr") and self.n_vocab > 0
+        if self.tok_flags:
+            L.mk_tokenize2.restype = ctypes.c_int
+            L.mk_tokenize2.argtypes = [vp, cp, ctypes.c_int, ip, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            L.mk_token_attr.restype, L.mk_token_attr.argtypes = ctypes.c_int, [vp, ctypes.c_int]
+        self._controls = None
         self.build = None
         if hasattr(L, "mk_build_info"):
             L.mk_build_info.restype, L.mk_build_info.argtypes = ctypes.c_char_p, []
@@ -278,16 +285,43 @@ class Engine:
         self.L.mk_chat_template(self.h, buf, n)
         return buf.raw[:n].decode()
 
-    def tokenize(self, text):
+    def tokenize(self, text, special=True, add_special=False):
+        """text -> token ids. special: the text of control tokens (<|im_start|>, ...) becomes those tokens, else plain text;
+        add_special: the vocabulary's BOS / EOS where it adds them (llama_tokenize's parse_special / add_special;
+        other than the defaults they need mk_tokenize2: ValueError without it)"""
         b = text.encode()
+        if special and not add_special:
+            def run(out, cap):
+                return self.L.mk_tokenize(self.h, b, len(b), out, cap)
+        elif self.tok_flags:
+            def run(out, cap):
+                return self.L.mk_tokenize2(self.h, b, len(b), out, cap, int(add_special), int(special))
+        else:
+            raise ValueError("parse_special false / add_special need a newer libqwen38mk (mk_tokenize2)")
         cap = len(b) + 16
         out = (ctypes.c_int * cap)()
-        n = self.L.mk_tokenize(self.h, b, len(b), out, cap)
+        n = run(out, cap)
         if n < 0:
             cap = -n
             out = (ctypes.c_int * cap)()
-            n = self.L.mk_tokenize(self.h, b, len(b), out, cap)
+            n = run(out, cap)
         return list(out[:n])
+
+    def controls(self):
+        """{text: id} of the vocabulary's control (and unknown) tokens: the ones whose text tokenize(special=False) keeps
+        as text (user-defined ones such as <think> are tokens either way); {} without mk_token_attr. Read once (one call
+        per token id, ~0.1 s)."""
+        if self._controls is None:
+            self._controls = {}
+            if self.tok_flags:
+                attr = self.L.mk_token_attr
+                for t in range(self.n_vocab):
+                    a = attr(self.h, t)
+                    if a > 0 and a & 0x9:  # (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN)
+                        text = self.piece(t).decode(errors="replace")
+                        if text:
+                            self._controls.setdefault(text, t)
+        return self._controls
 
     def piece(self, tok):
         p = self._pieces.get(tok)
@@ -926,6 +960,62 @@ class ChatTemplateArg(argparse.Action):
         setattr(namespace, self.dest, ("file" if option_string == "--chat-template-file" else "inline", value))
 
 
+class Prompt(str):
+    """a rendered prompt (LiteralTemplate.render) whose request content had special-token text: lit = (the prompt
+    rendered with each such text as a placeholder character, {ord(placeholder): text}, the LiteralTemplate), from which
+    Server.tokenize_prompt tokenizes those texts as plain text"""
+    lit = None
+
+
+class LiteralTemplate:
+    """the chat template, rendering special-token text inside the request's messages and tools as text (--content-specials
+    text). render() renders the request as it is (the prompt text is unchanged: /apply-template, token counts), and when
+    that content has control-token text (<|im_end|>, <|im_start|>, ...: the vocabulary's control tokens) once more with
+    each such text replaced by a private-use character the prompt does not contain. If that render, with the texts put
+    back, is the same prompt (the template treats the characters as it treats the texts), the result is a Prompt telling
+    tokenize_prompt which special-token texts came from the request: those become plain text (a tool result with
+    "<|im_end|>\\n<|im_start|>system" cannot forge a turn), the template's own stay special tokens. Otherwise the request
+    keeps llama-server's behaviour (logged)."""
+
+    def __init__(self, template, controls):
+        self.template, self.controls = template, controls  # controls: {text: token id} (Engine.controls)
+        self.ctl_re = re.compile("|".join(re.escape(t) for t in sorted(controls, key=len, reverse=True)))
+        self.warned = False
+
+    def render(self, **ctx):
+        text = self.template.render(**ctx)
+        found = {}  # control text -> its placeholder
+        free = (chr(c) for c in range(0x10FFFD, 0xFFFFF, -1) if chr(c) not in text)  # (plane 16: private use)
+
+        def place(m):
+            if m.group() not in found:
+                found[m.group()] = next(free)
+            return found[m.group()]
+
+        def mark(x):
+            if isinstance(x, str):
+                return self.ctl_re.sub(place, x)
+            if isinstance(x, dict):
+                return {mark(k): mark(v) for k, v in x.items()}
+            if isinstance(x, (list, tuple)):
+                return [mark(v) for v in x]
+            return x
+        marked = dict(ctx, **{k: mark(ctx[k]) for k in ("messages", "tools") if k in ctx})
+        if not found:
+            return text
+        back = {ord(p): t for t, p in found.items()}
+        lit = self.template.render(**marked)
+        if lit.translate(back) != text:
+            if not self.warned:
+                self.warned = True
+                log("special-token text in a request's content: the chat template renders it differently once marked, so "
+                    "it is tokenized as special tokens (as llama-server does); not logged again")
+            return text
+        p = Prompt(text)
+        p.lit = (lit, back, self)
+        return p
+
+
 class BadRequest(Exception):
     pass
 
@@ -1473,6 +1563,7 @@ class Server:
             log("the GGUF has no chat template: using ChatML (as llama-server; --chat-template-file to give one)")
             self.template_src = CHATML_TEMPLATE
         self.template = make_template(self.template_src)
+        self.setup_specials(args)
         im = self.eng.tokenize("<|im_start|>")
         self.im_start = im[0] if len(im) == 1 else None  # checkpoint at the start of the generation prompt
         if args.mmproj:
@@ -1497,6 +1588,20 @@ class Server:
         self.t_start = time.time()
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts{vis}")
         self.warm_s = self.eng.keep_warm()  # (MK_KEEP_WARM_S: the first reply starts at full clocks too)
+
+    def setup_specials(self, args):
+        """--content-specials text (the default; env MK_CONTENT_SPECIALS): special-token text inside the request's
+        messages and tools is tokenized as plain text (LiteralTemplate, tokenize_prompt); parse: as the special tokens,
+        as llama-server does"""
+        if getattr(args, "content_specials", "parse") != "text":
+            log("special-token text in messages is tokenized as special tokens (--content-specials parse, as llama-server)")
+            return
+        controls = self.eng.controls()
+        if not controls:
+            log(f"special-token text in messages is tokenized as special tokens: {os.path.basename(args.lib)} has no "
+                f"mk_tokenize2 / mk_token_attr (rebuild it)")
+            return
+        self.template = LiteralTemplate(self.template, controls)
 
     def warm_up(self):
         """Runs one prefill and one decode cycle before the server listens.
@@ -1737,7 +1842,7 @@ class Server:
         generating: /v1/messages/count_tokens, /v1/chat/completions/input_tokens"""
         text, _, media = self.render(body)
         if not media:
-            return len(self.eng.tokenize(text))
+            return len(self.tokenize_prompt(text, media)[0])
         with self.lock:  # (the image cache belongs to the running request too)
             toks, images = self.tokenize_prompt(text, media)
             self.vision.release([im for _, im in images])
@@ -1889,11 +1994,13 @@ class Server:
         """the prompt's token ids and its images [(pos, Vision.Image)]: each MEDIA_MARKER becomes <|vision_start|>, the
         image's rows (<|image_pad|> placeholders, nx * ny of them), <|vision_end|>; the text between is tokenized piece
         by piece, as mtmd_tokenize does. A video's marker becomes its parts (Vision.video: texts, and frames / frame
-        pairs each like an image). The images are pinned (Vision.image / video): the caller releases them."""
+        pairs each like an image). The images are pinned (Vision.image / video): the caller releases them. Special-token
+        text from the request's content (a Prompt of LiteralTemplate) is tokenized as text (tokenize_text)."""
+        lit = getattr(text, "lit", None)
         if not media:
-            return self.eng.tokenize(text), []
+            return self.tokenize_text(lit[0] if lit else text, lit), []
         toks, images = [], []
-        segs = text.split(MEDIA_MARKER)
+        segs = (lit[0] if lit else text).split(MEDIA_MARKER)  # (the same media markers: LiteralTemplate checked it)
         frames_left = MAX_VIDEO_FRAMES
 
         def add_image(im, j=None):  # (j: its slot in images, else appended)
@@ -1907,7 +2014,7 @@ class Server:
         try:
             for i, seg in enumerate(segs):
                 if seg:
-                    toks += self.eng.tokenize(seg)
+                    toks += self.tokenize_text(seg, lit)
                 if i < len(media):
                     if isinstance(media[i], VideoBytes):
                         # llama.cpp's layout: "Video:", frames / frame pairs as images, timestamp texts between (each
@@ -1931,6 +2038,27 @@ class Server:
             self.vision.release([im for _, im in images])
             raise
         return toks, images
+
+    def tokenize_text(self, text, lit=None):
+        """the token ids of rendered prompt text (a piece between media). With lit (Prompt.lit) the text comes from the
+        prompt rendered with the request content's special-token texts as placeholders: it is split at the template's
+        own control tokens (kept), and each piece between them is tokenized with its texts put back, as plain text where
+        it has any (parse_special false: the piece is one run of text, as llama.cpp tokenizes the text between special
+        tokens, so those texts never become control tokens). Pieces without any, and every prompt without such text
+        in its content, tokenize exactly as before."""
+        if not lit:
+            return self.eng.tokenize(text)
+        _, back, lt = lit
+        toks, pos = [], 0
+        for m in itertools.chain(lt.ctl_re.finditer(text), [None]):
+            piece = text[pos:m.start() if m else len(text)]
+            if piece:
+                orig = piece.translate(back)
+                toks += self.eng.tokenize(orig, special=False) if orig != piece else self.eng.tokenize(piece)
+            if m:
+                toks.append(lt.controls[m.group()])
+                pos = m.end()
+        return toks
 
     def ck_positions(self, toks, start):
         """checkpoints for a prefill of toks[start:] besides the generation prompt: each message start and every
@@ -2601,14 +2729,23 @@ def make_handler(srv):
         # ---- routes without generation (llama-server's) ----
         def _tokenize(self, body):
             content = body.get("content")
-            if body.get("parse_special") is False:
-                raise BadRequest("parse_special: false is not supported (special tokens are always parsed)")
+            # llama-server's flags: parse_special [true], add_special [false; for the first element only, if a string]
+            special = body.get("parse_special") is not False
+            add = body.get("add_special") is True
             if isinstance(content, str):
                 content = [content]
             if not isinstance(content, list) or not all(isinstance(c, (str, int)) and not isinstance(c, bool) for c in content):
                 raise BadRequest("content: a string, or an array of strings and token ids")
-            # (ids of the tokenizer's own, or ids given in the content: those only within the vocabulary get a piece)
-            toks = [(t, isinstance(c, str)) for c in content for t in (srv.eng.tokenize(c) if isinstance(c, str) else [c])]
+
+            def tok(i, c):  # (ids of the tokenizer's own, or ids given in the content: those only in the vocabulary get a piece)
+                if not isinstance(c, str):
+                    return [c]
+                first = add and i == 0
+                return srv.eng.tokenize(c) if special and not first else srv.eng.tokenize(c, special, first)
+            try:
+                toks = [(t, isinstance(c, str)) for i, c in enumerate(content) for t in tok(i, c)]
+            except ValueError as e:  # (a library without mk_tokenize2)
+                raise BadRequest(str(e))
             if not body.get("with_pieces"):
                 return {"tokens": [t for t, _ in toks]}
             out = []
@@ -2949,6 +3086,11 @@ def main():
     ap.add_argument("--park-cks", type=int, default=2, metavar="N",
                     help="checkpoints kept with a parked conversation (the newest; with exact reuse any checkpoint gives "
                          "the same bits, fewer only mean more re-prefill after an edit)")
+    ap.add_argument("--content-specials", choices=["text", "parse"],
+                    default=os.environ.get("MK_CONTENT_SPECIALS") or "text",
+                    help="special-token text (<|im_end|>, <|im_start|>, ...) inside messages, tool results, tool calls and "
+                         "tool definitions: text (tokenized as plain text, so content such as a file an agent reads cannot "
+                         "forge turns) or parse (as those special tokens, as llama-server does) (env MK_CONTENT_SPECIALS)")
     ap.add_argument("--chat-template-file", dest="chat_template", action=ChatTemplateArg, metavar="PATH",
                     help="Jinja chat template file to use instead of the GGUF's (as llama-server), e.g. another "
                          "template for a fine-tune of the same model")
@@ -2986,6 +3128,8 @@ def main():
     for k in ("side_max", "park_mib", "park_min", "park_cks"):
         if getattr(args, k) < 0:
             ap.error(f"--{k.replace('_', '-')}: expected a number >= 0")
+    if args.content_specials not in ("text", "parse"):  # (an MK_CONTENT_SPECIALS default is not checked by choices)
+        ap.error(f"MK_CONTENT_SPECIALS: expected text or parse, not {args.content_specials!r}")
     args.chat_template_src = None  # (before the port opens: a bad template fails at once, not after the model load)
     if args.chat_template:
         try:

@@ -23,6 +23,7 @@ REM   MK_DRAFT_Q4=0       the draft head reads lm_head instead of its Q4_K copy 
 REM   MK_MTP              the MTP draft layer from a separate GGUF of the same model (e.g. an mtp-*.gguf)
 REM   MK_NO_MTP=1         no MTP layer: plain decoding, depth 0 (also automatic for a model file without one)
 REM   MK_CHAT_TEMPLATE_FILE  a Jinja chat template file used instead of the GGUF's (--chat-template-file, as llama-server)
+REM   MK_CONTENT_SPECIALS special-token text inside messages: text (default) or parse (as llama-server; see scripts/serve.sh)
 REM   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS, MK_MAX_VIDEO_FRAMES
 REM                       request limits: body size (default 128 MB), images per request (32), pixels per image
 REM                       (100,000,000; checked before decoding), video frames per request (256)

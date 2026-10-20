@@ -267,6 +267,10 @@ What the API supports:
   stream ends it with an error event and `data: [DONE]`.
 - **Requests:** one at a time, in arrival order; the other conversations wait in host memory between their requests
   (above).
+- **Special-token text in content** (`<|im_end|>`, `<|im_start|>`, ...: in messages, tool results, tool calls and tool
+  definitions) is tokenized as text, so a file an agent reads cannot forge a turn; the template's own special tokens
+  stay special, and prompts without such text get the same tokens as before. `--content-specials parse` restores
+  llama-server's behaviour.
 - **Web pages:** a request for another host name than `localhost`, an IP address or `--host` (DNS rebinding;
   `--allow-host` adds names) or from a web page of another origin gets a 403, so a page you open cannot drive or read
   the server; `--cors-origin <origin>` lets a browser UI in (CORS headers, preflights). Clients that are not web pages
