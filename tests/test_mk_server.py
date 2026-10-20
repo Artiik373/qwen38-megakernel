@@ -473,7 +473,8 @@ CALL = "<tool_call>\n<function=read_file>\n<parameter=path>\n/etc/hostname\n</pa
 
 
 class ToolCallCutTests(_HttpCase):
-    """a tool call counts only with its closing tags: one cut by max_tokens is text and the reply ends with 'length'"""
+    """a tool call counts only with its closing tags: one cut by max_tokens is text and the reply ends with 'length' (a
+    stream started it as it was generated: its arguments never become valid JSON)"""
 
     def test_only_a_closed_call_is_parsed(self) -> None:
         self.assertEqual(len(self.mk.parse_tool_calls(CALL, TOOLS)), 1)
@@ -499,7 +500,12 @@ class ToolCallCutTests(_HttpCase):
         self.assertEqual(events[-1], b"[DONE]")
         deltas = [c for e in events[:-1] for c in json.loads(e)["choices"]]
         content = "".join(d["delta"].get("content") or "" for d in deltas)
-        calls = [tc for d in deltas for tc in d["delta"].get("tool_calls") or []]
+        calls = {}  # (accumulated by index, as the SDKs do)
+        for tc in [tc for d in deltas for tc in d["delta"].get("tool_calls") or []]:
+            c = calls.setdefault(tc["index"], {"id": tc.get("id"), "function": {"name": "", "arguments": ""}})
+            for k in ("name", "arguments"):
+                c["function"][k] += tc["function"].get(k) or ""
+        calls = [calls[i] for i in sorted(calls)]
         return pieces, [d["finish_reason"] for d in deltas if d["finish_reason"]][-1], content, calls
 
     def test_a_complete_call_is_a_tool_call(self) -> None:
@@ -513,8 +519,14 @@ class ToolCallCutTests(_HttpCase):
         for cut in (1, 2, 4, 12):  # inside </tool_call>, </function>, the parameter
             for stream in (False, True):
                 pieces, finish, content, calls = self._reply(n - cut, stream)
-                self.assertEqual((finish, calls), ("length", []), (cut, stream))
-                self.assertEqual(content, "".join(pieces[:n - cut]), (cut, stream))  # (all of the generated text)
+                if not stream:
+                    self.assertEqual((finish, calls), ("length", []), cut)
+                    self.assertEqual(content, "".join(pieces[:n - cut]), cut)  # (all of the generated text)
+                    continue
+                self.assertEqual((finish, content, len(calls)), ("length", "Let me look.", 1), cut)
+                self.assertEqual(calls[0]["function"]["name"], "read_file")
+                with self.assertRaises(ValueError):  # (never valid JSON: a client cannot run it)
+                    json.loads(calls[0]["function"]["arguments"])
 
 
 # === sec:b1 ===

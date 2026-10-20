@@ -257,8 +257,10 @@ What the API supports:
 - **Video:** `input_video` parts (`{"data": <base64>}`, as llama-server) or `video_url` parts with a base64 `data:` URL;
   ffmpeg samples `--video-fps` frames per second (default 4) and the prompt is laid out as llama.cpp does
   ([docs/ENGINE.md](docs/ENGINE.md#video)). There is no audio.
-- **Tool calls:** a call counts only when it is complete; one cut by `max_tokens` is returned as text in `content`, with
-  `finish_reason` "length".
+- **Tool calls:** streamed as they are generated (the name first, then the arguments' JSON text in pieces: string
+  values as they come, other values whole); a call counts only when it is complete. One cut by `max_tokens` is
+  returned as text in `content` (a stream has already started it: its arguments never become valid JSON), with
+  `finish_reason` "length". A value may contain any text, tool-call markup included.
 - **Limits:** request bodies up to 128 MB (`MK_MAX_BODY_MB`), 32 images per request (`MK_MAX_IMAGES`), 100 megapixels
   per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded), 256 video frames per request
   (`MK_MAX_VIDEO_FRAMES`: 64 s at 4 fps). A refused upload still gets its 4xx answer:

@@ -7,7 +7,7 @@ llama-server's API that open-jet uses).
 POST /v1/chat/completions (streaming or not): the request is rendered with the chat template stored
 in the GGUF, or the one given by --chat-template-file / --chat-template (llama-server's options), with
 enable_thinking / preserve_thinking / reasoning_effort via chat_template_kwargs and tools via `tools`;
-reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured `tool_calls`.
+reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured `tool_calls` (streamed as generated).
 Sampling: temperature, top_p, top_k (1..32; <= 0: 32, the engine's maximum), min_p, seed; stop strings
 (`stop`).  Successive requests of a conversation reuse the processed tokens: the new prompt is
 matched against the sequence so far and only the rest is prefilled. When the new prompt diverges inside
@@ -1110,44 +1110,215 @@ def normalize_messages(messages, media=None):
     return out
 
 
-# a tool call counts only with both closing tags: one cut by max_tokens (or left open) is not a call
-TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>((?:(?!<tool_call>).)*?)</function>\s*</tool_call>", re.S)
-PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
+# Qwen's XML tool calls: <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...</function>\n</tool_call>.
+# A call counts only with both closing tags: one cut by max_tokens (or left open) is not a call. A value runs to the next
+# </parameter> (as llama.cpp's parser reads it), so it may contain any other markup, <tool_call> included.
+TOOL_OPEN = "<tool_call>"
+TOOL_HEAD_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>")
+TOOL_END_RE = re.compile(r"</function>\s*</tool_call>")
+PARAM_HEAD_RE = re.compile(r"<parameter=([^>\n]+)>")
+TAG_NAME_RE = re.compile(r"[^>\n]*")  # (a name that may still be completing: nothing that ends it yet)
+SPACE_RE = re.compile(r"\s*")
+
+
+class ToolCallParser:
+    """Qwen's tool calls in the generated text (from its first <tool_call>), parsed as the text arrives. `calls`: the
+    complete calls in OpenAI's shape. With events, feed() also returns each call as it is generated: ("start", index,
+    id, name) once its function name is complete, then ("args", index, fragment) pieces of its arguments' JSON text: a
+    string parameter's value as it is generated (JSON-escaped), any other value whole at its end (it is decoded as JSON
+    there), the closing brace with the call's closing tags, so the arguments become valid JSON only when the call is
+    complete. A complete call's fragments add up to its arguments byte for byte (a parameter given twice: both values
+    are sent, the arguments hold the last one, as a JSON parser reads the sent text). A parameter is a string when
+    its schema type is "string", or it has no type and does not start like a JSON value.
+    one (parallel_tool_calls false): no call is started in the stream after a complete one. Decisions do not depend on
+    how the text is split into pieces: a tag that may still be completing waits for more text."""
+
+    def __init__(self, tools, events=False, one=False):
+        self.schemas = {}
+        for t in tools or []:
+            fn = t.get("function", t) if isinstance(t, dict) else {}
+            props = (fn.get("parameters") or {}).get("properties") if isinstance(fn, dict) else None
+            self.schemas[fn.get("name") if isinstance(fn, dict) else None] = props if isinstance(props, dict) else {}
+        self.events, self.one = events, one
+        self.text, self.pos, self.state = "", 0, "seek"
+        self.calls = []
+        self.end = 0  # where the last complete call ends in text
+        self.started = 0  # calls started in the stream
+        self.open = []  # where the calls started in the stream that did not complete begin
+        self.cur = None  # the call being read
+
+    def feed(self, text, final=False):
+        """the stream events of text (all of them by the final call)"""
+        self.text += text
+        out = []
+        step = {"seek": self._seek, "head": self._head, "between": self._between, "value": self._value}
+        while self.state != "done" and step[self.state](final, out):
+            pass
+        if final:
+            self.state = "done"
+        return out
+
+    def unparsed(self, streamed=False):
+        """the tool-call markup after the last complete call that is not a call itself (cut by max_tokens, left open or
+        malformed), from its <tool_call> to the end; empty if there is none. streamed: only the part before a call that
+        was started in the stream (the client has that one as a call already)"""
+        u = self.text.find(TOOL_OPEN, self.end)
+        if u < 0:
+            return ""
+        cut = min((s for s in self.open if s >= u), default=len(self.text)) if streamed else len(self.text)
+        return self.text[u:cut]
+
+    def _seek(self, final, out):
+        i = self.text.find(TOOL_OPEN, self.pos)
+        if i < 0:
+            self.pos = max(self.pos, len(self.text) - len(TOOL_OPEN) + 1)
+            return False
+        self.start, self.pos, self.state = i, i, "head"
+        return True
+
+    def _head(self, final, out):
+        t = self.text
+        m = TOOL_HEAD_RE.match(t, self.start)
+        if m is None:
+            j = SPACE_RE.match(t, self.start + len(TOOL_OPEN)).end()
+            if not final and ("<function=".startswith(t[j:]) if len(t) - j < 10 else
+                              t.startswith("<function=", j) and TAG_NAME_RE.fullmatch(t, j + 10)):
+                return False  # (it may still become a call)
+            self.pos, self.state = self.start + len(TOOL_OPEN), "seek"  # (not a call)
+            return True
+        name = m.group(1).strip()
+        props = self.schemas.get(name, {})
+        self.cur = c = {"start": self.start, "name": name, "id": "call_" + uuid.uuid4().hex[:24], "props": props,
+                        "args": {}, "n": 0, "index": None}
+        if self.events and not (self.one and self.calls):
+            c["index"], self.started = self.started, self.started + 1
+            out.append(("start", c["index"], c["id"], name))
+        self.pos, self.state = m.end(), "between"
+        return True
+
+    def _between(self, final, out):
+        """after the function name or a parameter: the next parameter or the closing tags (other text is skipped, a new
+        <tool_call> makes this one not a call)"""
+        t, c = self.text, self.cur
+        hits = [(j, tag) for tag in ("<parameter=", "</function>", TOOL_OPEN) for j in (t.find(tag, self.pos),) if j >= 0]
+        if not hits:
+            if final:
+                return self._drop()  # (left open)
+            self.pos = max(self.pos, len(t) - 10)
+            return False
+        j, tag = min(hits)
+        if tag == TOOL_OPEN:  # (a new call before this one's closing tags: this one was left open)
+            self._drop()
+            self.pos, self.state = j, "seek"
+            return True
+        if tag == "</function>":
+            m = TOOL_END_RE.match(t, j)
+            if m is not None:
+                self._arg("}" if c["n"] else "{}", out)
+                self.calls.append({"id": c["id"], "type": "function", "function": {
+                    "name": c["name"], "arguments": json.dumps(c["args"], ensure_ascii=False)}})
+                self.cur, self.end, self.pos, self.state = None, m.end(), m.end(), "seek"
+                return True
+            k = SPACE_RE.match(t, j + 11).end()
+            if not final and len(t) - k < 12 and "</tool_call>".startswith(t[k:]):
+                self.pos = j
+                return False
+            self.pos = j + 11
+            return True
+        m = PARAM_HEAD_RE.match(t, j)
+        if m is None:
+            if not final and TAG_NAME_RE.fullmatch(t, j + 11):
+                self.pos = j
+                return False
+            self.pos = j + 11
+            return True
+        vs = m.end()
+        if vs == len(t):  # (a newline right after the tag is not part of the value)
+            if final:
+                return self._drop()
+            self.pos = j
+            return False
+        vs += t[vs] == "\n"
+        key = m.group(1).strip()
+        spec = c["props"].get(key)
+        typ = spec.get("type") if isinstance(spec, dict) else None
+        c.update(key=key, vstart=vs, vscan=vs, vsent=vs, kind="string" if typ == "string" else None if typ is None else "json")
+        self.state = "value"
+        return True
+
+    def _value(self, final, out):
+        t, c = self.text, self.cur
+        k = t.find("</parameter>", c["vscan"])
+        if k < 0:
+            if final:  # (a stream gets the string's text to the end, the call stays incomplete)
+                self._send_value(len(t), False, out)
+                return self._drop()
+            c["vscan"] = max(c["vstart"], len(t) - 11)
+            self._send_value(max(c["vstart"], len(t) - 12), False, out)  # (a newline and the closing tag may follow)
+            return False
+        end = k - 1 if k > c["vstart"] and t[k - 1] == "\n" else k
+        self._send_value(end, True, out)
+        self.pos, self.state = k + len("</parameter>"), "between"
+        return True
+
+    def _send_value(self, upto, done, out):
+        """the value's text up to `upto` (done: its end): a string's as it comes, another value's at its end"""
+        t, c = self.text, self.cur
+        if c["kind"] is None:  # (no type in the schema: decided by its first character)
+            head = t[c["vstart"]:upto].strip()[:1]
+            if not head and not done:
+                return
+            c["kind"] = "json" if head in "[{0123456789-tfn" else "string"
+        key = json.dumps(c["key"], ensure_ascii=False)
+        if c["kind"] == "string":
+            if c["vsent"] == c["vstart"] and not c.get("opened"):
+                c["opened"] = True
+                self._arg((", " if c["n"] else "{") + key + ': "', out)
+                c["n"] += 1
+            if upto > c["vsent"]:
+                self._arg(json.dumps(t[c["vsent"]:upto], ensure_ascii=False)[1:-1], out)
+                c["vsent"] = upto
+            if done:
+                self._arg('"', out)
+                c["args"][c["key"]] = t[c["vstart"]:upto]
+                c["opened"] = False
+            return
+        if not done:
+            return
+        val = t[c["vstart"]:upto]
+        try:
+            val = json.loads(val)
+        except (ValueError, RecursionError):  # (not JSON: the text itself)
+            pass
+        self._arg((", " if c["n"] else "{") + key + ": " + json.dumps(val, ensure_ascii=False), out)
+        c["n"] += 1
+        c["args"][c["key"]] = val
+
+    def _arg(self, frag, out):
+        if self.cur["index"] is not None:
+            out.append(("args", self.cur["index"], frag))
+
+    def _drop(self):
+        """the call being read is not a call: a new <tool_call> before its closing tags, or (returns False: the end)
+        left open at the end of the text, whose unclosed value or tag may hold anything (no call is looked for in it)"""
+        if self.cur["index"] is not None:
+            self.open.append(self.cur["start"])
+        self.cur, self.state = None, "seek"
+        return False
 
 
 def unparsed_tool_call(text):
-    """the tool-call markup after the last complete call that is not a call itself (cut by max_tokens, left open or
-    malformed), from its <tool_call> to the end; empty if there is none"""
-    end = 0
-    for m in TOOL_CALL_RE.finditer(text):
-        end = m.end()
-    i = text.find("<tool_call>", end)
-    return text[i:] if i >= 0 else ""
+    """the tool-call markup after the last complete call that is not a call itself (ToolCallParser.unparsed)"""
+    p = ToolCallParser([])
+    p.feed(text, final=True)
+    return p.unparsed()
 
 
 def parse_tool_calls(text, tools):
-    schemas = {}
-    for t in tools or []:
-        fn = t.get("function", t)
-        schemas[fn.get("name")] = (fn.get("parameters") or {}).get("properties") or {}
-    calls = []
-    for m in TOOL_CALL_RE.finditer(text):
-        name = m.group(1).strip()
-        props = schemas.get(name, {})
-        args = {}
-        for p in PARAM_RE.finditer(m.group(2)):
-            key, val = p.group(1).strip(), p.group(2)
-            typ = (props.get(key) or {}).get("type")
-            if typ == "string" or (typ is None and not val.strip()[:1] in "[{0123456789-tfn"):
-                args[key] = val
-            else:
-                try:
-                    args[key] = json.loads(val)
-                except json.JSONDecodeError:
-                    args[key] = val
-        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
-    return calls
+    """the complete tool calls in text (ToolCallParser)"""
+    p = ToolCallParser(tools)
+    p.feed(text, final=True)
+    return p.calls
 
 
 def _off(limit, above=False):
@@ -1266,18 +1437,26 @@ class StopMatcher:
 
 
 class OutputParser:
-    """Splits the generated text into reasoning (before </think>), content and tool-call markup."""
+    """Splits the generated text into reasoning (before </think>), content and tool calls (from the first <tool_call>:
+    ToolCallParser). calls: the tool calls' stream events too, as ("tool_call", delta) with delta in the shape of an
+    OpenAI stream's delta.tool_calls[] entry; one: parallel_tool_calls false."""
 
-    def __init__(self, thinking, tools):
+    def __init__(self, thinking, tools, calls=False, one=False):
         self.mode = "reasoning" if thinking else "content_start"
         self.tools = tools
+        self.tc = ToolCallParser(tools, calls, one) if tools else None
         self.buf = ""
         self.tool_text = ""
         self.tool_sep = ""  # the whitespace between the content and the first <tool_call>
         self.content_seen = False
 
+    @property
+    def calls(self):
+        """the complete tool calls (OpenAI's shape)"""
+        return self.tc.calls if self.tc else []
+
     def feed(self, text, final=False):
-        """returns [(kind, text)] with kind in {reasoning, content}"""
+        """returns [(kind, text)] with kind in {reasoning, content}, and ("tool_call", delta) (calls)"""
         out = []
         self.buf += text
         while True:
@@ -1306,10 +1485,9 @@ class OutputParser:
                         head = self.buf[:i].rstrip()
                         out.append(("content", head))
                         self.tool_sep = self.buf[len(head):i]
-                        self.tool_text = self.buf[i:]
-                        self.buf = ""
+                        self.buf = self.buf[i:]
                         self.mode = "tools"
-                        break
+                        continue
                     keep = 0 if final else len("<tool_call>") - 1
                 else:
                     keep = 0
@@ -1323,18 +1501,25 @@ class OutputParser:
                     out.append(("content", head))
                     self.buf = seg[len(head):] + self.buf[len(self.buf) - keep:]
                 break
-            # tools: collect everything
+            # tools: everything from the first <tool_call>
             self.tool_text += self.buf
+            for ev in self.tc.feed(self.buf, final):
+                if ev[0] == "start":
+                    out.append(("tool_call", {"index": ev[1], "id": ev[2], "type": "function",
+                                              "function": {"name": ev[3], "arguments": ""}}))
+                else:
+                    out.append(("tool_call", {"index": ev[1], "function": {"arguments": ev[2]}}))
             self.buf = ""
             break
         out = [(k, t) for k, t in out if t]
         self.content_seen = self.content_seen or any(k == "content" for k, _ in out)
         return out
 
-    def unparsed(self):
-        """the tool-call markup that is not a complete call (unparsed_tool_call), as the rest of the content: the
-        client gets the text, as from llama-server, instead of a call it would execute half-written"""
-        rest = unparsed_tool_call(self.tool_text)
+    def unparsed(self, streamed=False):
+        """the tool-call markup that is not a complete call (ToolCallParser.unparsed), as the rest of the content: the
+        client gets the text, as from llama-server, instead of a call it would execute half-written. streamed: without
+        a call the stream started (its client has it as a call whose arguments never became valid JSON)"""
+        rest = self.tc.unparsed(streamed) if self.tc else ""
         return (self.tool_sep if self.content_seen else "") + rest if rest else ""
 
 
@@ -2257,7 +2442,8 @@ class Server:
         return desc
 
     def generate(self, body, emit, gone=lambda: False):
-        """runs one chat completion; emit(kind, payload) is called with ('reasoning'|'content', text) deltas.
+        """runs one chat completion; emit(kind, payload) is called with ('reasoning'|'content', text) deltas, and in a
+        stream (body["stream"]) with ('tool_call', delta.tool_calls[] entry) as the tool calls are generated.
         Returns (finish_reason, tool_calls, usage, timings). emit returning False, or gone() returning True (the client
         closed its connection; asked before the prefill, during it by a watcher thread (the prefill stops at its next
         chunk) and before each engine cycle) stops it with ClientGone."""
@@ -2337,7 +2523,8 @@ class Server:
                      f"{len(enc)} encoded on the CPU in {secs(enc_s)}")
         CON.status(f"#{rid} decoding")
         log(line)
-        parser = OutputParser(thinking, tools)
+        # a stream gets the tool calls as they are generated (ToolCallParser's events)
+        parser = OutputParser(thinking, tools, bool(body.get("stream")), body.get("parallel_tool_calls") is False)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         n_gen, finish, pending, aborted, dropped = 0, "length", [tok], False, 0
         phase = {"thinking": 0, "answer": 0, "tool call": 0}  # generated tokens by the part of the reply they are in
@@ -2378,13 +2565,15 @@ class Server:
         for kind, delta in parser.feed(stopper.feed(dec.decode(b"", final=True), final=True), final=True):
             emit(kind, delta)
         self.stop_word = stopper.word
-        calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
+        calls = parser.calls
         if body.get("parallel_tool_calls") is False:
             calls = calls[:1]  # (the first call only)
         rest = parser.unparsed()
-        if rest:
-            emit("content", rest)
-        # a call cut by max_tokens is text, and the reply ends with "length" (complete calls before it are still sent)
+        shown = parser.unparsed(streamed=True) if body.get("stream") else rest
+        if shown:
+            emit("content", shown)
+        # a call cut by max_tokens is text (a stream's client has it as a call it started, arguments incomplete), and the
+        # reply ends with "length" (complete calls before it are still sent)
         if calls and not (rest and finish == "length"):
             finish = "tool_calls"
         t2 = time.time()
@@ -2820,7 +3009,7 @@ def make_handler(srv):
 
         def _anthropic_stream(self, chat, model):
             """Anthropic's SSE: message_start, ping, content blocks (thinking / text deltas as they come, tool_use blocks
-            with their whole input as one input_json_delta at the end), message_delta, message_stop"""
+            with their input as input_json_delta pieces as it is generated), message_delta, message_stop"""
             mid = "msg_" + uuid.uuid4().hex
             st = {"started": False, "index": -1, "open": None, "ws": ""}  # ws: the thinking's held trailing whitespace
 
@@ -2875,6 +3064,12 @@ def make_handler(srv):
                         st["ws"] = t[len(body):]
                         if body:
                             delta({"type": "thinking_delta", "thinking": body})
+                    elif kind == "tool_call":  # (ToolCallParser's events: a call's start, then its input's JSON text)
+                        if "id" in text:
+                            block({"type": "tool_use", "id": "toolu_" + text["id"].removeprefix("call_"),
+                                   "name": text["function"]["name"], "input": {}})
+                        if text["function"].get("arguments"):
+                            delta({"type": "input_json_delta", "partial_json": text["function"]["arguments"]})
                     else:
                         if st["open"] != "text":
                             block({"type": "text", "text": ""})
@@ -2896,11 +3091,6 @@ def make_handler(srv):
                                                          "message": str(e)}}, last=True)
                 return
             start()
-            close()
-            for c in calls:
-                tu = anthropic_tool_use(c)
-                block({**tu, "input": {}})
-                delta({"type": "input_json_delta", "partial_json": json.dumps(tu["input"], ensure_ascii=False)})
             close()
             event("message_delta", {"type": "message_delta", "delta": {
                 "stop_reason": anthropic_stop_reason(finish, srv.stop_word), "stop_sequence": srv.stop_word},
@@ -2950,7 +3140,8 @@ def make_handler(srv):
             def emit(kind, text):
                 head()
                 try:
-                    chunk({"reasoning_content": text} if kind == "reasoning" else {"content": text})
+                    chunk({"tool_calls": [text]} if kind == "tool_call" else
+                          {"reasoning_content": text} if kind == "reasoning" else {"content": text})
                 except (BrokenPipeError, ConnectionResetError):
                     return False
                 return True
@@ -2970,9 +3161,7 @@ def make_handler(srv):
                 send(b"data: " + json.dumps({"error": err}, ensure_ascii=False).encode() + b"\n\n")
                 send(b"data: [DONE]\n\n", last=True)
                 return
-            head()
-            for i, c in enumerate(calls):
-                chunk({"tool_calls": [{"index": i, **c}]})
+            head()  # (the tool calls went out as they were generated)
             chunk({}, finish=finish, timings=timings)
             if (body.get("stream_options") or {}).get("include_usage"):
                 chunk(None, usage=usage)

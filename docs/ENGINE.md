@@ -295,9 +295,21 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
 
 - Prompts are rendered with the chat template stored in the GGUF (jinja2): `chat_template_kwargs`
   `enable_thinking` / `preserve_thinking` / `reasoning_effort`, OpenAI `tools`. Reasoning is streamed as
-  `reasoning_content`, Qwen's XML tool calls are returned as structured `tool_calls`. A call counts only with both
-  closing tags (`</function>`, `</tool_call>`): one cut by `max_tokens` (or left open) is returned as text at the end
-  of `content`, and the reply ends with `finish_reason` "length" (complete calls before it are still returned).
+  `reasoning_content`, Qwen's XML tool calls are returned as structured `tool_calls`. A parameter's value runs to its
+  `</parameter>`, so it may hold any text (a file that contains tool-call markup, as llama.cpp's parser reads it). A
+  call counts only with both closing tags (`</function>`, `</tool_call>`): one cut by `max_tokens` (or left open) is
+  returned as text at the end of `content`, and the reply ends with `finish_reason` "length" (complete calls before it
+  are still returned).
+- Streams send each tool call as it is generated, as OpenAI and llama-server do: a `delta.tool_calls` entry with
+  `index`, `id`, `type` and `function.name` (`arguments` "") once the function name is complete, then entries with
+  `index` and pieces of `function.arguments`. A string parameter's value goes out as it is generated (JSON-escaped);
+  other values (schema type not "string"; without a type, a value that starts like JSON) whole at their end, decoded
+  as in the non-streamed reply; the closing brace comes with the call's closing tags. The pieces of a complete call add
+  up to the non-streamed reply's `arguments` byte for byte (a parameter the model gives twice: both values are sent,
+  and a JSON parser keeps the last, as the reply does). A call the stream started that is then cut (`max_tokens`, a
+  stop string) or left open keeps arguments that are not valid JSON (clients that run a call once its arguments
+  parse never run it), its markup is not repeated as `content`, and `finish_reason` is "length" / "stop" as without
+  streaming. `parallel_tool_calls: false`: no call is started after the first complete one.
 - **Chat template option** (llama-server's): `--chat-template-file PATH` (the file's text, UTF-8; CRLF line ends are
   read as LF, as llama-server on Windows reads them) or `--chat-template TEMPLATE` (the Jinja source itself, or
   `chatml`) replaces the GGUF's template everywhere: chat and Anthropic requests, `/apply-template`, token counts,
@@ -417,7 +429,8 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   `text`, `tool_use` (parsed `input`), `stop_reason` end_turn / max_tokens / stop_sequence (with `stop_sequence`) /
   tool_use, `usage` with `input_tokens` (prefilled), `cache_read_input_tokens` (reused from the previous turn) and
   `output_tokens`. Streams: `message_start`, `ping`, `content_block_start` / `content_block_delta` (`thinking_delta`,
-  `text_delta`, and one `input_json_delta` per tool call at the end) / `content_block_stop`, `message_delta`,
+  `text_delta`, `input_json_delta` pieces of each tool call's input as it is generated, as in OpenAI streams above) /
+  `content_block_stop`, `message_delta`,
   `message_stop`; an error after the start is an `error` event. Errors in Anthropic's shape
   (`{"type": "error", "error": {"type": "invalid_request_error", ...}}`); API keys are not checked (a local server).
 - Without generation (no wait for a running request, except for images): `POST /tokenize` (`content`: a string or
