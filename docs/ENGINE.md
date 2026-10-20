@@ -484,9 +484,10 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   buffer; as llama-server): the chunks are decoded into a buffer of at most `MK_MAX_BODY_MB` MB (413 as soon as a chunk
   would pass it), extensions and trailers are dropped, and a malformed size line (not hex, over 16 digits, no CRLF
   within 4096 bytes), chunk data without its CRLF or more than 64 trailer lines is a 400 that closes the connection;
-  another transfer coding is a 501, a Content-Length next to it a 400. At most `MK_MAX_IMAGES` images per request
-  (default 32; 400) and `MK_MAX_VIDEO_FRAMES` video frames (default 256, all videos of the request; 400 as soon as
-  the frame past it is decoded), and no more images are decoded once the prompt cannot fit the context. The image library refuses an image of more than
+  another transfer coding is a 501, a Content-Length next to it a 400.
+  At most `MK_MAX_IMAGES` images per request (default 32; 400) and `MK_MAX_VIDEO_FRAMES`
+  video frames (default 256, all videos of the request; 400 as soon as the frame past it is decoded), and no more
+  images are decoded once the prompt cannot fit the context. The image library refuses an image of more than
   `MK_IMAGE_MAX_PIXELS` pixels (default 100,000,000) from its header, before decoding it. Measured on 2026-10-17
   without the limit: a 446 KB PNG declaring 12000 x 12000 pixels took 39 s and 0.9 GB of server memory (decode, then
   4096 tokens encoded); a 20000 x 20000 one asks stb_image for ~2.4 GB.
