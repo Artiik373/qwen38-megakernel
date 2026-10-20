@@ -393,18 +393,28 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   (1..32; <= 0 means 32, the engine's maximum; above 32 is clamped with a one-time warning), min_p [0], seed,
   presence_penalty / frequency_penalty (-2..2, vLLM's semantics: the tokens generated in this response);
   repetition_penalty is ignored (with a warning). One request at a time, in arrival order.
-- Request fields the engine cannot honour are a 400 naming the field, never ignored silently: `n` > 1, `logprobs` /
-  `top_logprobs` / `n_probs`, `logit_bias`, `response_format` other than `{"type": "text"}`, `json_schema`, `grammar`,
-  `tool_choice` other than "auto" / "none" (forcing a call needs constrained sampling), legacy `functions`,
-  `ignore_eos`, audio output, `add_generation_prompt: false` / `continue_final_message`, and llama.cpp's other
-  samplers (`mirostat`, `typical_p` / `typ_p`, `tfs_z`, `xtc_probability`, `dry_multiplier`, `top_n_sigma`,
-  `dynatemp_range`, `min_tokens`) unless they have their "off" value (llama.cpp's web UI sends them all). Handled by the
-  server: `tool_choice: "none"` (the tools stay in the prompt, calls come back as text, as in llama-server),
+- Request fields the engine cannot honour are a 400 naming the field, never ignored silently: `n` / `n_cmpl` > 1,
+  `logprobs` / `top_logprobs` / `n_probs`, `logit_bias`, `response_format` other than `{"type": "text"}`,
+  `json_schema`, `grammar`, `tool_choice` other than "auto" / "none" (forcing a call needs constrained sampling),
+  legacy `functions`, `ignore_eos`, audio output, `add_generation_prompt: false` / `continue_final_message`,
+  llama-server's `id_slot` other than 0 / -1 (one slot) and `n_indent`, and llama.cpp's other samplers (`mirostat`,
+  `typical_p` / `typ_p`, `tfs_z`, `xtc_probability`, `dry_multiplier`, `top_n_sigma`, `dynatemp_range`, `min_tokens`)
+  unless they have their "off" value (llama.cpp's web UI sends them all); `samplers` (names, or a string of their
+  letters) only when it asks for what the engine does: top_k, top_p, min_p and temperature in llama.cpp's default
+  order (others in their default places, penalties first when one is set), e.g. the web UI's "edkypmxt". Handled by
+  the server: `tool_choice: "none"` (the tools stay in the prompt, calls come back as text, as in llama-server),
   `parallel_tool_calls: false` (the first call only), OpenAI's top-level `reasoning_effort` ("none" turns thinking
   off as in llama-server; "minimal" -> "low"; other values go to the template, which knows low / medium / high / xhigh;
-  `chat_template_kwargs` win). Accepted and without effect on the output: `user`, `metadata`, `store`, `samplers`,
-  `cache_prompt`, `stream_options`, `timings_per_token` and other bookkeeping fields. A body that is not a JSON
-  object, non-numeric sampling values and a missing `messages` array are 400s.
+  `chat_template_kwargs` win), `reasoning_format` (above), and llama-server's `return_progress` (a stream gets
+  `prompt_progress` chunks while the prompt is processed: `{"total", "cache", "processed", "time_ms"}` with a
+  `{"role": "assistant", "content": null}` delta, at the start, about every 0.5 s and at the end, as llama-server's
+  web UI shows them), `timings_per_token` (a stream's chunks carry the `timings` so far) and `t_max_predict_ms` (past
+  it, the reply ends at the next token with a newline, `finish_reason` "length", as llama-server). Accepted and
+  without effect on the output: `user`, `metadata`, `store`, `cache_prompt`, `stream_options`, llama-server's
+  `n_keep` / `n_discard` (no context shift here: a prompt too long for the context is a 400), `response_fields` /
+  `return_tokens` (they shape its `/completion` replies only), `n_cache_reuse`, `sse_ping_interval`, `verbose`, and
+  other bookkeeping fields. A body that is not a JSON object, non-numeric sampling values and a missing `messages`
+  array are 400s.
 - Stop strings: `stop` (a string or a list; at most 64 strings of at most 1024 characters; empty ones are dropped).
   As in llama-server they are matched on the whole generated text (reasoning included, and tool-call markup): the
   reply ends before the first occurrence, with `finish_reason` "stop" ("tool_calls" when complete calls came before

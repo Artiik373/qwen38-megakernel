@@ -1359,18 +1359,57 @@ SAMPLER_OFF = {"mirostat": _off(0), "typical_p": _off(1, True), "typ_p": _off(1,
 REASONING_FORMATS = ("auto", "deepseek", "deepseek-legacy", "none")
 # the chat_template_kwargs the server hands to the template
 TEMPLATE_KWARGS = ("enable_thinking", "preserve_thinking", "reasoning_effort")
+# llama.cpp's default sampler chain (its `samplers` field: names, or a string of their letters); the engine applies
+# penalties, top_k, top_p, min_p and temperature in this order
+SAMPLER_CHAIN = ("penalties", "dry", "top_n_sigma", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature")
+SAMPLER_NAMES = {**{a: n for n in SAMPLER_CHAIN + ("infill", "adaptive_p") for a in (n, n.replace("_", "-"), n.replace("_", ""))},
+                 **dict(zip("edskypmxti", SAMPLER_CHAIN + ("infill",))), "nucleus": "top_p", "temp": "temperature",
+                 "typ": "typ_p"}
+
+
+def check_samplers(v, penalties):
+    """a request's `samplers` is accepted when it asks for what the engine does: top_k, top_p, min_p and temperature in
+    llama.cpp's order (the other samplers in their default places: their parameters are checked to be off), penalties
+    too when a penalty is set; unknown names are dropped, as llama.cpp does"""
+    if isinstance(v, str):
+        names = [SAMPLER_NAMES.get(c) for c in v]
+    elif isinstance(v, list) and all(isinstance(n, str) for n in v):
+        names = [SAMPLER_NAMES.get(n.lower()) for n in v]
+    else:
+        raise BadRequest("samplers: an array of sampler names or a string of sampler letters")
+    names = [n for n in names if n]
+    order = [SAMPLER_CHAIN.index(n) if n in SAMPLER_CHAIN else -1 for n in names]
+    need = {"top_k", "top_p", "min_p", "temperature"} | ({"penalties"} if penalties else set())
+    if min(order, default=0) < 0 or order != sorted(set(order)) or not need <= set(names):
+        raise BadRequest(f"samplers: {v!r} is not supported: the megakernel samples with "
+                         f"{', '.join(n for n in SAMPLER_CHAIN if n in need)} in llama.cpp's order (its default chain)")
 
 
 def check_params(body):
     """400 for the request fields the server cannot honour (they would change the output and need engine work, e.g.
-    logprobs, n > 1, constrained sampling): never ignored silently. Harmless ones (user, metadata, store, samplers,
-    cache_prompt, ...) are accepted."""
+    logprobs, n > 1, constrained sampling): never ignored silently. Harmless ones (user, metadata, store, cache_prompt,
+    llama-server's n_keep / n_discard (no context shift), response_fields / return_tokens (its /completion only),
+    n_cache_reuse, sse_ping_interval, verbose) are accepted; samplers only in the order the engine samples."""
     def bad(field, why):
         raise BadRequest(f"{field}: {why}")
     if not isinstance(body.get("messages"), list):
         bad("messages", "an array of messages is required")
-    if body.get("n") not in (None, 1):
-        bad("n", "one choice per request (the engine runs one sequence): send several requests instead")
+    for k in ("n", "n_cmpl"):
+        if body.get(k) not in (None, 1):
+            bad(k, "one choice per request (the engine runs one sequence): send several requests instead")
+    if body.get("id_slot") not in (None, -1, 0):
+        bad("id_slot", "the server has one slot, 0 (-1: any)")
+    if body.get("n_indent") not in (None, 0):
+        bad("n_indent", "not supported (llama-server's infill option: it ends a reply on indentation)")
+    t = body.get("t_max_predict_ms")
+    if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or t != t):
+        bad("t_max_predict_ms", "a number of milliseconds (<= 0: no limit)")
+    if body.get("samplers") is not None:
+        try:
+            pen = any(float(body.get(k) or 0) for k in ("presence_penalty", "frequency_penalty"))
+        except (TypeError, ValueError):
+            pen = False  # (sampling() refuses it)
+        check_samplers(body["samplers"], pen)
     if body.get("logprobs") or body.get("top_logprobs") not in (None, 0):
         bad("logprobs", "token log-probabilities are not available from the megakernel (they need engine support)")
     if body.get("logit_bias"):
@@ -2398,6 +2437,41 @@ class Server:
             stop.set()
             th.join()
 
+    @contextlib.contextmanager
+    def prompt_progress(self, cached, total):
+        """a request's return_progress (self.on_progress set): on_progress(cached, processed, total) when the prefill
+        starts, from a watcher thread every 0.5 s while it runs (the engine's mk_prefill_progress; ctypes releases the
+        GIL) and when it is done, as llama-server's prompt_progress events. The watcher is joined before the request
+        thread goes on, so the two never write to the client at once."""
+        cb = getattr(self, "on_progress", None)
+        if cb is None:
+            yield
+            return
+        prog, stop, seen = getattr(self.eng, "prefill_progress", None), threading.Event(), [cached]
+
+        def watch():
+            while not stop.wait(0.5):
+                p = prog() if prog else None
+                if p and p[1] > 0 and cached + p[0] > seen[0]:
+                    seen[0] = cached + p[0]
+                    cb(cached, seen[0], total)
+        cb(cached, cached, total)
+        th = threading.Thread(target=watch, name="mk-progress", daemon=True)
+        th.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            th.join()
+        cb(cached, total, total)
+
+    def timings_now(self):
+        """timings_per_token: the timings of the reply so far (llama-server's fields)"""
+        prompt_n, prompt_ms, t1, n_gen = self.tick
+        ms = max((time.time() - t1) * 1e3, 1e-6)
+        return {"prompt_n": prompt_n, "prompt_ms": prompt_ms, "predicted_n": n_gen, "predicted_ms": ms,
+                "predicted_per_second": n_gen * 1e3 / ms}
+
     def prefill_text(self, n_new, prog, el):
         """prog: the engine's (done, total) of the batched part, or None (a library without it: elapsed time only)"""
         if prog and prog[1] > 0:
@@ -2466,7 +2540,7 @@ class Server:
                     k += 1
                     CON.status(f"#{self.rid} encoding image {k} / {todo} on the CPU ({im.nx}x{im.ny} tok)")
                 imgs.append((p, im.nx, im.ny, im.rows()))
-            with eng.cancel_when(gone), self.prefill_status(len(toks) - start):
+            with eng.cancel_when(gone), self.prefill_status(len(toks) - start), self.prompt_progress(start, len(toks)):
                 if imgs:
                     return eng.prefill(toks[start:], gen, self.ck_positions(toks, start), imgs), start
                 return eng.prefill(toks[start:], gen, self.ck_positions(toks, start)), start
@@ -2630,6 +2704,9 @@ class Server:
         parser = OutputParser(thinking, tools, bool(body.get("stream")), body.get("parallel_tool_calls") is False, inline)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         n_gen, finish, pending, aborted, dropped = 0, "length", [tok], False, 0
+        # t_max_predict_ms (llama-server's): past it, the reply ends at the next token with a newline (finish "length")
+        t_max, timed_out = float(body.get("t_max_predict_ms") or 0) / 1e3, False
+        self.tick = (n_new, (t1 - t0) * 1e3, t1, 0)  # (timings_now)
         phase = {"thinking": 0, "answer": 0, "tool call": 0}  # generated tokens by the part of the reply they are in
         steps = stepped = 0  # engine cycles, the tokens they produced
         live, shown = CON.tty(), time.monotonic()
@@ -2650,7 +2727,9 @@ class Server:
                 finish = "stop"
                 break
             mode0 = parser.mode
-            for kind, delta in parser.feed(stopper.feed(dec.decode(self.eng.piece(t)))):
+            self.tick = self.tick[:3] + (n_gen,)
+            piece = dec.decode(self.eng.piece(t))
+            for kind, delta in parser.feed(stopper.feed(piece)):
                 if emit(kind, delta) is False:
                     aborted = True
                     break
@@ -2660,6 +2739,9 @@ class Server:
                 # drafts) are dropped. The engine's sequence keeps them, as after max_tokens: the next request finds
                 # the divergence (load_prompt) and continues from the reply that was sent.
                 finish, dropped = "stop", len(pending)
+                break
+            if t_max > 0 and "\n" in piece and time.time() - t1 > t_max:  # (the rest of the cycle: as after a stop)
+                finish, dropped, timed_out = "length", len(pending), True
                 break
         if aborted:  # (the engine's state is that of a reply cut by max_tokens: the next request reuses it as usual)
             spent()
@@ -2692,7 +2774,8 @@ class Server:
                 spec += f", {100 * accepted / drafted:.0f}% of {drafted:,} drafts accepted"
             parts.append(spec)
         parts.append(f"finish {finish}" + (f" ({plural(len(calls), 'call')})" if calls else "")
-                     + (f" (stop string; {dropped} tok of the cycle dropped)" if stopper.word is not None else ""))
+                     + (f" (stop string; {dropped} tok of the cycle dropped)" if stopper.word is not None else "")
+                     + (f" (t_max_predict_ms; {dropped} tok of the cycle dropped)" if timed_out else ""))
         if t_req:
             parts.append(f"request {secs(t2 - t_req)}")
         log(f"#{rid} reply: " + " | ".join(parts))
@@ -3243,13 +3326,15 @@ def make_handler(srv):
                 self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
                 self.wfile.flush()
 
-            def chunk(delta, finish=None, usage=None, timings=None):
+            def chunk(delta, finish=None, usage=None, timings=None, progress=None):
                 obj = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": srv.model_id,
                        "choices": [] if delta is None else [{"index": 0, "delta": delta, "finish_reason": finish}]}
                 if usage is not None:
                     obj["usage"] = usage
                 if timings is not None:
                     obj["timings"] = timings
+                if progress is not None:
+                    obj["prompt_progress"] = progress
                 send(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
 
             def head():
@@ -3262,18 +3347,34 @@ def make_handler(srv):
                     self.end_headers()
                     chunk({"role": "assistant", "content": None})
 
+            per_token = bool(body.get("timings_per_token"))  # (llama-server's: the timings so far in every chunk)
+
             def emit(kind, text):
                 head()
                 try:
                     chunk({"tool_calls": [text]} if kind == "tool_call" else
-                          {"reasoning_content": text} if kind == "reasoning" else {"content": text})
+                          {"reasoning_content": text} if kind == "reasoning" else {"content": text},
+                          timings=srv.timings_now() if per_token else None)
                 except (BrokenPipeError, ConnectionResetError):
                     return False
                 return True
 
+            t_p = []
+
+            def progress(cached, processed, total):  # (return_progress: llama-server's prompt_progress chunks)
+                t_p[:] = t_p or [time.monotonic()]
+                try:
+                    head()
+                    chunk({"role": "assistant", "content": None}, progress={
+                        "total": total, "cache": cached, "processed": processed,
+                        "time_ms": int((time.monotonic() - t_p[0]) * 1e3)})
+                except (BrokenPipeError, ConnectionResetError):  # (generate notices the disconnect)
+                    pass
+
             # parameter / render errors are reported as a 400 before the stream starts
             check_params(body)
             srv.render(body)
+            srv.on_progress = progress if body.get("return_progress") else None
             try:
                 finish, calls, usage, timings = srv.generate(body, emit, self.client_gone)
             except Exception as e:
@@ -3286,6 +3387,8 @@ def make_handler(srv):
                 send(b"data: " + json.dumps({"error": err}, ensure_ascii=False).encode() + b"\n\n")
                 send(b"data: [DONE]\n\n", last=True)
                 return
+            finally:
+                srv.on_progress = None
             head()  # (the tool calls went out as they were generated)
             chunk({}, finish=finish, timings=timings)
             if (body.get("stream_options") or {}).get("include_usage"):

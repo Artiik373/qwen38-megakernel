@@ -5,6 +5,7 @@ overflow error, reasoning format and template defaults, llama-server's extra req
 import base64
 import http.client
 import json
+import time
 import unittest
 
 from test_mk_server import (CALL, TEMPLATE, TOOLS, _FakeVisionLib, _HttpCase, _ScriptEngine, _load_mk_server, _request, _sse,
@@ -419,6 +420,98 @@ class ReasoningFormatTests(_HttpCase):
                 self.mk.main()
             self.assertEqual(cm.exception.code, 2, argv)
             self.assertIn(argv[0], err.getvalue())
+
+
+class _ProgressEngine(_ScriptEngine):
+    """a prefill of n_chunks chunks of chunk_s seconds that reports its progress as mk_prefill_progress does"""
+
+    def __init__(self, pieces, n_chunks=6, chunk_s=0.25, **kw):
+        super().__init__(pieces, **kw)
+        self.n_chunks, self.chunk_s, self.prog = n_chunks, chunk_s, (0, 0)
+
+    def prefill_progress(self):
+        return self.prog
+
+    def prefill(self, toks, ck_at=-1, cks=(), images=()):
+        for c in range(self.n_chunks):
+            time.sleep(self.chunk_s)
+            self.prog = (len(toks) * (c + 1) // self.n_chunks, len(toks))
+        return super().prefill(toks, ck_at, cks, images)
+
+
+class RequestFieldTests(_HttpCase):
+    """G7: llama-server's return_progress, timings_per_token and t_max_predict_ms; its other fields accepted when
+    harmless, a 400 when they would change the output"""
+
+    def _stream(self, http_, body):
+        _, events = _sse(http_.raw(_request({"messages": [{"role": "user", "content": "hello"}], "max_tokens": 20,
+                                             "stream": True, **body}), until=b"0\r\n\r\n", timeout=10))
+        self.assertEqual(events[-1], b"[DONE]")
+        return [json.loads(e) for e in events[:-1]]
+
+    def test_return_progress(self) -> None:
+        srv, http_ = self.serve(_ProgressEngine(["a", "b", "c"]))
+        evs = self._stream(http_, {"return_progress": True})
+        prog = [e["prompt_progress"] for e in evs if "prompt_progress" in e]
+        self.assertGreaterEqual(len(prog), 3)  # (start, at least one while it runs, end)
+        total = prog[0]["total"]
+        self.assertEqual((prog[0]["cache"], prog[0]["processed"], prog[-1]["processed"]), (0, 0, total))
+        self.assertEqual([p["processed"] for p in prog], sorted(p["processed"] for p in prog))
+        self.assertTrue(all(set(p) == {"total", "cache", "processed", "time_ms"} for p in prog))
+        self.assertTrue(all(e["choices"][0]["delta"] == {"role": "assistant", "content": None} for e in evs if "prompt_progress" in e))
+        last = max(i for i, e in enumerate(evs) if "prompt_progress" in e)
+        self.assertEqual("".join(c["delta"].get("content") or "" for e in evs[last:] for c in e["choices"]), "abc")
+        # a follow-up that reuses the cached prompt reports it as cache
+        prog = [e["prompt_progress"] for e in self._stream(http_, {"return_progress": True, "messages": [
+            {"role": "user", "content": "hello"}, {"role": "assistant", "content": "abc"}, {"role": "user", "content": "more"}]})
+            if "prompt_progress" in e]
+        self.assertGreater(prog[0]["cache"], 0)
+        self.assertEqual(prog[0]["processed"], prog[0]["cache"])
+        self.assertIsNone(srv.on_progress)
+        self.assertFalse(any("prompt_progress" in e for e in self._stream(http_, {})))  # (only when asked)
+
+    def test_timings_per_token(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["a", "b", "c", "d"]))
+        evs = [e for e in self._stream(http_, {"timings_per_token": True}) if e["choices"] and e["choices"][0]["delta"].get("content")]
+        n = [e["timings"]["predicted_n"] for e in evs]
+        self.assertEqual(n, sorted(n))
+        self.assertEqual(len(n), 4)
+        self.assertTrue(all({"prompt_n", "prompt_ms", "predicted_n", "predicted_ms", "predicted_per_second"} <= set(e["timings"])
+                            for e in evs))
+        self.assertFalse(any("timings" in e for e in self._stream(http_, {}) if e["choices"] and e["choices"][0]["delta"].get("content")))
+
+    def test_t_max_predict_ms(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["line\n"] * 200, delay=0.02))
+        body = {"messages": [{"role": "user", "content": "go"}], "max_tokens": 150}
+        status, data = http_.post({**body, "t_max_predict_ms": 100})
+        o = json.loads(data)
+        self.assertEqual((status, o["choices"][0]["finish_reason"]), (200, "length"))
+        self.assertLess(o["usage"]["completion_tokens"], 60)  # (~2 tokens per 20 ms cycle)
+        self.assertTrue(o["choices"][0]["message"]["content"].endswith("line"))  # (ended on a newline token)
+        o = json.loads(http_.post({**body, "t_max_predict_ms": 0})[1])
+        self.assertEqual(o["usage"]["completion_tokens"], 150)
+        _, http_ = self.serve(_ScriptEngine(["word "] * 100, delay=0.02))  # (no newline: no stop, as llama-server)
+        o = json.loads(http_.post({**body, "max_tokens": 60, "t_max_predict_ms": 50})[1])
+        self.assertEqual(o["usage"]["completion_tokens"], 60)
+
+    def test_other_fields(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        base = {"messages": [{"role": "user", "content": "x"}], "max_tokens": 4}
+        for extra in ({"n_keep": 10, "n_discard": 0, "cache_prompt": False, "id_slot": 0, "response_fields": ["content"],
+                       "return_tokens": True, "n_cache_reuse": 256, "sse_ping_interval": 30, "verbose": True},
+                      {"id_slot": -1, "n_cmpl": 1, "n_indent": 0, "t_max_predict_ms": -1},
+                      {"samplers": "edkypmxt"}, {"samplers": "kpmt"}, {"samplers": ["top_k", "top-p", "minp", "temp"]},
+                      {"samplers": ["penalties", "dry", "top_n_sigma", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]},
+                      {"samplers": "ekpmt", "presence_penalty": 0.5}, {"samplers": ["top_k", "unknown", "top_p", "min_p", "temperature"]}):
+            status, data = http_.post({**base, **extra})
+            self.assertEqual(status, 200, (extra, data))
+        for extra, field in (({"id_slot": 1}, "id_slot"), ({"n_cmpl": 2}, "n_cmpl"), ({"n_indent": 4}, "n_indent"),
+                             ({"t_max_predict_ms": "soon"}, "t_max_predict_ms"), ({"samplers": "tkpm"}, "samplers"),
+                             ({"samplers": "kpm"}, "samplers"), ({"samplers": "kpmt", "frequency_penalty": 1}, "samplers"),
+                             ({"samplers": ["top_k", "adaptive_p", "top_p", "min_p", "temperature"]}, "samplers"),
+                             ({"samplers": "kkpmt"}, "samplers"), ({"samplers": 3}, "samplers")):
+            status, data = http_.post({**base, **extra})
+            self.assertEqual((status, json.loads(data)["error"]["message"].split(":")[0]), (400, field), extra)
 
 
 class SdkStreamTests(_HttpCase):
