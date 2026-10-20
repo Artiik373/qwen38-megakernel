@@ -251,6 +251,25 @@ class AnthropicBlockTests(_HttpCase):
         m = self.mk.anthropic_to_chat(body)["messages"]
         self.assertEqual([x["role"] for x in m], ["system", "user", "system", "system"])
         self.assertEqual((m[2]["content"], m[3]["content"]), ("reminder", "plain"))
+        notes = []
+        m = self.mk.anthropic_to_chat(body, notes, mid_system=False)["messages"]  # (Qwen's templates)
+        self.assertEqual([x["role"] for x in m], ["system", "user", "user", "user"])
+        self.assertEqual({k for k, _ in notes}, {"anthropic-mid-system"})
+        # the server asks its template once
+        strict = ("{% for m in messages %}{% if m.role == 'system' and not loop.first %}"
+                  "{{ raise_exception('System message must be at the beginning.') }}{% endif %}"
+                  "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+                  "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
+        self.assertFalse(self.mk.takes_mid_system(self.mk.make_template(strict)))
+        self.assertTrue(self.mk.takes_mid_system(self.mk.make_template(TEMPLATE)))
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        srv.template = self.mk.make_template(strict)
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+        c.request("POST", "/v1/messages", json.dumps({**body, "max_tokens": 5}))
+        r = c.getresponse()
+        self.assertEqual((r.status, json.loads(r.read())["stop_reason"]), (200, "end_turn"))
+        c.close()
+        self.assertEqual((srv.mid_system, "anthropic-mid-system" in srv.warned), (False, True))
 
     def test_http(self) -> None:
         srv, http_ = self.serve(_ScriptEngine(["Hello", "."]))

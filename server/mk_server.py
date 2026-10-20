@@ -1589,7 +1589,17 @@ def _tool_result(content, notes):
     return "\n".join(p["text"] for p in parts)
 
 
-def anthropic_to_chat(body, notes=None):
+def takes_mid_system(template):
+    """whether a chat template renders a system message after the first message (Qwen's raise "System message must be
+    at the beginning")"""
+    try:
+        return "MIDSYS" in template.render(messages=[{"role": "system", "content": "S"}, {"role": "user", "content": "U"},
+                                                     {"role": "system", "content": "MIDSYS"}], add_generation_prompt=True)
+    except Exception:
+        return False
+
+
+def anthropic_to_chat(body, notes=None, mid_system=True):
     """an Anthropic Messages request as the server's chat request. system: a string or text blocks (joined by blank
     lines); content blocks text / image / thinking (-> reasoning_content) / tool_use (-> tool_calls) / tool_result (->
     tool messages, before the rest of their message: they answer the previous turn's calls) / document (plain-text and
@@ -1597,7 +1607,9 @@ def anthropic_to_chat(body, notes=None):
     any tool type (Anthropic's typed client and server tools too) as a function with its input_schema or none, as
     llama-server does; tool_choice auto / none / any / tool; stop_sequences -> stop; thinking enabled / adaptive ->
     thinking on, disabled or absent -> off (Anthropic's default; chat_template_kwargs win). notes: gets (key, message)
-    for what was skipped or converted (the console's one-time warnings)"""
+    for what was skipped or converted (the console's one-time warnings). mid_system False (the chat template takes a
+    system message only at the start: takes_mid_system): a system message inside the conversation becomes a user
+    message in its place"""
     notes = [] if notes is None else notes
     if not isinstance(body.get("messages"), list):
         raise BadRequest("messages: an array of messages is required")
@@ -1656,6 +1668,12 @@ def anthropic_to_chat(body, notes=None):
             if thinking:
                 nm["reasoning_content"] = thinking
             msgs.append(nm)
+    if not mid_system:  # (Claude Code sends its environment and skills list as a system message after the first one)
+        for i, m in enumerate(msgs):
+            if i and m["role"] == "system":
+                m["role"] = "user"
+                notes.append(("anthropic-mid-system", "Anthropic system messages inside the conversation are rendered as "
+                              "user messages in their place: the chat template takes a system message only at the start"))
     out = {"messages": msgs, "stream": bool(body.get("stream"))}
     out["max_tokens"] = body.get("max_tokens") if body.get("max_tokens") is not None else 4096  # (llama-server's)
     for k in ("temperature", "top_p", "top_k"):
@@ -3035,7 +3053,9 @@ def make_handler(srv):
         def _anthropic_chat(self, body):
             """anthropic_to_chat; what it skipped or converted is a one-time console warning per kind"""
             notes = []
-            chat = anthropic_to_chat(body, notes)
+            if getattr(srv, "mid_system", None) is None:  # (the template's answer, once)
+                srv.mid_system = takes_mid_system(srv.template)
+            chat = anthropic_to_chat(body, notes, srv.mid_system)
             for key, msg in notes:
                 srv.warn_once(key, msg)
             return chat
