@@ -25,6 +25,7 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <cmath>
 #include <cstdint>
@@ -6025,8 +6026,9 @@ struct MKEngine::Impl {
     // restore whose copies may still run only if nothing else is left) whose removal leaves the smallest gap relative
     // to its distance from the end E: (next - prev) / (E - prev). Old checkpoints thin out geometrically, recent ones
     // stay dense. Returns the slot of each new position (-1: dropped); evicted slots become free.
+    // A side request (sw_on) takes free slots that hold none of the kept sequence's checkpoints first; a slot that does
+    // gets its block saved to the host store before it is handed out (sw_ck_take; no room: no checkpoint there).
     std::vector<int> ck_assign(const std::vector<int> & want, int keep, int E) {
-        if (ck_frozen) return std::vector<int>(want.size(), -1); // (side request: the pool belongs to the kept sequence)
         struct C { int pos, slot, wi; }; // slot >= 0: existing checkpoint; wi >= 0: new (index into want)
         std::vector<C> c;
         for (int i = 0; i < (int) ck.size(); i++)
@@ -6052,15 +6054,21 @@ struct MKEngine::Impl {
             if (x.slot >= 0) used[x.slot] = 1;
         for (int i = 0; i < (int) ck.size(); i++)
             if (!used[i]) ck[i].pos = -1;
+        std::vector<int> ord(ck.size()); // free slots in this order
+        std::iota(ord.begin(), ord.end(), 0);
+        if (sw_on) std::stable_partition(ord.begin(), ord.end(), [&](int i) { return !sw_ck_held(i); });
         std::vector<int> out(want.size(), -1);
         int f = 0;
         for (const auto & x : c)
             if (x.wi >= 0) {
-                while (f < (int) ck.size() && used[f]) f++;
+                while (f < (int) ck.size() && used[ord[f]]) f++;
                 if (f == (int) ck.size()) break;
-                used[f] = 1;
-                out[x.wi] = f;
+                used[ord[f]] = 1;
+                out[x.wi] = ord[f];
             }
+        if (sw_on)
+            for (int & s : out)
+                if (s >= 0 && !sw_ck_take(s)) s = -1;
         return out;
     }
     // staging slot for one DeltaNet layer's piece of an in-prefill checkpoint (stream 0 waits for its previous copy)
@@ -9349,18 +9357,27 @@ struct MKEngine::Impl {
         ck_rs_src = -1;
     }
     // Side request (MKEngine::side_begin): the kept sequence's rows main_top = sw_top and its window ring; sw_hi rows and
-    // sw_rhi ring slots are in sw_blob. Every launch / prefill that writes rows < X calls sw_need(X) first.
+    // sw_rhi ring slots are in sw_blob. Every launch / prefill that writes rows < X calls sw_need(X) first (rings_all:
+    // every ring slot, for side_unpark). The checkpoint pool serves the side request: the kept sequence's checkpoints are
+    // hidden (sw_ck: position, ctl, rings flag), and a slot holding one has its block (and rings) copied into sw_blob
+    // before the side request writes it (sw_ck_take); side_end copies them back with the rows.
     static constexpr int SW_BLK = 1024; // rows per copy-out step
-    bool sw_on = false, sw_broken = false, ck_frozen = false;
+    bool sw_on = false, sw_broken = false;
     int sw_top = 0, sw_hi = 0, sw_rhi = 0;
     Blob sw_blob;
     Book sw_book;
-    std::vector<int> sw_ckpos;
+    struct SwCk {
+        int pos;
+        Ctl ctl;
+        bool ring_ok, saved;
+    };
+    std::vector<SwCk> sw_ck;
     double sw_ms_out = 0;
-    void sw_need(int X) {
+    void sw_need(int X, bool rings_all = false) {
         if (!sw_on || sw_broken) return;
         const int up = (X + MAXT + SW_BLK - 1) / SW_BLK * SW_BLK;
-        const int want = std::max(sw_hi, std::min(sw_top, up)), rwant = hb.kvwin > 0 ? std::max(sw_rhi, std::min(hb.kvrc, up)) : 0;
+        const int want = std::max(sw_hi, std::min(sw_top, up)),
+                  rwant = hb.kvwin > 0 ? std::max(sw_rhi, rings_all ? hb.kvrc : std::min(hb.kvrc, up)) : 0;
         if (want <= sw_hi && rwant <= sw_rhi) return;
         const auto t0 = std::chrono::steady_clock::now();
         CK(cudaDeviceSynchronize()); // (nothing still writing those rows; the copies then run before the next kernel)
@@ -9377,6 +9394,27 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk-mem] side request: kept rows < %d, ring slots < %d (+%.1f MB)\n", sw_hi, sw_rhi, (sw_blob.used - u0) / 1e6);
         }
     }
+    // slot i holds a checkpoint of the kept sequence that is not in sw_blob yet
+    bool sw_ck_held(int i) const { return sw_on && !sw_broken && i < (int) sw_ck.size() && sw_ck[i].pos >= 0 && !sw_ck[i].saved; }
+    // before the side request writes slot i: the kept checkpoint there goes to sw_blob (false: no room, nothing changed)
+    bool sw_ck_take(int i) {
+        if (!sw_ck_held(i)) return true;
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t items = sw_blob.items.size(), used = sw_blob.used;
+        const bool ok = blob_put(sw_blob, ck[i].mem, ck_block_bytes(), !ck_dev) &&
+                        (!sw_ck[i].ring_ok || blob_put(sw_blob, ck[i].ring, ring_bytes_ck, true));
+        if (ck_dev) wait_device("side request copies", std::max(wd_limit, 120.0)); // (device block: copies on stream 0)
+        sw_ms_out += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!ok) { // (the partial item goes; its chunks stay with the blob)
+            sw_blob.items.resize(items);
+            sw_blob.used = used;
+            return false;
+        }
+        sw_ck[i].saved = true;
+        return true;
+    }
+    // bytes the store can still hand out (free chunks, then new ones within the budget)
+    size_t hs_room() const { return hs_free.size() * hs_chunk + (hs_budget > hs_alloc ? (hs_budget - hs_alloc) / hs_chunk * hs_chunk : 0); }
     // Parked conversations (MKEngine::park): a snapshot of everything above, plus up to max_cks of the newest checkpoints
     struct Parked {
         Blob blob;
@@ -9405,6 +9443,53 @@ struct MKEngine::Impl {
         return v;
     }
     size_t ck_block_bytes() const { return (CK_NS + CK_NC + CK_NH) * 4; }
+    double hs_park_ms = 0;    // the last side_end_park: its park of the side request's conversation
+    size_t hs_park_bytes = 0;
+    // park(): a snapshot of the sequence (device copies quiesced by the caller) as a new entry: its id, -1 no room
+    int park_entry(int max_cks) {
+        const auto t0 = std::chrono::steady_clock::now();
+        Parked e;
+        struct Rel { // (the entry's chunks go back unless it is kept, also on an exception)
+            Impl & I;
+            Blob & b;
+            bool keep = false;
+            ~Rel() {
+                if (!keep) I.hs_release(b);
+            }
+        } rel{*this, e.blob};
+        e.book = book_get();
+        // device state first (copies on stream 0), then the checkpoint blocks (pinned host: memcpy while those run)
+        bool ok = kv_put(e.blob, 0, seq_top()) && ring_put(e.blob, 0, hb.kvwin > 0 ? hb.kvrc : 0) && live_put(e.blob);
+        for (int si : park_cks(max_cks)) {
+            if (!ok) break;
+            const CkSlot & s = ck[si];
+            ok = blob_put(e.blob, s.mem, ck_block_bytes(), !ck_dev) && (!s.ring_ok || blob_put(e.blob, s.ring, ring_bytes_ck, true));
+            e.cks.push_back({si, s.pos, s.ctl, s.ring_ok});
+        }
+        wait_device("park copies", std::max(wd_limit, 120.0));
+        if (!ok) return -1;
+        const int id = park_next++;
+        hs_bytes = e.blob.used;
+        hs_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        rel.keep = true;
+        parked.emplace(id, std::move(e));
+        return id;
+    }
+    // side_end: the kept sequence comes back (rows, rings, recurrent state, its checkpoints' blocks, the bookkeeping)
+    void side_restore() {
+        blob_get(sw_blob);
+        wait_device("side request copies", std::max(wd_limit, 120.0));
+        book_set(sw_book);
+        for (size_t k = 0; k < ck.size(); k++) {
+            ck[k].pos = sw_ck[k].pos;
+            ck[k].ctl = sw_ck[k].ctl;
+            ck[k].ring_ok = sw_ck[k].ring_ok;
+            ck[k].pending = false;
+        }
+        sw_on = false;
+        hs_bytes = sw_blob.used;
+        hs_release(sw_blob);
+    }
 
     void reset() {
         ck_rs_slot = -1;   // (a restore not issued yet is moot)
@@ -9859,6 +9944,8 @@ MKEngine::StoreInfo MKEngine::store_info() const {
     s.last_ms = p_->hs_ms;
     s.last_bytes = p_->hs_bytes;
     s.side_ms = p_->sw_ms_out;
+    s.side_park_ms = p_->hs_park_ms;
+    s.side_park_bytes = p_->hs_park_bytes;
     return s;
 }
 
@@ -9875,8 +9962,8 @@ bool MKEngine::side_begin() {
     const auto t0 = std::chrono::steady_clock::now();
     I.hs_quiesce();
     I.sw_book = I.book_get();
-    I.sw_ckpos.clear();
-    for (const auto & k : I.ck) I.sw_ckpos.push_back(k.pos);
+    I.sw_ck.clear();
+    for (const auto & k : I.ck) I.sw_ck.push_back({k.pos, k.ctl, k.ring_ok, false});
     I.sw_top = I.seq_top();
     I.sw_hi = I.sw_rhi = 0;
     I.sw_broken = false;
@@ -9889,7 +9976,6 @@ bool MKEngine::side_begin() {
         return false;
     }
     for (auto & k : I.ck) k.pos = -1;
-    I.ck_frozen = true;
     reset();
     I.sw_ms_out = ms_since(t0);
     return true;
@@ -9904,15 +9990,73 @@ int MKEngine::side_end() {
         side_drop();
         return 0;
     }
-    I.blob_get(I.sw_blob);
-    I.wait_device("side request copies", std::max(I.wd_limit, 120.0));
-    I.book_set(I.sw_book);
-    for (size_t k = 0; k < I.ck.size(); k++) I.ck[k].pos = I.sw_ckpos[k];
-    I.ck_frozen = false;
-    I.sw_on = false;
-    I.hs_bytes = I.sw_blob.used;
-    I.hs_release(I.sw_blob);
+    I.side_restore();
     I.hs_ms = ms_since(t0);
+    return 1;
+}
+
+int MKEngine::side_end_park(int max_checkpoints, int * id) {
+    Impl & I = *p_;
+    if (!I.sw_on) throw std::runtime_error("side_end_park: no side request is running");
+    *id = 0;
+    I.hs_park_ms = 0;
+    I.hs_park_bytes = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    I.hs_quiesce();
+    if (I.sw_broken) { // (the kept sequence is lost: the side request's conversation stays, with its checkpoints)
+        I.sw_on = false;
+        I.hs_release(I.sw_blob);
+        return 0;
+    }
+    if (!I.seq.empty()) {
+        const int pid = I.park_entry(max_checkpoints); // (before side_restore writes the kept sequence's rows and blocks back)
+        if (pid > 0) {
+            *id = pid;
+            I.hs_park_bytes = I.hs_bytes;
+            I.hs_park_ms = ms_since(t0);
+        }
+        t0 = std::chrono::steady_clock::now();
+    }
+    I.side_restore();
+    I.hs_ms = ms_since(t0);
+    return 1;
+}
+
+int MKEngine::side_unpark(int id) {
+    Impl & I = *p_;
+    if (!I.sw_on) throw std::runtime_error("side_unpark: no side request is running");
+    if (!I.seq.empty()) throw std::runtime_error("side_unpark: the side request has a sequence already");
+    auto it = I.parked.find(id);
+    if (it == I.parked.end()) return -1;
+    const auto t0 = std::chrono::steady_clock::now();
+    I.hs_quiesce();
+    Impl::Parked & e = it->second;
+    const int top = std::max({e.book.kv_top, (int) e.book.seq.size(), e.book.ctl.dn_c});
+    if (!I.sw_broken) { // room for what the kept sequence moves out first (else nothing changes)
+        const int rows = std::min(I.sw_top, (top + MAXT + Impl::SW_BLK - 1) / Impl::SW_BLK * Impl::SW_BLK) - I.sw_hi;
+        size_t need = I.kv_token_bytes() * (size_t) std::max(0, rows) + 2 * I.hs_chunk; // (+ the last chunks' slack)
+        if (I.hb.kvwin > 0) need += I.ring_bytes() / I.hb.kvrc * (size_t) (I.hb.kvrc - I.sw_rhi);
+        for (const auto & c : e.cks)
+            if (I.sw_ck_held(c.slot)) need += I.ck_block_bytes() + (I.sw_ck[c.slot].ring_ok ? I.ring_bytes_ck : 0);
+        if (need > I.hs_room()) return 0;
+    }
+    I.sw_need(top, true); // (the entry's rows, every ring slot)
+    for (const auto & c : e.cks)
+        if (!I.sw_ck_take(c.slot)) I.sw_ck[c.slot].pos = -1; // (no room after all: the kept sequence loses that checkpoint)
+    I.blob_get(e.blob);
+    I.wait_device("unpark copies", std::max(I.wd_limit, 120.0));
+    I.book_set(e.book);
+    for (const auto & c : e.cks) {
+        Impl::CkSlot & s = I.ck[c.slot];
+        s.pos = c.pos;
+        s.ctl = c.ctl;
+        s.ring_ok = c.ring_ok;
+        s.pending = false;
+    }
+    I.hs_bytes = e.blob.used;
+    I.hs_ms = ms_since(t0);
+    I.hs_release(e.blob);
+    I.parked.erase(it);
     return 1;
 }
 
@@ -9920,7 +10064,6 @@ void MKEngine::side_drop() {
     Impl & I = *p_;
     if (!I.sw_on) return;
     I.sw_on = false;
-    I.ck_frozen = false;
     I.hs_release(I.sw_blob);
     reset();
 }
@@ -9931,34 +10074,8 @@ int MKEngine::park(int max_checkpoints) {
     Impl & I = *p_;
     if (I.sw_on) throw std::runtime_error("park: a side request is running");
     if (I.seq.empty()) return 0;
-    const auto t0 = std::chrono::steady_clock::now();
     I.hs_quiesce();
-    Impl::Parked e;
-    struct Rel { // (the entry's chunks go back unless it is kept, also on an exception)
-        Impl & I;
-        Impl::Blob & b;
-        bool keep = false;
-        ~Rel() {
-            if (!keep) I.hs_release(b);
-        }
-    } rel{I, e.blob};
-    e.book = I.book_get();
-    // device state first (copies on stream 0), then the checkpoint blocks (pinned host: memcpy while those run)
-    bool ok = I.kv_put(e.blob, 0, I.seq_top()) && I.ring_put(e.blob, 0, I.hb.kvwin > 0 ? I.hb.kvrc : 0) && I.live_put(e.blob);
-    for (int si : I.park_cks(max_checkpoints)) {
-        if (!ok) break;
-        const Impl::CkSlot & s = I.ck[si];
-        ok = I.blob_put(e.blob, s.mem, I.ck_block_bytes(), !I.ck_dev) && (!s.ring_ok || I.blob_put(e.blob, s.ring, I.ring_bytes_ck, true));
-        e.cks.push_back({si, s.pos, s.ctl, s.ring_ok});
-    }
-    I.wait_device("park copies", std::max(I.wd_limit, 120.0));
-    if (!ok) return -1;
-    const int id = I.park_next++;
-    I.hs_bytes = e.blob.used;
-    I.hs_ms = ms_since(t0);
-    rel.keep = true;
-    I.parked.emplace(id, std::move(e));
-    return id;
+    return I.park_entry(max_checkpoints);
 }
 
 bool MKEngine::unpark(int id) {

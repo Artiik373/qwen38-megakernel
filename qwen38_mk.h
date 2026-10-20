@@ -134,6 +134,8 @@ class MKEngine {
         double last_ms;                 // the last side_end / park / unpark: wall time, bytes copied
         size_t last_bytes;
         double side_ms; // the running (or last) side request: time spent copying the kept sequence's rows out
+        double side_park_ms;    // the last side_end_park: parking the side request's conversation (0: not parked)
+        size_t side_park_bytes;
     };
     StoreInfo store_info() const;
     // bytes per token of the KV cache (every slot, K and V), of the MK_KV_WIN rings, of the recurrent state (DeltaNet /
@@ -142,12 +144,22 @@ class MKEngine {
     // Side request (a short unrelated prompt without losing the cached sequence): side_begin() keeps the current
     // sequence aside (its recurrent state is copied to the host store now; its KV rows and window-ring rows only when a
     // launch of the side request is about to overwrite them, 1024 rows at a time) and leaves the engine as reset() does,
-    // with its checkpoints hidden and no new ones saved. side_end() copies everything back: the kept sequence is then
-    // bit for bit as before side_begin (returns 1), or, if the store ran out of room during the side request, the engine
-    // is reset (0: the kept sequence is lost, the next prompt is prefilled in full). side_drop(): discard it (reset).
+    // with its checkpoints hidden. The side request saves checkpoints of its own in the pool: a slot holding one of the
+    // kept sequence's is copied to the store first. side_end() copies everything back: the kept sequence is then bit for
+    // bit as before side_begin (returns 1), or, if the store ran out of room during the side request, the engine is reset
+    // (0: the kept sequence is lost, the next prompt is prefilled in full). side_drop(): discard it (reset).
     // false from side_begin: no room in the store (nothing changed).
+    // side_end_park(max_checkpoints, id): as side_end, but the side request's own conversation is parked first (as
+    // park(max_checkpoints): *id its entry, 0 when it is empty or the store has no room for it); if the kept sequence
+    // was lost (returns 0), the side request's conversation stays as the engine's sequence instead.
+    // side_unpark(id): right after side_begin, the side request continues parked conversation id: the engine becomes it
+    // bit for bit (as unpark; the entry is freed) while the kept sequence stays aside (the rows, window rings and
+    // checkpoint blocks it overwrites are copied to the store first). 1 done, 0 no room in the store (nothing changed),
+    // -1 no such entry.
     bool side_begin();
     int side_end();
+    int side_end_park(int max_checkpoints, int * id);
+    int side_unpark(int id);
     void side_drop();
     bool side_active() const;
     // Parked conversations: park() copies the whole sequence state (KV rows, window rings, recurrent state, the sequence,

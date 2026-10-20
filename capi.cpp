@@ -489,15 +489,17 @@ int mk_store_reserve(void * hp, long long bytes) {
         return 0;
     });
 }
-// out[0..7]: budget, allocated, used bytes, parked entries, the last side_end / park / unpark's bytes and microseconds,
-// the side request's copy-out microseconds, bytes per KV token; returns the count written (up to cap)
+// out[0..9]: budget, allocated, used bytes, parked entries, the last side_end / park / unpark's bytes and microseconds,
+// the side request's copy-out microseconds, bytes per KV token, the last side_end_park's park of the side request's
+// conversation: bytes and microseconds; returns the count written (up to cap)
 int mk_store_info(void * hp, long long * out, int cap) {
     const MKEngine * e = static_cast<Handle *>(hp)->eng;
     const MKEngine::StoreInfo s = e->store_info();
     size_t pt, rings, state, ck;
     e->kv_sizes(&pt, &rings, &state, &ck);
     const long long v[] = {(long long) s.budget, (long long) s.allocated, (long long) s.used, s.parked, (long long) s.last_bytes,
-                           (long long) (s.last_ms * 1000.0), (long long) (s.side_ms * 1000.0), (long long) pt};
+                           (long long) (s.last_ms * 1000.0), (long long) (s.side_ms * 1000.0), (long long) pt,
+                           (long long) s.side_park_bytes, (long long) (s.side_park_ms * 1000.0)};
     const int n = std::min(cap, (int) (sizeof v / sizeof v[0]));
     for (int i = 0; i < n; i++) out[i] = v[i];
     return n;
@@ -518,6 +520,22 @@ int mk_side_begin(void * hp) {
 // 1 the kept sequence is back, 0 it was dropped (the store ran full; the engine is reset), -1 error (dropped too)
 int mk_side_end(void * hp) {
     return guarded(hp, [](MKEngine * e) { return e->side_end(); });
+}
+// mk_side_end, with the side request's own conversation parked first (as mk_park(max_checkpoints)): *id its entry (0:
+// not parked: empty, or no room). 1 the kept sequence is back; 0 it was lost (the store ran full during the side
+// request): the side request's conversation stays as the engine's sequence; -1 error (a CUDA error drops both)
+int mk_side_end_park(void * hp, int max_checkpoints, int * id) {
+    *id = 0;
+    return guarded(hp, [&](MKEngine * e) { return e->side_end_park(max_checkpoints, id); });
+}
+// right after mk_side_begin: the side request continues parked conversation id (the engine becomes it, the entry is
+// freed; the kept sequence stays aside): 0, 1 (no room in the store: nothing changed), -1 (no such entry / error)
+int mk_side_unpark(void * hp, int id) {
+    return guarded(hp, [&](MKEngine * e) {
+        const int r = e->side_unpark(id);
+        if (r < 0) g_err = "no parked conversation " + std::to_string(id);
+        return r < 0 ? -1 : r == 1 ? 0 : 1;
+    });
 }
 int mk_side_drop(void * hp) {
     return guarded(hp, [](MKEngine * e) {
