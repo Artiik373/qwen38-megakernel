@@ -279,7 +279,8 @@ python3 server/mk_server.py -m ~/models/Qwen3.8-27B-UD-Q4_K_XL.gguf -c 120000 --
     --mmproj ~/models/mmproj-BF16.gguf
 ```
 
-Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `-c` context [32768], `-d` drafts [4],
+Options (defaults in brackets): `--host` [127.0.0.1], `--port` [18080], `--allow-host NAME` / `--cors-origin ORIGIN`
+(web pages, below), `-c` context [32768], `-d` drafts [4],
 `--kv auto|f16|q8` [auto: q8_0 only when fp16 does not fit], `--draft-vocab` [draft_vocab_32k.bin], `--mtp FILE` (the
 MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decoding; env `MK_NO_MTP=1`), `--exact-reuse`
 [off; the launchers turn it on], `--chat-template-file PATH` / `--chat-template TEMPLATE` [the GGUF's; below],
@@ -422,6 +423,22 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   sends (at most 1 GiB and 30 s, 5 s without data, as nginx's lingering close) before closing. Closing with unread data
   makes the kernel send a reset, and a client that sends its whole body before reading (Python's http.client, curl
   without `Expect: 100-continue`) then sees a connection error instead of the answer.
+- **Web pages** (Host and Origin checks, CORS): a request whose `Host` is not `localhost`, an IP address, the `--host`
+  name or an `--allow-host` name (any port; the option is repeatable or comma-separated, env `MK_ALLOW_HOSTS`; `*`: any
+  name, e.g. behind a reverse proxy, which turns this check off) gets a 403 naming the option: a web page that points
+  its own domain at this machine (DNS rebinding) would otherwise be same-origin with the server and could read
+  `/props`, `/metrics` and the replies. A request with an `Origin` header (browsers send one with every POST and every
+  cross-origin request) is answered only when that origin is the server's own (Origin's host and port == `Host`'s) or
+  listed with `--cors-origin` (repeatable or comma-separated, env `MK_CORS_ORIGINS`; default none; `*` is refused:
+  llama-server reflects any origin, this server does not). Pages of other sites, of another port on this machine (any
+  other local web app) and `file:` pages (`Origin: null`, unless `null` is listed) get a 403, also for the simple
+  requests (a `text/plain` POST) a page may send without a preflight, so a page the user happens to open cannot start
+  a long prefill, evict the cached conversation or read anything. A listed origin gets `Access-Control-Allow-Origin` +
+  `Vary: Origin` on every response (errors, streams and the 503 while loading too), and its preflights (`OPTIONS`) are
+  answered 200 with `Access-Control-Allow-Methods: GET, POST, OPTIONS`, the headers it asked for and
+  `Access-Control-Max-Age: 86400` (Chrome's `Access-Control-Request-Private-Network` too). Clients that are not web
+  pages (curl, the OpenAI / Anthropic SDKs, OpenCode, Claude Code) send no `Origin` and are not affected; the
+  `Content-Type` is not checked (`curl -d` without `-H` sends a form type), as the Origin check already stops pages.
 - Disconnects: before the prefill and before each decode cycle the server checks whether the client closed its
   connection, and stops. During the prefill a watcher thread checks every 50 ms and asks the engine to stop at its next
   prefill chunk (`mk_cancel` / `MKEngine::cancel`: a host flag read between chunks of 2048 tokens, no device sync); the

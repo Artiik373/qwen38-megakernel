@@ -266,6 +266,10 @@ What the API supports:
   stream ends it with an error event and `data: [DONE]`.
 - **Requests:** one at a time, in arrival order; the other conversations wait in host memory between their requests
   (above).
+- **Web pages:** a request for another host name than `localhost`, an IP address or `--host` (DNS rebinding;
+  `--allow-host` adds names) or from a web page of another origin gets a 403, so a page you open cannot drive or read
+  the server; `--cors-origin <origin>` lets a browser UI in (CORS headers, preflights). Clients that are not web pages
+  send no `Origin` and are not affected.
 
 [docs/ENGINE.md](docs/ENGINE.md#server) has the details, the server's options and the engine's environment variables.
 

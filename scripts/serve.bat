@@ -10,6 +10,8 @@ REM                       pip install imageio-ffmpeg): frames sampled per second
 REM   MK_VIDEO_MAX_TOKENS tokens per video frame pair (default: the image limit); fewer fit longer clips
 REM   MK_FFMPEG           the ffmpeg executable (or its directory) for video input
 REM   MK_HOST             listen address (default 127.0.0.1; 0.0.0.0 for other machines on the LAN)
+REM   MK_ALLOW_HOSTS      host names clients use besides localhost, IP addresses and MK_HOST (comma-separated; * = any)
+REM   MK_CORS_ORIGINS     web origins whose pages may call the server (comma-separated; see scripts/serve.sh)
 REM   MK_DRAFT            MTP drafts per cycle (default 7; a build.ps1 -MkFlags "" build takes at most 4)
 REM   MK_EXACT_REUSE=0    turn exact reuse off (see scripts/serve.sh)
 REM   MK_SIDE_MAX         side requests up to this many prompt tokens (default 8192; 0 = off; see scripts/serve.sh)

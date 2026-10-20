@@ -12,6 +12,10 @@
 #   MK_VIDEO_MAX_TOKENS tokens per video frame pair (default: the image limit); fewer fit longer clips
 #   MK_FFMPEG           the ffmpeg executable (or its directory) for video input
 #   MK_HOST             listen address (default 127.0.0.1; 0.0.0.0 for other machines on the LAN)
+#   MK_ALLOW_HOSTS      host names clients use besides localhost, IP addresses and MK_HOST (comma-separated; * = any):
+#                       requests for other names get a 403 (DNS rebinding)
+#   MK_CORS_ORIGINS     web origins whose pages may call the server (comma-separated, e.g. http://localhost:5173):
+#                       requests from pages of other origins get a 403
 #   MK_DRAFT            MTP drafts per cycle (default 7; a `make MKFLAGS=` build takes at most 4)
 #   MK_EXACT_REUSE=0    turn exact reuse off: a reused prompt then appends the previous reply instead of re-prefilling it
 #                       (faster follow-up turns, but not bit-identical to the same request sent fresh)

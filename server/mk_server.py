@@ -34,6 +34,7 @@ import collections
 import contextlib
 import ctypes
 import hashlib
+import ipaddress
 import itertools
 import json
 import os
@@ -2272,14 +2273,180 @@ UNSUPPORTED = {"/completion", "/completions", "/v1/completions", "/v1/responses"
                "/v1/rerank", "/v1/reranking", "/v1/audio/transcriptions", "/audio/transcriptions", "/lora-adapters",
                "/v1/chat/completions/control", "/models", "/v1/streams/lookup", "/tools", "/cors-proxy"}
 
+# ---- the request gate: Host (DNS rebinding) and Origin (other sites' web pages) checks, CORS for listed origins ----
+HOST_NAME = r"(?:\[[0-9A-Za-z:._~%-]+\]|[0-9A-Za-z._~%!$&'()*+,;=-]+)"  # (a reg-name or a bracketed IPv6 address)
+AUTHORITY_RE = re.compile(rf"({HOST_NAME})(?::([0-9]{{0,5}}))?")
+ORIGIN_RE = re.compile(rf"([A-Za-z][A-Za-z0-9+.-]*)://({HOST_NAME})(?::([0-9]{{0,5}}))?/?")
+DEFAULT_PORTS = {"http": 80, "https": 443}
+CORS_METHODS = "GET, POST, OPTIONS"
+CORS_MAX_AGE = 86400  # seconds a browser may keep a preflight's answer (every request is still checked)
+HEADER_LIST_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:[ \t]*,[ \t]*[!#$%&'*+.^_`|~0-9A-Za-z-]+)*")
+
+
+def is_ip(host):
+    """host (as in a URL: IPv6 in brackets) is an IP address literal"""
+    try:
+        ipaddress.ip_address(host[1:-1] if host.startswith("[") and host.endswith("]") else host)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_origin(origin):
+    """(scheme, host, port) of an Origin header / --cors-origin value, lower case, port None for a scheme without a
+    default one; None if it is not an origin ("null" -> ("null", "", None): only a listed "null" matches it)"""
+    o = origin.strip()
+    if o == "null":
+        return "null", "", None
+    m = ORIGIN_RE.fullmatch(o)
+    if not m or (m.group(3) and int(m.group(3)) > 65535):
+        return None
+    scheme, host = m.group(1).lower(), m.group(2).lower()
+    return scheme, host, int(m.group(3)) if m.group(3) else DEFAULT_PORTS.get(scheme)
+
+
+def origin_key(origin):
+    """the origin as browsers serialize it (scheme://host[:port], without the scheme's default port), or None"""
+    p = parse_origin(origin)
+    if p is None or p[0] == "null":
+        return p and "null"
+    scheme, host, port = p
+    return f"{scheme}://{host}" + (f":{port}" if port is not None and port != DEFAULT_PORTS.get(scheme) else "")
+
+
+class Gate:
+    """Which requests the server answers (main sets HTTPServer.gate; without one, every request).
+    Host: localhost, an IP address, the --host name or an --allow-host one (any port), or none (HTTP/1.0). A web page
+    that points its own site's name at this machine (DNS rebinding) is refused: it would be same-origin with the server
+    and could read the replies, /props and /metrics.
+    Origin (browsers send it with every POST and every cross-site request): the server's own (Origin's host and port ==
+    Host's, 80 without a port) or an --cors-origin one; pages of any other origin (other sites, another program's port
+    on this machine, file: pages) get a 403, including the simple requests (a text/plain POST) a page may send without a
+    preflight. Requests without an Origin are not from a web page (curl, the SDKs, agents) and are answered. An
+    admitted origin gets CORS headers (GatedHandler)."""
+
+    def __init__(self, host="127.0.0.1", allow_hosts=(), cors_origins=()):
+        names = [h.strip().lower().rstrip(".") for h in allow_hosts if h.strip()]
+        self.any_host = "*" in names
+        self.hosts = {"localhost"} | {h for h in names if h != "*"}
+        host = (host or "").strip().lower().rstrip(".")
+        if host and not is_ip(host):
+            self.hosts.add(host)
+        self.origins = set()
+        for o in cors_origins:
+            if not o.strip():
+                continue
+            if o.strip() == "*":
+                raise ValueError("--cors-origin / MK_CORS_ORIGINS: list the origins to allow (any origin is not supported)")
+            key = origin_key(o)
+            if key is None:
+                raise ValueError(f"--cors-origin / MK_CORS_ORIGINS: {o.strip()[:100]!r} is not an origin "
+                                 f"(scheme://host[:port], e.g. http://localhost:5173)")
+            self.origins.add(key)
+
+    def check(self, headers):
+        """(None, the origin to send CORS headers to, or None) for a request to answer; (the 403's message, None) for
+        one to refuse"""
+        hosts, auth = headers.get_all("Host") or [], None
+        if len(hosts) > 1:
+            return "more than one Host header", None
+        if hosts:
+            m = AUTHORITY_RE.fullmatch(hosts[0].strip())
+            if not m:
+                return f"bad Host header {hosts[0].strip()[:100]!r}", None
+            name = m.group(1).lower().rstrip(".")
+            auth = name, int(m.group(2)) if m.group(2) else None
+            if not (self.any_host or is_ip(name) or name in self.hosts):
+                return (f"Host {name[:100]} is not allowed (web pages must not reach the server under other names): "
+                        f"start the server with --allow-host {name[:100]} (env MK_ALLOW_HOSTS) to accept it"), None
+        origins = headers.get_all("Origin") or []
+        if not origins:
+            return None, None
+        if len(origins) > 1:
+            return "more than one Origin header", None
+        origin, p = origins[0].strip(), parse_origin(origins[0])
+        if p is not None and (origin_key(origin) in self.origins or self.same(p, auth)):
+            return None, origin
+        shown = origin_key(origin) if p is not None else repr(origin[:100])
+        return (f"Origin {shown} is not allowed (requests from web pages of other origins are refused): start the server "
+                f"with --cors-origin {shown} (env MK_CORS_ORIGINS) to accept it"), None
+
+    @staticmethod
+    def same(p, auth):
+        """the origin p is the server's own: Host's name and port (80 when Host has none). The scheme does not matter:
+        nothing else can serve pages on the server's port."""
+        return auth is not None and p[2] is not None and p[1] == auth[0] and p[2] == (auth[1] or 80)
+
+
+class GatedHandler(BaseHTTPRequestHandler):
+    """the handlers' base: the server's Gate decides on each request before it is handled (and before a 100 Continue);
+    a refused one gets a 403 and the connection closes (its body is not read). An admitted browser origin gets
+    Access-Control-Allow-Origin + Vary: Origin on every response (errors and event streams too), and its CORS preflights
+    (OPTIONS) are answered."""
+    protocol_version = "HTTP/1.1"
+    cors = None  # the request's admitted Origin: CORS headers on the response
+    admitted = None  # the gate's verdict on the request (None: not asked yet)
+
+    def log_message(self, *a):
+        pass
+
+    def handle_one_request(self):
+        self.cors = self.admitted = None
+        super().handle_one_request()
+
+    def parse_request(self):
+        return super().parse_request() and self.admit()
+
+    def admit(self):
+        """True if the gate lets the request through (asked once per request); else it is answered with a 403"""
+        if self.admitted is None:
+            gate = getattr(self.server, "gate", None)
+            why, self.cors = gate.check(self.headers) if gate else (None, None)
+            self.admitted = why is None
+            if why:
+                path = self.path.split("?")[0]
+                log(f"{self.command} {path[:200]} -> 403: {why}")
+                err = ({"type": "error", "error": {"type": "permission_error", "message": why}} if path.startswith("/v1/messages")
+                       else {"error": {"code": 403, "message": why, "type": "permission_error"}})
+                data = json.dumps(err).encode()
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                self.end_headers()
+                self.wfile.write(data)
+        return self.admitted
+
+    def end_headers(self):
+        if self.cors:
+            self.send_header("Access-Control-Allow-Origin", self.cors)
+            self.send_header("Vary", "Origin")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        """a CORS preflight of an admitted origin (the others got the gate's 403): the methods, the headers it asked for
+        and how long it may keep the answer; any other OPTIONS: the methods"""
+        headers = [("Allow", CORS_METHODS)]
+        if self.cors and self.headers.get("Access-Control-Request-Method"):
+            headers += [("Access-Control-Allow-Methods", CORS_METHODS), ("Access-Control-Max-Age", str(CORS_MAX_AGE))]
+            want = (self.headers.get("Access-Control-Request-Headers") or "").strip()
+            if want and HEADER_LIST_RE.fullmatch(want):
+                headers.append(("Access-Control-Allow-Headers", want))
+            if (self.headers.get("Access-Control-Request-Private-Network") or "").strip().lower() == "true":
+                headers.append(("Access-Control-Allow-Private-Network", "true"))  # (Chrome: a public page to this machine)
+        if self.headers.get("Transfer-Encoding") or (self.headers.get("Content-Length") or "0").strip() != "0":
+            headers.append(("Connection", "close"))  # (a body is not read: it must not be taken for the next request)
+            self.close_connection = True
+        self.send_response(200)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
 
 def make_handler(srv):
-    class H(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, *a):
-            pass
-
+    class H(GatedHandler):
         def client_gone(self):
             """True once the client has closed its connection (end of file or reset). The request was read in full, so
             anything readable is the next request of a keep-alive client (still connected) or the close."""
@@ -2327,7 +2494,7 @@ def make_handler(srv):
 
         def handle_expect_100(self):
             # (curl sends large bodies after a 100 Continue: a refused one is answered before it is sent)
-            if self.command == "POST" and self._refuse_body():
+            if not self.admit() or self.command == "POST" and self._refuse_body():
                 return False
             return super().handle_expect_100()
 
@@ -2657,13 +2824,9 @@ def make_handler(srv):
 
 def make_loading_handler():
     """the handler while the model loads (the port opens first, as llama-server's does): every request gets llama-server's
-    503 "Loading model" and the connection closes (a request body is not read: the lingering close drains it)"""
-    class Loading(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, *a):
-            pass
-
+    503 "Loading model" and the connection closes (a request body is not read: the lingering close drains it); the gate
+    and CORS preflights as in the real handler"""
+    class Loading(GatedHandler):
         def _loading(self):
             data = json.dumps({"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}}).encode()
             self.send_response(503)
@@ -2675,7 +2838,8 @@ def make_loading_handler():
             self.wfile.write(data)
 
         def handle_expect_100(self):
-            self._loading()
+            if self.admit():
+                self._loading()
             return False
 
         do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = _loading
@@ -2711,6 +2875,7 @@ class HTTPServer(ThreadingHTTPServer):
     whole answer and the end of the stream), then drains what the client still sends (linger) before closing, so the
     client is not reset in the middle of its upload and gets the answer (the reason) instead of a connection error."""
     daemon_threads = True
+    gate = None  # the request Gate (main sets it; None: every request is answered)
 
     def handle_error(self, request, client_address):
         """a client that resets its connection (an idle keep-alive one at the end of its session) is not an error; other
@@ -2745,6 +2910,15 @@ def main():
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18080)
+    ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                    help="a host name clients may reach the server under, besides localhost, IP addresses and --host's "
+                         "(repeatable or comma-separated; '*': any name, e.g. behind a reverse proxy, which turns the "
+                         "DNS-rebinding check off; env MK_ALLOW_HOSTS); requests for other names get a 403")
+    ap.add_argument("--cors-origin", "--cors-origins", dest="cors_origin", action="append", default=[], metavar="ORIGIN",
+                    help="a web origin (scheme://host[:port]) whose pages may call the server: its requests get CORS "
+                         "headers (repeatable or comma-separated; env MK_CORS_ORIGINS); requests from pages of other origins "
+                         "get a 403 (default: none, only the server's own origin; clients that are not web pages send no "
+                         "Origin and are not affected)")
     ap.add_argument("-c", "--ctx", type=int, default=32768)
     ap.add_argument("-d", "--draft", type=int, default=4)
     ap.add_argument("--draft-vocab", default=os.path.join(os.path.dirname(HERE), "draft_vocab_32k.bin"))
@@ -2820,6 +2994,13 @@ def main():
             ap.error(str(e))
         kind, value = args.chat_template
         log(f"chat template: {value if kind == 'file' else 'from --chat-template'} instead of the GGUF's")
+
+    def listed(env, values):  # (the environment's comma-separated values, then the options')
+        return [v.strip() for s in [os.environ.get(env, "")] + values for v in s.split(",") if v.strip()]
+    try:
+        gate = Gate(args.host, listed("MK_ALLOW_HOSTS", args.allow_host), listed("MK_CORS_ORIGINS", args.cors_origin))
+    except ValueError as e:
+        ap.error(str(e))
     MAX_BODY_MB = env_int("MK_MAX_BODY_MB", MAX_BODY_MB)
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     MAX_VIDEO_FRAMES = env_int("MK_MAX_VIDEO_FRAMES", MAX_VIDEO_FRAMES)
@@ -2828,7 +3009,12 @@ def main():
     # the port opens first (a busy port fails before the model loads); until the load is done every request gets a 503
     # (llama-server's "Loading model"), then the handler is swapped for the real one (new connections take it)
     httpd = HTTPServer((args.host, args.port), make_loading_handler())
+    httpd.gate = gate
     log(f"listening on http://{args.host}:{args.port} (503 until the model is loaded)")
+    if gate.any_host or gate.hosts != {"localhost"}:
+        log("host names: any (--allow-host *)" if gate.any_host else f"host names: {', '.join(sorted(gate.hosts))} and IP addresses")
+    if gate.origins:
+        log(f"CORS: pages of {', '.join(sorted(gate.origins))} may call the server")
     box = {}
 
     def load():
