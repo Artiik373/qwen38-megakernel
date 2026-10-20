@@ -44,12 +44,15 @@ def mix(n):  # the fix's salt: launch start position -> 64-bit word (any injecti
     return ((n + 1) * 0xD6E8FEB86659FD93) & M64
 
 
-def draw(p, u, excl=-1):  # cand_draw: inverse CDF over p (optionally without excl, renormalised)
+def draw(p, u, excl=-1, positive=False):
+    """cand_draw: inverse CDF over p (optionally without excl, renormalised). positive: the residual walks of
+    sample_targets / sample_targets_blk, which skip entries <= 0, so when rounding leaves x >= 0 after the whole walk
+    the draw is the last entry with a positive residual (cand_draw's: the last entry not excluded)"""
     s = sum(x for j, x in enumerate(p) if j != excl)
     x = u * s
     last = 0
     for j, pj in enumerate(p):
-        if j == excl:
+        if j == excl or (positive and not pj > 0):
             continue
         last = j
         x -= pj
@@ -156,7 +159,7 @@ def run_one(seed, cfg, P, Q, L, x0, nd_max=7):
             if res is None or not sum(res) > 0:
                 tg[tau] = draw(p, u)
             else:
-                tg[tau] = draw(res, u)
+                tg[tau] = draw(res, u, positive=True)
             last = tau
             i = tau + 1
             while i < T and tg[i - 1] == tok[i]:
@@ -174,7 +177,7 @@ def run_one(seed, cfg, P, Q, L, x0, nd_max=7):
                         continue
                     res = [max(0.0, p[j] - q[j]) for j in range(len(p))]
                     u = urand(seed, 2 * (n + i) + 1)
-                    tg[i] = draw(p, u, d) if not sum(res) > 0 else draw(res, u)
+                    tg[i] = draw(p, u, d) if not sum(res) > 0 else draw(res, u, positive=True)
                     last = i
                     break
                 tg[i] = draw(p, urand(seed, 2 * (n + i) + 1))
