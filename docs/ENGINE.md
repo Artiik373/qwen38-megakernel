@@ -382,8 +382,9 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   would be a side request but for its earlier turns runs as a side request again, resumed from the parked conversation
   (`MKEngine::side_unpark`: the cached sequence stays aside, only the rows the short conversation needs move), so a chat
   with a capped reply keeps its prefix cached beside a long conversation, and its replies are those of the same
-  conversation on a fresh server. These entries are evicted before any other parked conversation, and parking one never
-  evicts anything but another of them. Cost under WSL2 (q8 KV, a 1.5k-token side conversation, chunks already
+  conversation on a fresh server. At most 4 of them are kept (the oldest goes first: most are clients' title requests,
+  never continued); they are evicted before any other parked conversation, and parking one never evicts anything but
+  another of them. Cost under WSL2 (q8 KV, a 1.5k-token side conversation, chunks already
   allocated): ~25-30 ms to park it (0.4 GB: its rows, recurrent state and checkpoint) and ~8 ms to copy the slot its
   checkpoint takes, ~25-35 ms to continue it (`side_unpark`); preset D's window rings about double that. Re-reading it
   instead would take ~0.9 s at 1.5k tokens and ~5 s at 8k.

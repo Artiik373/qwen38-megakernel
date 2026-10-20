@@ -216,8 +216,9 @@ conversations only between replies (a reply in progress is never paused):
   the rows it overwrites go to host memory and back (12-20 ms), and the cached conversation is not touched. With
   parking on, this applies to requests that cap their reply at `max_tokens` <= 1024 (other new conversations are parked
   like any other), and the side request's own conversation is parked after its reply too, so a follow-up turn with a
-  capped reply continues it beside the cached conversation again instead of reading it again. These short
-  conversations are the first to go when host memory is full: they never push out a parked conversation.
+  capped reply continues it beside the cached conversation again instead of reading it again. Up to 4 of these short
+  conversations are kept (the oldest goes first), and they are the first to go when host memory is full: they never push
+  out a parked conversation.
 - **In practice:** with OpenCode 2.0.32 on native Windows (230k context, preset D), two coding sessions running at the
   same time finished in 110 s with ~72k prompt tokens prefilled, against 242 s and ~232k with the store off
   (2026-10-19).
