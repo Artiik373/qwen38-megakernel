@@ -2,11 +2,13 @@
 tool calls whose values hold tool-call markup, tool-call arguments streamed as they are generated (OpenAI and Anthropic
 shapes, the official SDKs' stream accumulators when installed), Anthropic typed tools and unknown blocks, the context
 overflow error, reasoning format and template defaults, llama-server's extra request fields, chunked request bodies."""
+import base64
 import http.client
 import json
 import unittest
 
-from test_mk_server import CALL, TEMPLATE, TOOLS, _HttpCase, _ScriptEngine, _load_mk_server, _request, _sse, _sse_events
+from test_mk_server import (CALL, TEMPLATE, TOOLS, _FakeVisionLib, _HttpCase, _ScriptEngine, _load_mk_server, _request, _sse,
+                            _sse_events)
 
 WRITE = [{"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {
     "path": {"type": "string"}, "content": {"type": "string"}, "mode": {"type": "integer"}, "opts": {"type": "object"}}}}}]
@@ -286,6 +288,59 @@ class AnthropicBlockTests(_HttpCase):
             self.assertEqual(r.status, 200, o)
         self.assertEqual(o, {"input_tokens": len(srv.render(self.mk.anthropic_to_chat(body))[0])})
         self.assertTrue({"anthropic-tool-web_fetch_20250910", "anthropic-block-mcp_tool_use"} <= srv.warned)
+
+
+def _post(port, path, body, headers=None):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    c.request("POST", path, json.dumps(body) if not isinstance(body, bytes) else body, headers or {})
+    r = c.getresponse()
+    data = r.read()
+    c.close()
+    return r.status, data
+
+
+class ContextOverflowTests(_HttpCase):
+    """G5: a prompt longer than the context: llama-server's exceed_context_size_error with n_prompt_tokens / n_ctx, and
+    Anthropic's 'prompt is too long' on /v1/messages; streams too (the error comes before the stream starts)"""
+
+    def test_openai_and_anthropic_shapes(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["ok"]), ctx=100)
+        msgs = [{"role": "user", "content": "x" * 100}]
+        n = len(srv.render({"messages": msgs})[0])  # (a character tokenizer)
+        for stream in (False, True):
+            status, data = _post(http_.port, "/v1/chat/completions", {"messages": msgs, "stream": stream})
+            self.assertEqual((status, json.loads(data)), (400, {"error": {
+                "code": 400, "type": "exceed_context_size_error", "n_prompt_tokens": n, "n_ctx": 100,
+                "message": f"request ({n} tokens) exceeds the available context size (100 tokens), try increasing it"}}))
+            status, data = _post(http_.port, "/v1/messages", {"max_tokens": 5, "messages": msgs, "stream": stream})
+            n_a = len(srv.render(self.mk.anthropic_to_chat({"messages": msgs}))[0])
+            self.assertEqual((status, json.loads(data)), (400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": f"prompt is too long: {n_a} tokens > 83 maximum",
+                "n_prompt_tokens": n_a, "n_ctx": 100}}))
+        # (the largest prompt that runs: 83 tokens, 16 left for the reply)
+        over = len(srv.render({"messages": [{"role": "user", "content": ""}]})[0])
+        fit = [{"role": "user", "content": "x" * (83 - over)}]
+        status, data = _post(http_.port, "/v1/chat/completions", {"messages": fit})
+        self.assertEqual(status, 200, data)
+        status, data = _post(http_.port, "/v1/chat/completions", {"messages": [{"role": "user", "content": fit[0]["content"] + "x"}]})
+        self.assertEqual(json.loads(data)["error"]["n_prompt_tokens"], 84)
+        # other 400s keep their type, now with llama-server's code field
+        status, data = _post(http_.port, "/v1/chat/completions", {"messages": msgs, "n": 2})
+        self.assertEqual((status, json.loads(data)["error"]["code"], json.loads(data)["error"]["type"]), (400, 400, "invalid_request_error"))
+
+    def test_images_stop_at_the_context(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["ok"]), ctx=48)
+        lib = _FakeVisionLib()  # (each image: 2 x 2 = 4 tokens + start / end)
+        v = object.__new__(self.mk.Vision)
+        v.L, v.ctx, v.cache, v.cache_max = lib, 1, {}, 8
+        srv.vision, srv.vis_start, srv.vis_end, srv.img_pad = v, 1001, 1002, 1003
+        parts = [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b"i%d" % i).decode()}}
+                 for i in range(8)]
+        status, data = _post(http_.port, "/v1/chat/completions", {"messages": [{"role": "user", "content": parts}]})
+        err = json.loads(data)["error"]
+        self.assertEqual((status, err["type"], err["n_ctx"]), (400, "exceed_context_size_error", 48))
+        self.assertTrue(err["message"].startswith(f"request (at least {err['n_prompt_tokens']} tokens)"), err)
+        self.assertLess(len(lib.freed) + len(lib.live), 8)  # (stopped decoding images)
 
 
 class SdkStreamTests(_HttpCase):

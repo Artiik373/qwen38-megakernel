@@ -449,7 +449,15 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
 - Errors: a CUDA error or non-finite logits make the engine throw; the server answers HTTP 500 and keeps serving. In a
   stream that has started (status 200 sent), the error is the last event, OpenAI style:
   `data: {"error": {"message": ..., "type": "server_error", "code": 500}}`, then `data: [DONE]`. `POST /slots` (slot
-  save / restore) and `POST /props` get 501.
+  save / restore) and `POST /props` get 501. Errors carry llama-server's `code` (the HTTP status) next to `message`
+  and `type`.
+- A prompt longer than the context (the reply needs 16 tokens of it) is a 400 in llama-server's machine-readable shape,
+  `{"error": {"code": 400, "type": "exceed_context_size_error", "message": "request (N tokens) exceeds the available
+  context size (C tokens), try increasing it", "n_prompt_tokens": N, "n_ctx": C}}` (clients that compact or trim key
+  on the type and the two numbers; with images the counting stops at the first image past the context: "at least N
+  tokens"), and on `/v1/messages` Anthropic's `invalid_request_error` "prompt is too long: N tokens > M maximum" (the
+  text Claude Code reads before it compacts its conversation; M = C - 17) with the same two fields. Streams get it as
+  the status before the stream starts.
 - Limits (environment, read at startup): a request body needs a Content-Length (411 without one, also for chunked
   bodies; 400 when malformed) of at most `MK_MAX_BODY_MB` MB (default 128; 413, refused before the body is read, also
   on `Expect: 100-continue`). At most `MK_MAX_IMAGES` images per request (default 32; 400) and `MK_MAX_VIDEO_FRAMES`

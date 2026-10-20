@@ -1042,6 +1042,20 @@ class BadRequest(Exception):
     pass
 
 
+class ContextOverflow(BadRequest):
+    """a prompt that does not fit the context (the reply needs RESERVE tokens): llama-server's exceed_context_size_error
+    (400, with n_prompt_tokens and n_ctx, its message), and on /v1/messages Anthropic's "prompt is too long: N tokens
+    > M maximum" (the text Claude Code reads before it compacts the conversation). at_least: counting stopped early
+    (no more images decoded for a prompt that cannot run)"""
+    RESERVE = 16
+
+    def __init__(self, n_prompt, n_ctx, at_least=False):
+        self.n_prompt, self.n_ctx = n_prompt, n_ctx
+        n = f"at least {n_prompt}" if at_least else n_prompt
+        super().__init__(f"request ({n} tokens) exceeds the available context size ({n_ctx} tokens), try increasing it")
+        self.anthropic = f"prompt is too long: {n_prompt} tokens > {n_ctx - self.RESERVE - 1} maximum"
+
+
 class ClientGone(Exception):
     """the client closed its connection: the request stops, nothing is sent"""
 
@@ -2300,8 +2314,8 @@ class Server:
                                 j += 1
                     else:
                         add_image(self.vision.image(media[i]))
-                    if len(toks) + 16 >= self.args.ctx:  # (no more images decoded for a prompt that cannot run)
-                        raise BadRequest(f"prompt of at least {len(toks)} tokens does not fit the context of {self.args.ctx}")
+                    if len(toks) + ContextOverflow.RESERVE >= self.args.ctx:  # (no more images decoded for it)
+                        raise ContextOverflow(len(toks), self.args.ctx, at_least=True)
         except BaseException:
             self.vision.release([im for _, im in images])
             raise
@@ -2526,9 +2540,9 @@ class Server:
         except (TypeError, ValueError, OverflowError):
             raise BadRequest("max_tokens must be an integer")
         asked = max_new
-        limit = self.args.ctx - len(toks) - 16
+        limit = self.args.ctx - len(toks) - ContextOverflow.RESERVE
         if limit <= 0:
-            raise BadRequest(f"prompt of {len(toks)} tokens does not fit the context of {self.args.ctx}")
+            raise ContextOverflow(len(toks), self.args.ctx)
         max_new = limit if max_new <= 0 else min(max_new, limit)
         # tool_choice "none": the tools stay in the prompt, calls are not parsed (returned as text), as llama-server does
         tools = (body.get("tools") or []) if body.get("tool_choice") != "none" else []
@@ -2889,7 +2903,8 @@ def make_handler(srv):
             refused = self._body_length()[1]
             if refused:
                 log(f"{self.command} {self.path.split('?')[0]} -> {refused[0]}: {refused[1]}")
-                self._json(refused[0], {"error": {"message": refused[1], "type": "invalid_request_error"}}, close=True)
+                self._json(refused[0], {"error": {"code": refused[0], "message": refused[1], "type": "invalid_request_error"}},
+                           close=True)
             return bool(refused)
 
         def handle_expect_100(self):
@@ -2953,7 +2968,7 @@ def make_handler(srv):
                 try:  # (no generation: the tokenizer, from this thread; images take the engine's lock)
                     self._json(200, getattr(self, "_" + route)(body))
                 except BadRequest as e:
-                    self._error(400, str(e), anth)
+                    self._bad(e, anth)
                 return
             rid = next(srv.rids)
             if srv.busy():
@@ -2971,7 +2986,7 @@ def make_handler(srv):
                         self._complete(body)
                 except BadRequest as e:
                     srv.count(requests_bad=1)
-                    self._error(400, str(e), anth, rid)
+                    self._bad(e, anth, rid)
                 except (BrokenPipeError, ConnectionResetError, ClientGone) as e:
                     srv.count(requests_cancelled=1)
                     self.close_connection = True
@@ -2988,15 +3003,26 @@ def make_handler(srv):
                     CON.status("")
                     srv.eng.keep_warm()  # (MK_KEEP_WARM_S: the window restarts after every request)
 
-        def _error(self, code, message, anthropic=False, rid=None):
-            """answers with an error; a 4xx is also logged (a 5xx was logged with its exception)"""
+        def _error(self, code, message, anthropic=False, rid=None, kind=None, extra=None):
+            """answers with an error (OpenAI / llama-server's shape with its code, or Anthropic's); a 4xx is also logged
+            (a 5xx was logged with its exception). kind: the type instead of the code's; extra: more fields"""
             if code < 500:
                 log(f"#{rid} {code}: {message}" if rid else f"{self.command} {self.path.split('?')[0]} -> {code}: {message}")
             if anthropic:
-                self._json(code, {"type": "error", "error": {"type": ANTHROPIC_ERRORS.get(code, "api_error"), "message": message}})
+                err = {"type": kind or ANTHROPIC_ERRORS.get(code, "api_error"), "message": message, **(extra or {})}
+                self._json(code, {"type": "error", "error": err})
             else:
-                kind = {400: "invalid_request_error", 404: "not_found_error", 501: "not_supported"}.get(code, "server_error")
-                self._json(code, {"error": {"message": message, "type": kind}})
+                kind = kind or {400: "invalid_request_error", 404: "not_found_error", 501: "not_supported"}.get(code, "server_error")
+                self._json(code, {"error": {"code": code, "message": message, "type": kind, **(extra or {})}})
+
+        def _bad(self, e, anthropic=False, rid=None):
+            """answers a BadRequest (400); a prompt longer than the context in llama-server's / Anthropic's shape"""
+            if not isinstance(e, ContextOverflow):
+                return self._error(400, str(e), anthropic, rid)
+            extra = {"n_prompt_tokens": e.n_prompt, "n_ctx": e.n_ctx}
+            if anthropic:
+                return self._error(400, e.anthropic, True, rid, extra=extra)
+            self._error(400, str(e), False, rid, "exceed_context_size_error", extra)
 
         # ---- routes without generation (llama-server's) ----
         def _tokenize(self, body):
