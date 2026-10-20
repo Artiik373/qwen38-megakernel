@@ -144,6 +144,15 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #if MK_C1 && !MK_WV
 #error "MK_C1 needs MK_WV=1 (the split-K ffn_down it waits in)"
 #endif
+// MK_EGRESS (compete C4's host egress, agent_xdec's e2caa08 bit 2; compile-time, 0 = the code without it): block 0 copies
+// the launch's Ctl to a mapped host mirror after the launch's last grid barrier (step() reads the mirror instead of a
+// device-to-host copy), the barrier counts run on across launches (each launch starts from the counts the previous one
+// left, kept in cB.bar words; wrap-safe compares) so launch() zeroes them only once, and dv_add uploads asynchronously
+// from pinned staging on the launch stream. Bitwise exact (no device arithmetic changes). Aimed at the native Windows
+// build (fewer copy-engine switches per launch); no measurable change on Linux (agent_xdec).
+#ifndef MK_EGRESS
+#define MK_EGRESS 0
+#endif
 // MK_K2_TB (stockfix K2): tokens per batch of resid_wv's last-arrival combine (their partial loads issued together; 8 beat 4
 // by 0.5-0.8 us per call at 38k, no new spills)
 #ifndef MK_K2_TB
@@ -418,6 +427,9 @@ struct Bufs {
     // each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT; takes precedence over 1)
     int k6;
     int * err; // mapped host words, set only on failure: [0] no finite main logit / invalid token, [1] MTP catch-up out of range
+#if MK_EGRESS
+    Ctl * ctl_eg; // mapped host copy of ctl, written by block 0 at the end of every launch (mk_egress)
+#endif
 };
 
 __constant__ ModelW cW;
@@ -525,6 +537,20 @@ extern __shared__ __align__(16) uint8_t smem[]; // dynamic shared memory of the 
 // own 128-byte line, cB.bar + GS_GO) and the others poll only go (1: relaxed polls, then one acquire re-read; 2: acquire
 // polls); 3 = form 0's arrival with relaxed polls and one acquire re-read. Both words start at 0 every launch.
 constexpr int GS_GO = 32;
+#if MK_EGRESS
+// MK_EGRESS: the counts run on across launches. Word BAR_BASE holds the barrier count at the end of the previous launch and
+// C1_BASE (MK_C1) the C1 chunk count (every chunk's counter advances alike); block 0 writes both after the launch's last
+// barrier (mk_egress), thread 0 of every block reads them at the start (s_bar0, s_c1b). A count wraps after ~10^5
+// launches: the waits compare wrap-safe (MK_BAR_LT); MK_EPOCH turns a launch-relative count into the absolute one.
+constexpr int BAR_BASE = GS_GO + 8, C1_BASE = GS_GO + 9;
+__shared__ unsigned s_bar0, s_c1b;
+static_assert(SM_TOTAL + 32 <= 99 * 1024, "mk_cycle's dynamic + static shared memory (+ s_bar0, s_c1b)");
+#define MK_BAR_LT(v, e) ((int) ((v) - (e)) < 0)
+#define MK_EPOCH(e) ((e) + s_bar0)
+#else
+#define MK_BAR_LT(v, e) v < e
+#define MK_EPOCH(e) e
+#endif
 template <int V>
 __device__ __forceinline__ void gs_arrive_wait(unsigned epoch) {
     unsigned v;
@@ -533,11 +559,11 @@ __device__ __forceinline__ void gs_arrive_wait(unsigned epoch) {
         if constexpr (V == 0) {
             do {
                 asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.bar) : "memory");
-            } while (v < epoch);
+            } while (MK_BAR_LT(v, epoch));
         } else {
             do {
                 asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.bar) : "memory");
-            } while (v < epoch);
+            } while (MK_BAR_LT(v, epoch));
             asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.bar) : "memory");
         }
     } else {
@@ -548,11 +574,11 @@ __device__ __forceinline__ void gs_arrive_wait(unsigned epoch) {
         } else if constexpr (V == 2) {
             do {
                 asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(go) : "memory");
-            } while (v < epoch);
+            } while (MK_BAR_LT(v, epoch));
         } else {
             do {
                 asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(go) : "memory");
-            } while (v < epoch);
+            } while (MK_BAR_LT(v, epoch));
             asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(go) : "memory");
         }
     }
@@ -567,7 +593,7 @@ __device__ __forceinline__ void gsync(unsigned & epoch, int tag) {
             if (k < 1024) cB.prof[4096 + k * 128 + blockIdx.x] = gtimer();
         }
         epoch += gridDim.x;
-        gs_arrive_wait<MK_GSYNC>(epoch);
+        gs_arrive_wait<MK_GSYNC>(MK_EPOCH(epoch));
         if (cB.prof && blockIdx.x == 0) {
             const unsigned k = epoch / gridDim.x;
             s_bar_k = k;
@@ -594,10 +620,10 @@ __device__ __forceinline__ void k5_arrive(unsigned & epoch, int tag) {
         if (cB.prof && k < 1024) cB.prof[4096 + k * 128 + blockIdx.x] = gtimer();
         unsigned old;
         asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(cB.bar) : "memory");
-        const unsigned rank = old - epoch; // arrivals of this generation before this one
+        const unsigned rank = old - MK_EPOCH(epoch); // arrivals of this generation before this one
         epoch += gridDim.x;
         s_k5h = rank < (unsigned) NVH ? (int) rank : -1;
-        s_k5e = epoch;
+        s_k5e = MK_EPOCH(epoch);
         if (cB.prof) {
             if (blockIdx.x == 0) s_bar_k = k;
             if (rank == gridDim.x - 1 && k < 2048) cB.prof[k] = (gtimer() << 8) | (unsigned long long) tag;
@@ -612,7 +638,7 @@ __device__ __forceinline__ void k5_wait() {
         unsigned v;
         do {
             asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.bar) : "memory");
-        } while (v < e);
+        } while (MK_BAR_LT(v, e));
     }
     __syncthreads();
 }
@@ -5048,9 +5074,34 @@ __device__ __noinline__ void gsync_bench(int n) {
     }
 }
 
+#if MK_EGRESS
+// MK_EGRESS, after the launch's last grid barrier (every block has passed it, and with it every write to ctl): block 0
+// publishes the counts the next launch starts from (BAR_BASE, C1_BASE) and copies ctl to its mapped host mirror (the host
+// reads that after the launch instead of a device-to-host copy)
+__device__ __forceinline__ void mk_egress(unsigned epoch) {
+    if (blockIdx.x != 0) return;
+    if (threadIdx.x == 0) {
+        cB.bar[BAR_BASE] = s_bar0 + epoch;
+#if MK_C1
+        cB.bar[C1_BASE] = s_c1b + s_c1n * (gridDim.x / WV_S); // (block 0 consumes chunk 0: s_c1n = this launch's split edges)
+#endif
+    }
+    if (cB.ctl_eg && threadIdx.x < sizeof(Ctl) / 4) {
+        reinterpret_cast<volatile int *>(cB.ctl_eg)[threadIdx.x] = reinterpret_cast<volatile const int *>(cB.ctl)[threadIdx.x];
+        __threadfence_system();
+    }
+}
+#endif
+
 __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
     uint8_t * const sm = smem;
     unsigned epoch = 0;
+#if MK_EGRESS
+    if (threadIdx.x == 0) { // (0 after the host's memset: the first launch, bench launches)
+        s_bar0 = __ldcg(cB.bar + BAR_BASE);
+        s_c1b = __ldcg(cB.bar + C1_BASE);
+    }
+#endif
     if (P.mode == MODE_BENCH) {
         if (P.last == 3) { // gsync bench: P.ndraft barriers of form P.score
             switch (P.score) {
@@ -5084,7 +5135,14 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
         default: run_wide(P, epoch); break; // T = 6 .. MAXT
 #endif
     }
+#if MK_EGRESS
+    if (P.ndraft == 0 || P.score) {
+        mk_egress(epoch);
+        return;
+    }
+#else
     if (P.ndraft == 0 || P.score) return;
+#endif
     volatile Ctl * vc = cB.ctl;
     const int Rtot = vc->mtp_R;
     const bool lg = vc->mtp_logits;
@@ -5117,6 +5175,9 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
         // nd_stop is written before the PH_MTP_LMHEAD barrier, so every block takes the same exit
         for (int i = 1; i < P.ndraft && !vc->nd_stop; i++) mtp_pass<1>(P, 0, true, i, true, sm, epoch);
     }
+#if MK_EGRESS
+    mk_egress(epoch);
+#endif
 }
 
 #include "prefill.cuh"
@@ -5614,6 +5675,15 @@ struct MKEngine::Impl {
     float * emb_host = nullptr;   // the prefill's image rows: pinned, mapped (cP.emb = its device alias)
     size_t emb_cap = 0;           // (floats)
     volatile int * err_host = nullptr; // cB.err's host side
+#if MK_EGRESS
+    volatile Ctl * ctl_eg_host = nullptr; // cB.ctl_eg's host side
+    bool bar_live = false;                // the cB.bar counts run on from the previous launch (zeroed once, and after bench launches)
+    // ctl after a decode launch: the kernel's mapped mirror (a device-to-host copy without one)
+    void ctl_fetch(Ctl & c) {
+        if (ctl_eg_host) memcpy(&c, const_cast<const Ctl *>(ctl_eg_host), sizeof(Ctl));
+        else CK(cudaMemcpy(&c, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+    }
+#endif
     bool err_mtp_warned = false;
 #if MK_TEST_NAN
     int test_nan_at = getenv("MK_TEST_NAN_AT") ? atoi(getenv("MK_TEST_NAN_AT")) : 0, test_nan_n = 0;
@@ -6141,6 +6211,9 @@ struct MKEngine::Impl {
     // not (step's additions). A rewind / truncate rebuilds it that way, and a prefill continuing at dv_n rebuilds it over
     // the whole new sequence, so a reused prefix drafts (and samples) exactly as the same prompt sent fresh.
     int dv_n = 0;
+#if MK_EGRESS
+    int * dv_pin = nullptr; // dv_add's pinned staging: the ids (dv_base + DV_EXTRA), then [dv_base + DV_EXTRA] the row count
+#endif
 
     // Adds the tokens not yet in the draft head's vocabulary (appends their ids).
     void dv_add(const int * toks, size_t n) {
@@ -6155,6 +6228,20 @@ struct MKEngine::Impl {
         if (dv_ids.size() & 1) dv_ids.push_back(dv_ids.back()); // the draft lm_head takes rows in pairs
         const int k = (int) dv_ids.size() - n0;
         Mat & m = hw.head_d;
+#if MK_EGRESS
+        if (dv_pin) {
+            // asynchronous on the launch stream (ordered before the next launch). The staged ids [n0, n0 + k) are not
+            // rewritten before a later synchronisation: appends go past them, and dv_truncate's synchronous row-count copy
+            // waits for every copy queued before it (the next dv_add after it may restage the same ids)
+            m.N = (int) dv_ids.size();
+            memcpy(dv_pin + n0, dv_ids.data() + n0, k * 4);
+            dv_pin[dv_base + DV_EXTRA] = m.N;
+            CK(cudaMemcpyAsync(const_cast<int *>(hw.draft_ids) + n0, dv_pin + n0, k * 4, cudaMemcpyHostToDevice, 0));
+            CK(cudaMemcpyToSymbolAsync(cW, dv_pin + dv_base + DV_EXTRA, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N),
+                                       cudaMemcpyHostToDevice, 0));
+            return;
+        }
+#endif
         CK(cudaMemcpy(const_cast<int *>(hw.draft_ids) + n0, dv_ids.data() + n0, k * 4, cudaMemcpyHostToDevice));
         m.N = (int) dv_ids.size();
         CK(cudaMemcpyToSymbol(cW, &m.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
@@ -7230,6 +7317,12 @@ struct MKEngine::Impl {
             hw.draft_ids = did;
             dv_ids = ids;
             dv_base = (int) ids.size();
+#if MK_EGRESS
+            if (cudaHostAlloc(reinterpret_cast<void **>(&dv_pin), ((size_t) cap + 1) * 4, cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                dv_pin = nullptr; // (synchronous copies)
+            }
+#endif
             dv_in.assign(VOCAB, 0);
             for (int t : ids) dv_in[t] = 1;
             fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
@@ -7519,6 +7612,15 @@ struct MKEngine::Impl {
             err_host = eh;
             CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&hb.err), eh, 0));
         }
+#if MK_EGRESS
+        {
+            Ctl * ce = nullptr;
+            CK(cudaHostAlloc(reinterpret_cast<void **>(&ce), sizeof(Ctl), cudaHostAllocMapped));
+            memset(ce, 0, sizeof(Ctl));
+            ctl_eg_host = ce;
+            CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&hb.ctl_eg), ce, 0));
+        }
+#endif
         CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
 
         CK(cudaFuncSetAttribute(mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
@@ -7708,6 +7810,10 @@ struct MKEngine::Impl {
         if (embd_host) cudaFreeHost(embd_host);
         if (emb_host) cudaFreeHost(emb_host);
         if (err_host) cudaFreeHost(const_cast<int *>(err_host));
+#if MK_EGRESS
+        if (ctl_eg_host) cudaFreeHost(const_cast<Ctl *>(ctl_eg_host));
+        if (dv_pin) cudaFreeHost(dv_pin);
+#endif
     }
 
     // emb_host holding at least `floats` (grown: pinned, mapped; cP.emb follows it)
@@ -7767,7 +7873,16 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] MK_TEST_NAN: NaN K scales before decode launch %d\n", test_nan_n);
         }
 #endif
+#if MK_EGRESS
+        if (!bar_live) { // (the counts run on from the previous launch's BAR_BASE / C1_BASE: zeroed once, and after bench launches)
 #if MK_C1
+            CK(cudaMemsetAsync(hb.bar, 0, C1_WORDS * 4));
+#else
+            CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
+#endif
+            bar_live = true;
+        }
+#elif MK_C1
         CK(cudaMemsetAsync(hb.bar, 0, C1_WORDS * 4)); // (bench launches use only the first two lines)
 #else
         CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
@@ -7868,6 +7983,9 @@ struct MKEngine::Impl {
     // every gsync form (gs_arrive_wait) at nsm and nsm / 2 blocks, round-robin over the configurations so clock drift hits
     // them alike; per barrier = (median t(N) - median t(0)) / N. MK_GSB_REPS (default 15) rounds; 1.5 s GPU warm-up first.
     void gsync_bench_host(int N) {
+#if MK_EGRESS
+        bar_live = false; // (these launches zero the barrier words themselves and leave no BAR_BASE)
+#endif
         const int reps = getenv("MK_GSB_REPS") ? std::max(3, atoi(getenv("MK_GSB_REPS"))) : 15;
         st_warm<<<nsm * 4, 256>>>((unsigned long long) 1500 * 1000000ull);
         CK(cudaGetLastError());
@@ -7912,6 +8030,9 @@ struct MKEngine::Impl {
     }
 
     void bench() {
+#if MK_EGRESS
+        bar_live = false; // (these launches zero the barrier words themselves and leave no BAR_BASE)
+#endif
         if (const char * g = getenv("MK_GSB")) {
             gsync_bench_host(std::max(1, atoi(g)));
             return;
@@ -10294,7 +10415,11 @@ int MKEngine::step(std::vector<int> & out) {
     for (int i = 1; i < T; i++) drafts[i] = c.tok[i];
 #endif
     p_->launch(MODE_DECODE, T, 0);
+#if MK_EGRESS
+    p_->ctl_fetch(c);
+#else
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+#endif
     p_->nd_avail = nd > 0 ? std::min(nd, c.nd_prod) : 0;
 #if MK_SPEC_LOG
     p_->slog_cycle(n0, T, drafts, c);

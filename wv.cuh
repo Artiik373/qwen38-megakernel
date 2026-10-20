@@ -1137,7 +1137,8 @@ __device__ __forceinline__ void glu_store(int j, const float (&act)[T]) {
 
 #if MK_C1
 // C1 (MK_C1): per-chunk readiness of cB.qa between ffn_gu_wv and ffn_down's resid_wv. Chunk kc's counter is the word
-// cB.bar + C1_W0 + GS_GO kc (own 128-byte line; zeroed with the barrier words before every launch). Each of the chunk's G
+// cB.bar + C1_W0 + GS_GO kc (own 128-byte line; zeroed with the barrier words before every launch, or with MK_EGRESS
+// running on from the count C1_BASE the previous launch left: MK_C1E adds it). Each of the chunk's G
 // producer blocks release-adds 1 after its gate / up tiles (c1_arrive); the chunk's consumers (the same G blocks)
 // acquire-poll it until it reaches G x the number of split edges this launch has passed (s_c1n, thread 0 of each block
 // of chunks 0 .. WV_S - 1; mk_cycle zeroes it). Cumulative, never reset within a launch: the next edge's adds come only
@@ -1147,18 +1148,23 @@ constexpr int C1_W0 = 2 * GS_GO, C1_WORDS = C1_W0 + WV_S * GS_GO; // (cB.bar wor
 static_assert((FF / 16) % WV_S == 0, "gate / up tiles per ffn_down chunk");
 static_assert(SM_TOTAL + 32 <= 99 * 1024, "mk_cycle's dynamic + static shared memory (+ s_c1n)");
 __shared__ unsigned s_c1n;
+#if MK_EGRESS
+#define MK_C1E(x) (s_c1b + (x))
+#else
+#define MK_C1E(x) x
+#endif
 __device__ __forceinline__ void c1_arrive(int kc) {
     __syncthreads(); // (every warp's q16 stores of the block's tiles before thread 0's release)
     if (threadIdx.x == 0) asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(cB.bar + C1_W0 + GS_GO * kc) : "memory");
 }
 __device__ __forceinline__ void c1_wait(int kc, int G) {
     if (threadIdx.x == 0) {
-        const unsigned e = ++s_c1n * (unsigned) G;
+        const unsigned e = MK_C1E(++s_c1n * (unsigned) G);
         const unsigned * w = cB.bar + C1_W0 + GS_GO * kc;
         unsigned v;
         do {
             asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(w) : "memory");
-        } while (v < e);
+        } while (MK_BAR_LT(v, e));
     }
     __syncthreads();
 }
