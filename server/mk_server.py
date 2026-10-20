@@ -19,7 +19,8 @@ GET /health (503 "Loading model" until the model is loaded), /v1/models, /props,
 /detokenize, /apply-template, /v1/chat/completions/input_tokens (llama-server's shapes).  One request at a time.
 After each request the engine keeps the GPU's clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a
 reply after a pause starts at full speed.
-Limits (environment): MK_MAX_BODY_MB (request body, default 128), MK_MAX_IMAGES (images per request, default 32),
+Limits (environment): MK_MAX_BODY_MB (request body, Content-Length or chunked, default 128), MK_MAX_IMAGES (images per
+request, default 32),
 MK_MAX_VIDEO_FRAMES (video frames per request, default 256);
 the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
 whose client disconnects stops at the next prefill chunk (2048 tokens) or engine cycle. A connection the server closes
@@ -2995,10 +2996,16 @@ def make_handler(srv):
             self.wfile.write(data)
 
         def _body_length(self):
-            """(the request body's length, None), or (None, (status, message)) when it is not acceptable: chunked or
-            no Content-Length (411), a malformed one (400), over MK_MAX_BODY_MB (413, refused before reading)"""
-            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
-                return None, (411, "chunked request bodies are not supported: send a Content-Length")
+            """(the request body's length, or "chunked", None), or (None, (status, message)) when it is not acceptable:
+            no Content-Length (411), a malformed one (400), over MK_MAX_BODY_MB (413, refused before reading); a
+            transfer coding other than chunked (501), chunked with a Content-Length too (400: two framings)"""
+            te = [c.strip().lower() for v in self.headers.get_all("Transfer-Encoding") or [] for c in v.split(",")]
+            if any(te):
+                if [c for c in te if c] != ["chunked"]:
+                    return None, (501, f"Transfer-Encoding {', '.join(c for c in te if c)!r}: only chunked is supported")
+                if self.headers.get_all("Content-Length"):
+                    return None, (400, "Content-Length and Transfer-Encoding: chunked together")
+                return "chunked", None
             vals = [v.strip() for v in self.headers.get_all("Content-Length") or []]
             if not vals:
                 return None, (411, "a Content-Length header is required")
@@ -3008,6 +3015,56 @@ def make_handler(srv):
             if n > MAX_BODY_MB << 20:
                 return None, (413, f"request body of {n} bytes: over the limit of {MAX_BODY_MB} MB (MK_MAX_BODY_MB)")
             return n, None
+
+        CHUNK_LINE, TRAILER_LINES = 4096, 64  # (a chunk-size line with its extensions; trailer field lines)
+
+        def _read_chunked(self):
+            """a Transfer-Encoding: chunked body (RFC 9112 7.1), decoded into a buffer of at most MK_MAX_BODY_MB (413 as
+            soon as a chunk would pass it); a malformed size line (not hex, over 16 digits, no CRLF), data without its
+            CRLF or a malformed trailer section is a 400; trailers are read and dropped. Both close the connection (the
+            lingering close drains what the client still sends). None: answered, or the client left mid-body"""
+            cap, buf = MAX_BODY_MB << 20, bytearray()
+
+            def refuse(code, msg):
+                log(f"{self.command} {self.path.split('?')[0]} -> {code}: {msg}")
+                self._json(code, {"error": {"code": code, "message": msg, "type": "invalid_request_error"}}, close=True)
+
+            while True:
+                line = self.rfile.readline(self.CHUNK_LINE + 1)
+                if not line:  # (the client closed the connection mid-body)
+                    self.close_connection = True
+                    return None
+                if not line.endswith(b"\r\n"):
+                    return refuse(400, "chunked body: a chunk-size line without its CRLF (or over 4096 bytes)")
+                size = line[:-2].split(b";", 1)[0].rstrip(b" \t")
+                if not re.fullmatch(rb"[0-9A-Fa-f]{1,16}", size):
+                    return refuse(400, f"chunked body: bad chunk size {size[:40].decode('latin-1')!r}")
+                n = int(size, 16)
+                if n == 0:
+                    break
+                if len(buf) + n > cap:
+                    return refuse(413, f"chunked request body over the limit of {MAX_BODY_MB} MB (MK_MAX_BODY_MB)")
+                data = self.rfile.read(n)
+                if len(data) < n:
+                    self.close_connection = True
+                    return None
+                buf += data
+                end = self.rfile.read(2)
+                if end != b"\r\n":
+                    if len(end) < 2:
+                        self.close_connection = True
+                        return None
+                    return refuse(400, "chunked body: chunk data without its CRLF")
+            for _ in range(self.TRAILER_LINES + 1):  # (trailer fields: dropped)
+                line = self.rfile.readline(self.CHUNK_LINE + 1)
+                if line == b"\r\n":
+                    return bytes(buf)
+                if not line:
+                    self.close_connection = True
+                    return None
+                if not line.endswith(b"\r\n"):
+                    return refuse(400, "chunked body: a trailer line without its CRLF (or over 4096 bytes)")
+            return refuse(400, f"chunked body: more than {self.TRAILER_LINES} trailer lines")
 
         def _refuse_body(self):
             """answers an unacceptable request body (_body_length) without reading it; True if it did"""
@@ -3058,10 +3115,15 @@ def make_handler(srv):
             if self._refuse_body():
                 return
             n = self._body_length()[0]
-            raw = self.rfile.read(n) if n else b""
-            if len(raw) < n:  # (the client closed the connection mid-body)
-                self.close_connection = True
-                return
+            if n == "chunked":
+                raw = self._read_chunked()
+                if raw is None:  # (refused, or the client left)
+                    return
+            else:
+                raw = self.rfile.read(n) if n else b""
+                if len(raw) < n:  # (the client closed the connection mid-body)
+                    self.close_connection = True
+                    return
             route = POST_ROUTES.get(path)
             anth = path.startswith("/v1/messages")  # (errors in Anthropic's shape)
             if route is None:

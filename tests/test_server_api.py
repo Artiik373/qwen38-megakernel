@@ -5,6 +5,7 @@ overflow error, reasoning format and template defaults, llama-server's extra req
 import base64
 import http.client
 import json
+import socket
 import time
 import unittest
 
@@ -512,6 +513,103 @@ class RequestFieldTests(_HttpCase):
                              ({"samplers": "kkpmt"}, "samplers"), ({"samplers": 3}, "samplers")):
             status, data = http_.post({**base, **extra})
             self.assertEqual((status, json.loads(data)["error"]["message"].split(":")[0]), (400, field), extra)
+
+
+class ChunkedBodyTests(_HttpCase):
+    """G4: Transfer-Encoding: chunked request bodies (Node fetch with a stream body, Go, proxies), decoded into a buffer
+    capped at MK_MAX_BODY_MB; malformed framing is a 400 and the connection closes"""
+
+    HEAD = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+    BODY = json.dumps({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}).encode()
+
+    def _status(self, raw):
+        line = raw.split(b"\r\n", 1)[0]
+        return int(line.split()[1]) if line.startswith(b"HTTP/1.1 ") else None
+
+    @staticmethod
+    def chunks(data, sizes, ext=b"", upper=False, trailers=b""):
+        out, i = b"", 0
+        for n in sizes:
+            part, i = data[i:i + n], i + n
+            out += (b"%X" if upper else b"%x") % len(part) + ext + b"\r\n" + part + b"\r\n"
+        return out + b"0" + ext + b"\r\n" + trailers + b"\r\n"
+
+    def test_valid_bodies(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        b = self.BODY
+        for enc in (self.chunks(b, [len(b)]), self.chunks(b, [1] * len(b)), self.chunks(b, [7, 13, 1000], upper=True),
+                    self.chunks(b, [10, 1000], ext=b" ;name=value", trailers=b"X-Checksum: abc\r\nX-More: 1\r\n")):
+            for te in (b"chunked", b"Chunked", b" chunked "):
+                raw = http_.raw(self.HEAD + b"Transfer-Encoding: " + te + b"\r\n\r\n" + enc, until=b"}")
+                self.assertEqual(self._status(raw), 200, (enc[:60], raw[:300]))
+                self.assertIn(b'"content": "ok"', raw)
+        # keep-alive: the next request on the connection after a chunked one (body and trailers fully read)
+        req = self.HEAD + b"Transfer-Encoding: chunked\r\n\r\n" + self.chunks(b, [5, 1000], trailers=b"T: 1\r\n")
+        raw = http_.raw(req + req, until=b"}")
+        if raw.count(b"HTTP/1.1 200") < 2:
+            with socket.create_connection(("127.0.0.1", http_.port), timeout=5) as s:
+                s.sendall(req + req)
+                raw, t0 = b"", time.time()
+                while raw.count(b'"content": "ok"') < 2 and time.time() - t0 < 5:
+                    raw += s.recv(65536)
+        self.assertEqual(raw.count(b"HTTP/1.1 200"), 2, raw[:600])
+        # Expect: 100-continue, then the chunks
+        with socket.create_connection(("127.0.0.1", http_.port), timeout=5) as s:
+            s.sendall(self.HEAD + b"Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n")
+            self.assertTrue(s.recv(100).startswith(b"HTTP/1.1 100"))
+            s.sendall(self.chunks(b, [20, 1000]))
+            raw, t0 = b"", time.time()
+            while b'"content": "ok"' not in raw and time.time() - t0 < 5:
+                raw += s.recv(65536)
+            self.assertEqual(self._status(raw), 200, raw[:300])
+
+    def test_malformed_framing(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        b = self.BODY
+        good = self.chunks(b, [len(b)])
+        cases = [(b"zz\r\n" + b + b"\r\n0\r\n\r\n", 400, b"bad chunk size"),  # (not hex)
+                 (b"\r\n" + b, 400, b"bad chunk size"),  # (empty size)
+                 (b"%x\r\n%sXY0\r\n\r\n" % (len(b), b), 400, b"without its CRLF"),  # (no CRLF after the data)
+                 (b"0" * 17 + b"1\r\n", 400, b"bad chunk size"),  # (over 16 hex digits)
+                 (b"1" * 5000, 400, b"chunk-size line"),  # (a size line that never ends)
+                 (b"-5\r\n", 400, b"bad chunk size"),
+                 (b"%x\n%s\r\n0\r\n\r\n" % (len(b), b), 400, b"chunk-size line"),  # (LF only)
+                 (b"%x\r\n%s\r\n0\r\n" % (len(b), b) + b"X: y\r\n" * 70 + b"\r\n", 400, b"trailer lines"),
+                 (b"%x\r\n%s\r\n0\r\nX: " % (len(b), b) + b"y" * 5000, 400, b"trailer line")]
+        for enc, code, words in cases:
+            raw = http_.raw(self.HEAD + b"Transfer-Encoding: chunked\r\n\r\n" + enc)
+            self.assertEqual(self._status(raw), code, (enc[:40], raw[:300]))
+            self.assertIn(words, raw)
+            self.assertIn(b"Connection: close", raw)
+        for head, code in ((b"Transfer-Encoding: gzip, chunked\r\n", 501), (b"Transfer-Encoding: deflate\r\n", 501),
+                           (b"Transfer-Encoding: chunked\r\nContent-Length: %d\r\n" % len(good), 400)):
+            raw = http_.raw(self.HEAD + head + b"\r\n" + good)
+            self.assertEqual(self._status(raw), code, (head, raw[:300]))
+        self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0], 200)
+
+    def test_the_body_limit(self) -> None:
+        from unittest import mock
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        with mock.patch.object(self.mk, "MAX_BODY_MB", 1):
+            t = time.time()
+            raw = http_.raw(self.HEAD + b"Transfer-Encoding: chunked\r\n\r\n%x\r\n" % ((1 << 20) + 1))  # (refused unread)
+            self.assertEqual((self._status(raw), b"MK_MAX_BODY_MB" in raw), (413, True), raw[:300])
+            self.assertLess(time.time() - t, 2.0)
+            # over the limit across chunks: refused when the chunk that passes it is announced
+            piece = b"x" * 300000
+            raw = http_.raw(self.HEAD + b"Transfer-Encoding: chunked\r\n\r\n" + (b"%x\r\n%s\r\n" % (len(piece), piece)) * 4)
+            self.assertEqual(self._status(raw), 413, raw[:300])
+            big = json.dumps({"messages": [{"role": "user", "content": "x" * 900000}], "max_tokens": 2}).encode()
+            raw = http_.raw(self.HEAD + b"Transfer-Encoding: chunked\r\n\r\n" + self.chunks(big, [65536] * 16), until=b"}",
+                            timeout=20)
+            self.assertNotEqual(self._status(raw), 413, raw[:300])  # (under the limit: read whole)
+
+    def test_a_client_that_leaves_mid_body(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        with socket.create_connection(("127.0.0.1", http_.port), timeout=5) as s:
+            s.sendall(self.HEAD + b"Transfer-Encoding: chunked\r\n\r\n100\r\nabc")
+        time.sleep(0.2)
+        self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0], 200)
 
 
 class SdkStreamTests(_HttpCase):

@@ -478,11 +478,15 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   tokens"), and on `/v1/messages` Anthropic's `invalid_request_error` "prompt is too long: N tokens > M maximum" (the
   text Claude Code reads before it compacts its conversation; M = C - 17) with the same two fields. Streams get it as
   the status before the stream starts.
-- Limits (environment, read at startup): a request body needs a Content-Length (411 without one, also for chunked
-  bodies; 400 when malformed) of at most `MK_MAX_BODY_MB` MB (default 128; 413, refused before the body is read, also
-  on `Expect: 100-continue`). At most `MK_MAX_IMAGES` images per request (default 32; 400) and `MK_MAX_VIDEO_FRAMES`
-  video frames (default 256, all videos of the request; 400 as soon as the frame past it is decoded), and no more
-  images are decoded once the prompt cannot fit the context. The image library refuses an image of more than
+- Limits (environment, read at startup): a request body needs a Content-Length (411 without one; 400 when malformed)
+  of at most `MK_MAX_BODY_MB` MB (default 128; 413, refused before the body is read, also on `Expect:
+  100-continue`), or `Transfer-Encoding: chunked` (Node's `fetch` with a stream body, Go clients, proxies that do not
+  buffer; as llama-server): the chunks are decoded into a buffer of at most `MK_MAX_BODY_MB` MB (413 as soon as a chunk
+  would pass it), extensions and trailers are dropped, and a malformed size line (not hex, over 16 digits, no CRLF
+  within 4096 bytes), chunk data without its CRLF or more than 64 trailer lines is a 400 that closes the connection;
+  another transfer coding is a 501, a Content-Length next to it a 400. At most `MK_MAX_IMAGES` images per request
+  (default 32; 400) and `MK_MAX_VIDEO_FRAMES` video frames (default 256, all videos of the request; 400 as soon as
+  the frame past it is decoded), and no more images are decoded once the prompt cannot fit the context. The image library refuses an image of more than
   `MK_IMAGE_MAX_PIXELS` pixels (default 100,000,000) from its header, before decoding it. Measured on 2026-10-17
   without the limit: a 446 KB PNG declaring 12000 x 12000 pixels took 39 s and 0.9 GB of server memory (decode, then
   4096 tokens encoded); a 20000 x 20000 one asks stb_image for ~2.4 GB.

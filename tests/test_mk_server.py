@@ -694,8 +694,8 @@ class BodyLimitTests(_HttpCase):
             self.assertIn(b"Connection: close", raw)
         raw = http_.raw(self.HEAD + b"\r\n" + body)  # no Content-Length
         self.assertEqual(self._status(raw), 411, raw[:200])
-        raw = http_.raw(self.HEAD + b"Transfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n" % (len(body), body))
-        self.assertEqual(self._status(raw), 411, raw[:200])
+        raw = http_.raw(self.HEAD + b"Transfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n" % (len(body), body), until=b"}")
+        self.assertEqual(self._status(raw), 200, raw[:200])  # (chunked bodies: tests/test_server_api.py)
         raw = http_.raw(self.HEAD + b"Content-Length: 5\r\nContent-Length: 6\r\n\r\n" + body)
         self.assertEqual(self._status(raw), 400, raw[:200])
         self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0], 200)
