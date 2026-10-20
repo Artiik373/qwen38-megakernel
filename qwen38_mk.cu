@@ -149,7 +149,10 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 // device-to-host copy), the barrier counts run on across launches (each launch starts from the counts the previous one
 // left, kept in cB.bar words; wrap-safe compares) so launch() zeroes them only once, and dv_add uploads asynchronously
 // from pinned staging on the launch stream. Bitwise exact (no device arithmetic changes). Aimed at the native Windows
-// build (fewer copy-engine switches per launch); no measurable change on Linux (agent_xdec).
+// build (fewer copy-engine switches per launch). Linux A-B-A 2026-10-20 (served flags, -d 7, two timing holds): decode
+// +0.97 / +1.28% at 38k, +0.74 / +1.20% at 101.6k, +1.05 / +1.34% short; in MK_PROFILE the DRAM-bound phases run ~1-2%
+// faster per call too (cause not established; agent_xdec's 10-17 run, with its resid_wv change, saw no change).
+// +16 B mk_cycle stack frame (+2 MiB local memory).
 #ifndef MK_EGRESS
 #define MK_EGRESS 0
 #endif

@@ -727,7 +727,8 @@ placed a color change at the right time after 30 s of feed.
   wait only for that, instead of a grid barrier over all blocks. Bitwise exact; decode +0.4% at 38k, +0.6% at 101.6k and
   +0.4% on short prompts (A-B-A, 2026-10-20). `-DMK_EGRESS=1` (off by default) also drops the per-launch device-to-host
   copy and barrier reset: the kernel writes its control block to mapped host memory and the barrier counts carry over
-  between launches (no change on Linux; meant for the native Windows build).
+  between launches. Bitwise exact; on Linux decode +1.0..1.3% at 38k, +0.7..1.2% at 101.6k and +1.0..1.3% on short
+  prompts (two A-B-As, 2026-10-20); 2 MiB more VRAM.
 - **Attention**: split-K flash decoding with tensor-core MMAs (Q.K^T and P.V in fp16 with fp32 accumulation, online
   softmax) over 32-position K/V tiles; the chunk boundaries depend on the context length only, so greedy output does
   not depend on the draft depth. With the q8 cache (`attn_core_q8`) each block runs a three-deep software pipeline with
