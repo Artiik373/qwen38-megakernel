@@ -1542,7 +1542,28 @@ def _anthropic_image(src):
     raise BadRequest(f"image source type {src.get('type')!r} is not supported (base64)")
 
 
-def _tool_result(content):
+def _anthropic_document(b, notes):
+    """a document block's text: plain-text and content sources (title and context first); None for the others (PDF,
+    URL, file: skipped with a note)"""
+    src = b.get("source") if isinstance(b.get("source"), dict) else {}
+    if src.get("type") == "text":
+        text = str(src.get("data") or "")
+    elif src.get("type") == "content" and isinstance(src.get("content"), (str, list)):
+        c = src["content"]
+        text = c if isinstance(c, str) else "\n".join(
+            str(x.get("text") or "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+    else:
+        notes.append(("anthropic-doc-" + str(src.get("type")), f"Anthropic document source {src.get('type')!r} is not "
+                       "supported (text and content sources are): the document is skipped"))
+        return None
+    return "\n\n".join(s for s in (str(b.get("title") or ""), str(b.get("context") or ""), text) if s)
+
+
+def _skipped_block(t, notes, where="content"):
+    notes.append((f"anthropic-block-{t}", f"Anthropic {where} block type {t!r} is not supported: skipped (as llama-server)"))
+
+
+def _tool_result(content, notes):
     """a tool_result block's content as an OpenAI tool message's: a string, or parts when it has images"""
     if content is None or isinstance(content, str):
         return content or ""
@@ -1550,24 +1571,34 @@ def _tool_result(content):
         raise BadRequest("tool_result content: a string or an array of blocks")
     parts = []
     for c in content:
-        t = c.get("type") if isinstance(c, dict) else None
+        if not isinstance(c, dict):
+            raise BadRequest("tool_result content: blocks must be objects")
+        t = c.get("type")
         if t == "text":
             parts.append({"type": "text", "text": str(c.get("text") or "")})
         elif t == "image":
             parts.append({"type": "image_url", "image_url": {"url": _anthropic_image(c.get("source"))}})
+        elif t == "document":
+            text = _anthropic_document(c, notes)
+            if text is not None:
+                parts.append({"type": "text", "text": text})
         else:
-            raise BadRequest(f"tool_result content block type {t!r} is not supported (text, image)")
+            _skipped_block(t, notes, "tool_result content")
     if any(p["type"] == "image_url" for p in parts):
         return parts
     return "\n".join(p["text"] for p in parts)
 
 
-def anthropic_to_chat(body):
+def anthropic_to_chat(body, notes=None):
     """an Anthropic Messages request as the server's chat request. system: a string or text blocks (joined by blank
     lines); content blocks text / image / thinking (-> reasoning_content) / tool_use (-> tool_calls) / tool_result (->
-    tool messages, before the rest of their message: they answer the previous turn's calls); tools input_schema ->
-    parameters; tool_choice auto / none / any / tool; stop_sequences -> stop; thinking enabled / adaptive -> thinking on,
-    disabled or absent -> off (Anthropic's default; chat_template_kwargs win)"""
+    tool messages, before the rest of their message: they answer the previous turn's calls) / document (plain-text and
+    content sources -> text); other block types are skipped, as llama-server does; tools input_schema -> parameters,
+    any tool type (Anthropic's typed client and server tools too) as a function with its input_schema or none, as
+    llama-server does; tool_choice auto / none / any / tool; stop_sequences -> stop; thinking enabled / adaptive ->
+    thinking on, disabled or absent -> off (Anthropic's default; chat_template_kwargs win). notes: gets (key, message)
+    for what was skipped or converted (the console's one-time warnings)"""
+    notes = [] if notes is None else notes
     if not isinstance(body.get("messages"), list):
         raise BadRequest("messages: an array of messages is required")
     msgs = []
@@ -1581,8 +1612,10 @@ def anthropic_to_chat(body):
             raise BadRequest("system: a string or an array of text blocks")
         msgs.append({"role": "system", "content": "\n\n".join(BILLING_RE.sub(r"\1fffff;", t) for t in texts)})
     for m in body["messages"]:
-        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
-            raise BadRequest("messages: each message needs the role user or assistant")
+        # (a system message inside the conversation: Claude Code sends some; the chat template decides whether it can
+        # render one there, as llama-server leaves it to the template)
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant", "system"):
+            raise BadRequest("messages: each message needs the role user, assistant or system")
         role, content = m["role"], m.get("content")
         if isinstance(content, str):
             msgs.append({"role": role, "content": content})
@@ -1591,7 +1624,9 @@ def anthropic_to_chat(body):
             raise BadRequest("message content: a string or an array of content blocks")
         parts, calls, results, thinking = [], [], [], ""
         for b in content:
-            t = b.get("type") if isinstance(b, dict) else None
+            if not isinstance(b, dict):
+                raise BadRequest("message content: content blocks must be objects")
+            t = b.get("type")
             if t == "text":
                 parts.append({"type": "text", "text": str(b.get("text") or "")})
             elif t == "image":
@@ -1605,9 +1640,13 @@ def anthropic_to_chat(body):
                     "name": str(b.get("name") or ""), "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False)}})
             elif t == "tool_result":
                 results.append({"role": "tool", "tool_call_id": str(b.get("tool_use_id") or ""),
-                                "content": _tool_result(b.get("content"))})
-            else:
-                raise BadRequest(f"content block type {t!r} is not supported (text, image, thinking, tool_use, tool_result)")
+                                "content": _tool_result(b.get("content"), notes)})
+            elif t == "document":
+                text = _anthropic_document(b, notes)
+                if text is not None:
+                    parts.append({"type": "text", "text": text})
+            else:  # (server tool blocks, search results, container uploads, ...)
+                _skipped_block(t, notes)
         msgs += results
         if parts or calls or thinking:
             nm = {"role": role, "content": parts[0]["text"] if len(parts) == 1 and parts[0]["type"] == "text"
@@ -1630,10 +1669,14 @@ def anthropic_to_chat(body):
             raise BadRequest("tools: an array of tools")
         out["tools"] = []
         for t in tools:
-            if not isinstance(t, dict) or t.get("type") not in (None, "custom") or not t.get("name"):
-                raise BadRequest(f"tools: only custom tools (name, input_schema), not {str(t)[:80]!r}")
+            if not isinstance(t, dict) or not t.get("name"):
+                raise BadRequest(f"tools: each tool needs a name, not {str(t)[:80]!r}")
+            if t.get("type") not in (None, "custom"):  # (e.g. bash_20250124, web_search_20250305)
+                notes.append((f"anthropic-tool-{t['type']}", f"Anthropic tool type {t['type']!r} ({t['name']}) is offered "
+                              f"to the model as a plain function{'' if t.get('input_schema') else ' without parameters'}"
+                              " (as llama-server): a call to it comes back as a tool_use block for the client"))
             out["tools"].append({"type": "function", "function": {
-                "name": t["name"], "description": t.get("description") or "", "parameters": t.get("input_schema") or {}}})
+                "name": str(t["name"]), "description": t.get("description") or "", "parameters": t.get("input_schema") or {}}})
     tc = body.get("tool_choice")
     if tc is not None:
         kind = tc.get("type") if isinstance(tc, dict) else None
@@ -2986,11 +3029,19 @@ def make_handler(srv):
             return {"input_tokens": srv.prompt_tokens(body), "object": "response.input_tokens"}
 
         def _count_tokens(self, body):
-            return {"input_tokens": srv.prompt_tokens(anthropic_to_chat(body))}
+            return {"input_tokens": srv.prompt_tokens(self._anthropic_chat(body))}
 
         # ---- Anthropic Messages ----
+        def _anthropic_chat(self, body):
+            """anthropic_to_chat; what it skipped or converted is a one-time console warning per kind"""
+            notes = []
+            chat = anthropic_to_chat(body, notes)
+            for key, msg in notes:
+                srv.warn_once(key, msg)
+            return chat
+
         def _anthropic(self, body):
-            chat = anthropic_to_chat(body)
+            chat = self._anthropic_chat(body)
             model = body.get("model") if isinstance(body.get("model"), str) and body.get("model") else srv.model_id
             if chat["stream"]:
                 return self._anthropic_stream(chat, model)

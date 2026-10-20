@@ -1174,9 +1174,8 @@ class AnthropicTests(_HttpCase):
                          {"enable_thinking": False})
         self.assertEqual(a2c({"messages": [], "chat_template_kwargs": {"enable_thinking": True}})["chat_template_kwargs"],
                          {"enable_thinking": True})
-        for bad in ({"messages": "x"}, {"messages": [{"role": "system", "content": "x"}]},
-                    {"messages": [{"role": "user", "content": [{"type": "document", "source": {}}]}]},
-                    {"messages": [], "tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+        for bad in ({"messages": "x"}, {"messages": [{"role": "tool", "content": "x"}]},
+                    {"messages": [{"role": "user", "content": ["text"]}]}, {"messages": [], "tools": [{"type": "bash"}]},
                     {"messages": [], "tool_choice": {"type": "any"}}, {"messages": [], "thinking": {"type": "on"}},
                     {"messages": [], "stop_sequences": "x" * 2000}):
             with self.assertRaises(self.mk.BadRequest, msg=str(bad)):

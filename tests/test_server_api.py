@@ -172,6 +172,7 @@ class ToolCallStreamTests(_HttpCase):
         c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=20)
         c.request("POST", "/v1/messages", json.dumps(body))
         whole = json.loads(c.getresponse().read())
+        c.close()
         raw = http_.raw(_request({**body, "stream": True}).replace(b"/v1/chat/completions", b"/v1/messages"), until=b"0\r\n\r\n")
         _, ev = _sse_events(raw)
         starts = [(d["index"], d["content_block"]) for n, d in ev if n == "content_block_start"]
@@ -187,6 +188,85 @@ class ToolCallStreamTests(_HttpCase):
             self.assertEqual(json.loads("".join(inputs[i])), u["input"])
         self.assertEqual(ev[-2][1]["delta"]["stop_reason"], "tool_use")
         self.assertEqual([n for n, _ in ev].count("content_block_stop"), 3)
+
+
+class AnthropicBlockTests(_HttpCase):
+    """G1: Anthropic typed tools become functions, unknown content blocks are skipped (as llama-server), documents with
+    a text source become text; each kind is a one-time console warning"""
+
+    def test_typed_tools(self) -> None:
+        notes = []
+        tools = [{"name": "read", "description": "reads", "input_schema": {"type": "object", "properties": {}}},
+                 {"type": "custom", "name": "c", "input_schema": {"type": "object"}},
+                 {"type": "bash_20250124", "name": "bash"}, {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool"},
+                 {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+        out = self.mk.anthropic_to_chat({"messages": [], "tools": tools}, notes)
+        self.assertEqual([t["function"] for t in out["tools"]], [
+            {"name": "read", "description": "reads", "parameters": {"type": "object", "properties": {}}},
+            {"name": "c", "description": "", "parameters": {"type": "object"}},
+            {"name": "bash", "description": "", "parameters": {}},
+            {"name": "str_replace_based_edit_tool", "description": "", "parameters": {}},
+            {"name": "web_search", "description": "", "parameters": {}}])
+        self.assertEqual([k for k, _ in notes], ["anthropic-tool-bash_20250124", "anthropic-tool-text_editor_20250728",
+                                                 "anthropic-tool-web_search_20250305"])
+        for bad in ([{"type": "bash_20250124"}], ["bash"], [{"name": ""}]):
+            with self.assertRaises(self.mk.BadRequest):
+                self.mk.anthropic_to_chat({"messages": [], "tools": bad})
+
+    def test_blocks(self) -> None:
+        notes = []
+        content = [{"type": "text", "text": "Summarize."},
+                   {"type": "document", "title": "notes.txt", "source": {"type": "text", "media_type": "text/plain", "data": "A B"}},
+                   {"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": "one"},
+                                                                              {"type": "text", "text": "two"}]},
+                    "context": "ctx"},
+                   {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+                   {"type": "search_result", "source": "https://x", "title": "t", "content": [{"type": "text", "text": "s"}]},
+                   {"type": "container_upload", "file_id": "f"}]
+        msgs = [{"role": "user", "content": content},
+                {"role": "assistant", "content": [
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "q"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                    {"type": "text", "text": "Found it."},
+                    {"type": "tool_use", "id": "toolu_9", "name": "read", "input": {"p": 1}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_9", "content": [
+                    {"type": "text", "text": "r1"}, {"type": "document", "source": {"type": "text", "data": "d1"}},
+                    {"type": "search_result", "source": "u", "title": "t", "content": []}]}]}]
+        m = self.mk.anthropic_to_chat({"messages": msgs}, notes)["messages"]
+        self.assertEqual(m[0], {"role": "user", "content": [{"type": "text", "text": "Summarize."},
+                                                             {"type": "text", "text": "notes.txt\n\nA B"},
+                                                             {"type": "text", "text": "ctx\n\none\ntwo"}]})
+        self.assertEqual((m[1]["content"], [c["function"]["name"] for c in m[1]["tool_calls"]]), ("Found it.", ["read"]))
+        self.assertEqual(m[2], {"role": "tool", "tool_call_id": "toolu_9", "content": "r1\nd1"})
+        self.assertEqual(sorted({k for k, _ in notes}), [
+            "anthropic-block-container_upload", "anthropic-block-search_result", "anthropic-block-server_tool_use",
+            "anthropic-block-web_search_tool_result", "anthropic-doc-base64"])
+
+    def test_system_messages_inside_the_conversation(self) -> None:
+        # (Claude Code 2.1 sends its reminders as a system message after the first user message: was a 400)
+        body = {"system": [{"type": "text", "text": "S"}], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
+            {"role": "system", "content": [{"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "system", "content": "plain"}]}
+        m = self.mk.anthropic_to_chat(body)["messages"]
+        self.assertEqual([x["role"] for x in m], ["system", "user", "system", "system"])
+        self.assertEqual((m[2]["content"], m[3]["content"]), ("reminder", "plain"))
+
+    def test_http(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["Hello", "."]))
+        body = {"model": "m", "max_tokens": 20, "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}],
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"},
+                                                          {"type": "redacted_thinking", "data": "x"},
+                                                          {"type": "mcp_tool_use", "id": "m", "name": "n", "input": {}}]}]}
+        for path in ("/v1/messages", "/v1/messages", "/v1/messages/count_tokens"):
+            c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+            c.request("POST", path, json.dumps(body))
+            r = c.getresponse()
+            o = json.loads(r.read())
+            c.close()
+            self.assertEqual(r.status, 200, o)
+        self.assertEqual(o, {"input_tokens": len(srv.render(self.mk.anthropic_to_chat(body))[0])})
+        self.assertTrue({"anthropic-tool-web_fetch_20250910", "anthropic-block-mcp_tool_use"} <= srv.warned)
 
 
 class SdkStreamTests(_HttpCase):
