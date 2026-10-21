@@ -211,7 +211,8 @@ conversations only between replies (a reply in progress is never paused):
   conversation is slower, because page-locked memory is allocated at ~1 GB/s (5.7 s for 120k tokens); after that the
   memory is reused. A request that repeats the cached conversation up to its first reply and differs only later (a
   client that edits its own history: a moved memory block, cleared tool results, an edited chat message) continues it
-  and parks nothing.
+  and parks nothing. Conversations a client is unlikely to continue (one it has just summarised to compact it, and the
+  summary request's own) are parked with low priority and go first when host memory is full.
 - **Side requests:** a new conversation's first request of at most `MK_SIDE_MAX` tokens (default 8192; `0` = off) that
   would otherwise throw away a much longer cached conversation, such as a client's title request, runs beside it. Only
   the rows it overwrites go to host memory and back (12-20 ms), and the cached conversation is not touched. With

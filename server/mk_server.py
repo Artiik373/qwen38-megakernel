@@ -2206,11 +2206,14 @@ class FifoLock:
 
 class Parked:
     """a conversation parked in the engine's host store (Engine.park): what the server matches prompts against. side: a
-    side request's own conversation (Engine.side_end_park), evicted before the others"""
+    side request's own conversation (Engine.side_end_park); low: one that is likely never continued (a summary request's
+    and the conversation it summarised: Server.cache_switch); both kinds are evicted before the others. tools: its last
+    request had tools (None: unknown)"""
 
-    def __init__(self, pid, seq, cks, committed, img_spans, gen, nbytes, side=False):
+    def __init__(self, pid, seq, cks, committed, img_spans, gen, nbytes, side=False, low=False, tools=None):
         self.id, self.seq, self.cks, self.committed = pid, seq, cks, committed
         self.img_spans, self.gen, self.nbytes, self.t, self.side = img_spans, gen, nbytes, time.time(), side
+        self.low, self.tools = low, tools
 
 
 SIDE_STORE_MIB = 1024  # host store of side requests when parking is off (--park-mib 0)
@@ -2245,9 +2248,15 @@ class Server:
     side = None
     side_ready = False
     live_gen = -1
+    # whether the live conversation's last request had tools (None: unknown), and why the live conversation is parked
+    # with low priority when another one replaces it ("": it is not); cache_switch decides next_low for the request it
+    # runs, which becomes live_low once its prompt is processed
+    live_tools = None
+    live_low = next_low = ""
     asst_marker = ()  # the tokens of "<|im_start|>assistant": where a prompt's first reply starts (Server.first_reply)
-    # (parked, bytes in use, bytes allocated, their token counts, how many are side requests' own): /metrics and /props read it
-    store_gauge = (0, 0, 0, (), 0)
+    # (parked, bytes in use, bytes allocated, their token counts, how many are side requests' own, how many have low
+    # priority): /metrics and /props read it
+    store_gauge = (0, 0, 0, (), 0, 0)
     cache_pre = ""  # what the host cache did for the running request (before cache_note on the prompt line)
 
     def __init__(self, args):
@@ -2379,7 +2388,7 @@ class Server:
         tools continues as side requests. A new agent session's first turn (tools, a long reply) parks the live
         conversation like any conversation, so its next turns find it cached."""
         eng, a = self.eng, self.args
-        self.cache_pre = ""
+        self.cache_pre, self.next_low = "", ""
         seq = eng.sequence()
         live = self.resume_point(seq, eng.committed(), eng.checkpoints(), self.img_spans, toks, spans)
         lost = len(seq) - live[2]  # cached positions the normal path would discard
@@ -2406,11 +2415,15 @@ class Server:
                 if r[2] >= live[2] + a.park_min and (best is None or r[2] > best[1][2]):
                     best = (e, r)
             if best:
-                self.park_live(seq, "another conversation came back", keep=best[0].id)
+                self.park_live(seq, "another conversation came back", keep=best[0].id, low=self.live_low)
                 self.unpark(best[0])
                 return
         if side_ok and first_turn:
-            self.side_start(seq, len(toks), max_tokens)
+            # a long one beside the live conversation (a summary of it?): if the next request replaces the live
+            # conversation instead of continuing it, it was the summarised one, parked with low priority
+            after = "replaced right after a long request without tools beside it" if (
+                not tools and len(toks) >= a.park_min and a.park_mib > 0) else ""
+            self.side_start(seq, len(toks), max_tokens, after=after)
             return
         if a.park_mib > 0 and not cont and lost >= a.park_min:
             k = self.first_reply(toks)
@@ -2421,8 +2434,13 @@ class Server:
                 # keep is never continued
                 log(f"#{self.rid} not parked: the request continues the cached conversation with its history edited "
                     f"(the prompt matches {live[0]:,} of the {len(seq):,} cached tok, past its first reply at {k:,})")
-            else:
-                self.park_live(seq, "a new conversation")
+                return
+            # a request without tools that replaces a conversation whose last request had tools is how clients summarise
+            # a conversation (compaction); the compacted conversation then replaces the summary's: both copies are
+            # likely dead, parked with low priority (evicted before real parked conversations)
+            debris = "" if tools or not self.live_tools else "replaced by a request without tools"
+            self.park_live(seq, "a new conversation", low=self.live_low or debris)
+            self.next_low = debris and "the conversation of a request without tools that replaced one with tools"
 
     def first_reply(self, toks):
         """the position of the prompt's first assistant message (its <|im_start|>assistant tokens; a prompt without
@@ -2444,20 +2462,22 @@ class Server:
         """refreshes store_gauge (on the request thread: /metrics and /props never call into the engine)"""
         info = self.eng.store_info()
         self.store_gauge = (len(self.parked), info["used"], info["allocated"], tuple(len(e.seq) for e in self.parked.values()),
-                            sum(e.side for e in self.parked.values()))
+                            sum(e.side for e in self.parked.values()), sum(e.low for e in self.parked.values()))
         return info
 
     def make_room(self, need, budget, keep=None, side_only=False):
-        """evicts parked conversations, side requests' own ones first, each kind least recently parked first (never
-        `keep`, the one about to be restored; side_only: no other kind), until `need` more bytes fit in `budget`; False:
-        they do not"""
+        """evicts parked conversations, side requests' own ones and low-priority ones first, each tier least recently
+        parked first (never `keep`, the one about to be restored; side_only: only those), until `need` more bytes fit in
+        `budget`; False: they do not"""
         while self.eng.store_info()["used"] + need > budget:
-            pid = next((p for p, e in self.parked.items() if p != keep and e.side), None)
+            pid = next((p for p, e in self.parked.items() if p != keep and (e.side or e.low)), None)
             if pid is None and not side_only:
                 pid = next((p for p in self.parked if p != keep), None)
             if pid is None:
                 return False
-            self.evict(pid, f"least recently parked{', a side request' if self.parked[pid].side else ''}) to make room")
+            e = self.parked[pid]
+            kind = ", a side request" if e.side else ", low priority" if e.low else ""
+            self.evict(pid, f"least recently parked{kind}) to make room")
         return True
 
     def evict(self, pid, why):
@@ -2467,9 +2487,9 @@ class Server:
         self.store_update()
         log(f"#{self.rid} evicted the parked conversation of {len(e.seq):,} tok ({mib(e.nbytes)}, {why}")
 
-    def park_live(self, seq, why, keep=None):
+    def park_live(self, seq, why, keep=None, low=""):
         """a snapshot of the live conversation into the host store (the engine keeps it too); keep: a parked one that must
-        stay (it is restored next)"""
+        stay (it is restored next); low: why it is parked with low priority ("": it is not)"""
         eng, a = self.eng, self.args
         if len(seq) < a.park_min:
             return
@@ -2484,9 +2504,11 @@ class Server:
         if pid is None:
             log(f"#{self.rid} not parked: no room in the host store for the cached {len(seq):,} tok ({mib(need)})")
             return
-        self.parked[pid] = Parked(pid, seq, cks, eng.committed(), self.img_spans, self.live_gen, need)
+        self.parked[pid] = Parked(pid, seq, cks, eng.committed(), self.img_spans, self.live_gen, need, low=bool(low),
+                                  tools=self.live_tools)
         info = self.store_update()
         self.count(parks=1)
+        why += f", low priority: {low}" if low else ""
         log(f"#{self.rid} parked the cached conversation ({why}): {len(seq):,} tok, {mib(info['last_bytes'])} copied in "
             f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} of {a.park_mib:,} MiB")
 
@@ -2501,16 +2523,17 @@ class Server:
             self.store_update()
             raise
         del self.parked[e.id]
-        self.img_spans, self.live_gen = e.img_spans, e.gen
+        self.img_spans, self.live_gen, self.live_tools, self.live_low = e.img_spans, e.gen, e.tools, ""
         info = self.store_update()
         self.count(park_restores=1)
         self.cache_pre = f"restored a parked conversation ({len(e.seq):,} tok); "
         log(f"#{self.rid} restored the parked conversation of {len(e.seq):,} tok: {mib(info['last_bytes'])} copied in "
             f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} in use")
 
-    def side_start(self, seq, n, max_tokens=-1, resume=None):
+    def side_start(self, seq, n, max_tokens=-1, resume=None, after=""):
         """runs the request as a side request: the live sequence stays cached (Engine.side_begin; side_finish brings it
-        back after the reply). resume: a side request's parked conversation it continues (Engine.side_unpark)"""
+        back after the reply). resume: a side request's parked conversation it continues (Engine.side_unpark); after:
+        the low-priority reason the live conversation gets when it is back ("": its own)"""
         eng = self.eng
         # room for what the request may overwrite: its prompt and its reply (max_tokens, else SIDE_REPLY_ROOM: past that
         # the engine saves more rows while there is room, else the kept sequence is dropped), and the checkpoint blocks
@@ -2522,7 +2545,8 @@ class Server:
         if not eng.side_begin():
             log(f"#{self.rid} side request: no room in the host store: the cached {len(seq):,} tok are not kept")
             return
-        self.side, self.side_ready = (len(seq), self.img_spans, self.live_gen), False
+        self.side = (len(seq), self.img_spans, self.live_gen, self.live_tools, after or self.live_low)
+        self.side_ready = False
         self.count(side_requests=1)
         self.cache_pre = f"side request: the cached {len(seq):,} tok are kept aside; "
         if resume is not None:
@@ -2531,7 +2555,7 @@ class Server:
                     f"{len(resume.seq):,} tok")
                 return
             del self.parked[resume.id]
-            self.img_spans, self.live_gen = resume.img_spans, resume.gen
+            self.img_spans, self.live_gen, self.live_tools = resume.img_spans, resume.gen, resume.tools
             info = self.store_update()
             self.count(side_resumed=1)
             self.cache_pre += f"its parked conversation ({len(resume.seq):,} tok) restored in {info['last_ms']:.0f} ms; "
@@ -2542,7 +2566,7 @@ class Server:
         checkpoint to resume from)"""
         if self.side is None:
             return
-        n, spans, gen = self.side
+        n, spans, gen, tools, low = self.side
         self.side, eng, a = None, self.eng, self.args
         ok, pid, own, room = False, None, None, True
         try:
@@ -2566,7 +2590,7 @@ class Server:
         info = self.store_update()
         kept = ""
         if pid is not None:
-            self.parked[pid] = Parked(pid, *own, side=True)
+            self.parked[pid] = Parked(pid, *own, side=True, tools=self.live_tools)
             info = self.store_update()
             self.count(side_kept=1)
             kept = (f"; its own conversation ({len(own[0]):,} tok) parked: {mib(info.get('side_park_bytes', 0))} in "
@@ -2574,7 +2598,7 @@ class Server:
         elif own is not None and ok:
             kept = "; its own conversation was not parked (no room in the host store)"
         if ok:
-            self.img_spans, self.live_gen = spans, gen
+            self.img_spans, self.live_gen, self.live_tools, self.live_low = spans, gen, tools, low
             log(f"#{self.rid} side request done: the cached {n:,} tok are back ({mib(info['last_bytes'])}: kept in "
                 f"{info['side_ms']:.0f} ms, back in {info['last_ms']:.0f} ms){kept}")
         elif own is not None and room:  # (side_end_park: the kept sequence was lost, the side request's conversation stays)
@@ -2582,7 +2606,7 @@ class Server:
             log(f"#{self.rid} side request: the cached {n:,} tok were dropped (the host store ran full): the side "
                 f"request's own conversation ({len(own[0]):,} tok) stays cached")
         else:
-            self.img_spans, self.live_gen = [], -1
+            self.img_spans, self.live_gen, self.live_tools, self.live_low = [], -1, None, ""
             self.count(side_dropped=1)
             log(f"#{self.rid} side request: the cached {n:,} tok were dropped (the host store ran full, or an engine "
                 f"error): the next request prefills its prompt in full")
@@ -2671,6 +2695,7 @@ class Server:
                 "budget_mib": self.store_mib, "side_max": g(a, "side_max"), "park_mib": g(a, "park_mib"),
                 "park_min": g(a, "park_min"), "park_checkpoints": g(a, "park_cks"), "parked": self.store_gauge[0],
                 "parked_tokens": list(self.store_gauge[3]), "parked_side": self.store_gauge[4],
+                "parked_low": self.store_gauge[5],
                 "side_conversations": bool(self.side_keep()), "used_mib": round(self.store_gauge[1] / 2**20, 1),
                 "allocated_mib": round(self.store_gauge[2] / 2**20, 1)},
             "vision": None if v is None else {
@@ -3037,7 +3062,7 @@ class Server:
                 self.cache_note = f"CACHE MISS: {had}, no checkpoint before that" if seq else "nothing cached"
                 r = feed(0)
         self.img_spans = spans
-        self.live_gen = gen
+        self.live_gen, self.live_tools, self.live_low = gen, tools, self.next_low
         self.side_ready = self.side is not None
         self.cache_note = self.cache_pre + self.cache_note
         return r

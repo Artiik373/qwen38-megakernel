@@ -1,6 +1,7 @@
 """Tests of server/mk_server.py's host cache policy without a GPU: which requests run as side requests (a one-shot
-without tools, whatever its max_tokens) and which edits of a conversation's history park nothing, with request shapes
-the agent harnesses send. Fake engines and the test server come from test_mk_server.py and test_engine_side.py."""
+without tools, whatever its max_tokens), which edits of a conversation's history park nothing, and which parked
+conversations have low priority (compaction debris), with request shapes the agent harnesses send. Fake engines and the
+test server come from test_mk_server.py and test_engine_side.py."""
 import os
 import sys
 import unittest
@@ -128,7 +129,7 @@ class EditedHistoryTests(base._HttpCase):
     CATALOG = " <reminder>memory catalog: " + "entry " * 12 + "</reminder>"  # (Qwen Code's moving block)
 
     def serve(self, eng, ctx=4096):
-        srv, http_ = super().serve(eng, ctx)
+        srv, http_ = base._HttpCase.serve(self, eng, ctx)
         srv.im_start = ord("<")  # (the test tokenizer: one token per character)
         srv.asst_marker = tuple(ord(c) for c in "<|im_start|>assistant")
         srv.args.ck_msgs = 1  # (a checkpoint at each message start, as the server's default)
@@ -200,6 +201,116 @@ class EditedHistoryTests(base._HttpCase):
         srv.asst_marker = ()  # (a vocabulary without a single <|im_start|> token)
         self.quiet(lambda: (self.chat(http_, first, tools=TOOLS), self.chat(http_, second, tools=TOOLS)))
         self.assertEqual([o[0] for o in eng.ops], ["park"])
+
+
+class DebrisTests(base._HttpCase):
+    """S3: a summary request (no tools) that replaces a conversation with tools parks it with low priority, and the
+    summary's own conversation is low too when the compacted conversation replaces it; low entries go before real
+    parked conversations"""
+
+    chat, quiet = base.HostCacheTests.chat, base.HostCacheTests.quiet
+    LONG = base.HostCacheTests.LONG
+    serve = EditedHistoryTests.serve
+
+    def setup(self, side_max=200, park_mib=4):
+        eng = side._SideEngine(["a", "b"])
+        srv, http_ = base.HostCacheTests.serve_store(self, eng, side_max=side_max, park_mib=park_mib)
+        return eng, srv, http_
+
+    @staticmethod
+    def entries(srv):
+        """the parked conversations, least recently parked first: (tokens, side, low)"""
+        return [(len(e.seq), e.side, e.low) for e in srv.parked.values()]
+
+    def compaction(self, http_, task, summary_msgs, after=""):
+        """an agent conversation (tools), its summary request (no tools), the compacted conversation (tools)"""
+        self.chat(http_, [{"role": "user", "content": task + self.LONG}], tools=TOOLS)
+        r = self.chat(http_, summary_msgs)
+        summary = "Summary: " + r["choices"][0]["message"]["content"] + " go on" + after
+        self.chat(http_, [{"role": "user", "content": summary}], tools=TOOLS)
+
+    def test_a_summary_and_the_conversation_it_replaced_are_parked_with_low_priority(self) -> None:
+        eng, srv, http_ = self.setup()
+        summary = "Summarize this conversation for a continuation: " + "the user asked to read files. " * 6
+        log = self.quiet(lambda: self.compaction(http_, "A: ", [{"role": "system", "content": "You summarize."},
+                                                               {"role": "user", "content": summary}]))
+        self.assertIn("(a new conversation, low priority: replaced by a request without tools)", log)
+        self.assertIn("(a new conversation, low priority: the conversation of a request without tools that replaced "
+                      "one with tools)", log)
+        self.assertEqual([low for _, _, low in self.entries(srv)], [True, True], log)
+        self.assertEqual(srv.engine_info()["host_cache"]["parked_low"], 2)
+
+    def test_a_summary_with_the_whole_conversation_as_messages_is_debris_too(self) -> None:
+        eng, srv, http_ = self.setup()
+        msgs = [{"role": "system", "content": "You summarize conversations."},  # (Crush's shape: its own system prompt)
+                {"role": "user", "content": "B: " + self.LONG}, {"role": "assistant", "content": "ab"},
+                {"role": "user", "content": "Provide a detailed summary of our conversation above."}]
+        log = self.quiet(lambda: self.compaction(http_, "B: ", msgs))
+        self.assertEqual([low for _, _, low in self.entries(srv)], [True, True], log)
+
+    def test_low_priority_entries_go_before_a_real_parked_conversation(self) -> None:
+        eng, srv, http_ = self.setup(park_mib=2)  # (2 MiB: two long conversations, or one and the small debris)
+        summary = "Summarize this conversation for a continuation: " + "the user asked to read files. " * 6
+
+        def run():
+            self.chat(http_, [{"role": "user", "content": "Z: " + self.LONG}], tools=TOOLS)  # (a real conversation)
+            # (parks Z, then A with low priority, then the summary's conversation with low priority)
+            self.compaction(http_, "A: ", [{"role": "user", "content": summary}], after=self.LONG)
+            self.chat(http_, [{"role": "user", "content": "C: " + self.LONG}], tools=TOOLS)  # (parks the compacted)
+        log = self.quiet(run)
+        self.assertIn(", low priority) to make room", log)
+        z = [o for o in eng.ops if o[0] == "park"][0]  # (Z's park: never dropped)
+        self.assertNotIn(("drop", z[1]), eng.ops, log)
+        self.assertEqual(self.entries(srv)[0][:2], (z[2], False), log)
+
+    def test_after_a_long_summary_beside_it_a_replaced_conversation_is_low_a_continued_one_is_not(self) -> None:
+        summary = [{"role": "user", "content": "Summarize: " + "the user asked to read files. " * 3}]  # (side request)
+        task = [{"role": "user", "content": "A: " + self.LONG}]
+        for then, low in (([{"role": "user", "content": "Summary: done. go on"}], True),  # (the compacted one: new)
+                          (None, False)):  # (the conversation continues uncompacted, then a new one comes)
+            eng, srv, http_ = self.setup()
+
+            def run():
+                r = self.chat(http_, task, tools=TOOLS)
+                self.chat(http_, summary)
+                if then is None:
+                    self.chat(http_, task + [{"role": "assistant", "content": r["choices"][0]["message"]["content"]},
+                                             {"role": "user", "content": "more"}], tools=TOOLS)
+                self.chat(http_, then or [{"role": "user", "content": "another task"}], tools=TOOLS)
+            log = self.quiet(run)
+            self.assertIn("side request done", log)
+            real = [e for e in srv.parked.values() if not e.side]
+            self.assertEqual([e.low for e in real], [low], log)
+            if low:
+                self.assertIn("low priority: replaced right after a long request without tools beside it", log)
+
+    def test_a_low_entry_that_comes_back_is_parked_normally_again(self) -> None:
+        eng, srv, http_ = self.setup()
+        summary = "Summarize this conversation for a continuation: " + "the user asked to read files. " * 6
+
+        def run():
+            r = self.chat(http_, [{"role": "user", "content": "A: " + self.LONG}], tools=TOOLS)
+            self.chat(http_, [{"role": "user", "content": summary}])  # (A parked, low)
+            a2 = [{"role": "user", "content": "A: " + self.LONG}, {"role": "assistant", "content": "ab"},
+                  {"role": "user", "content": "more"}]
+            self.assertEqual(r["choices"][0]["message"]["content"], "ab")
+            self.chat(http_, a2, tools=TOOLS)  # (A comes back: it was real after all)
+            self.chat(http_, [{"role": "user", "content": "B: " + self.LONG}], tools=TOOLS)  # (A parked again: normal)
+        log = self.quiet(run)
+        real = [(len(e.seq), e.low) for e in srv.parked.values() if not e.side]
+        self.assertEqual(real[-1][1], False, (real, log))
+        self.assertIn("restored the parked conversation", log)
+
+    def test_make_room_takes_low_entries_with_the_side_ones(self) -> None:
+        eng, srv, _ = self.setup(park_mib=1)
+        mk = self.mk
+        for pid, kind in ((1, ""), (2, "low"), (3, "side"), (4, "")):
+            eng.entries[pid] = ([1] * 300, 0, [], 300000)
+            srv.parked[pid] = mk.Parked(pid, [1] * 300, [], 0, [], -1, 300000, side=kind == "side", low=kind == "low")
+        self.quiet(lambda: self.assertTrue(srv.make_room(100000, 1 << 20)))
+        self.assertEqual(list(srv.parked), [1, 3, 4])  # (low entry 2 first: the oldest of the low tier)
+        self.quiet(lambda: self.assertFalse(srv.make_room(700000, 1 << 20, side_only=True)))
+        self.assertEqual(list(srv.parked), [1, 4])  # (side entry 3 went; side_only takes nothing else)
 
 
 if __name__ == "__main__":

@@ -388,11 +388,11 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   (`MKEngine::side_unpark`: the cached sequence stays aside, only the rows the short conversation needs move), so a chat
   without tools (or with a capped reply) keeps its prefix cached beside a long conversation, and its replies are those
   of the same conversation on a fresh server. At most 4 of them are kept (the oldest goes first: most are clients'
-  title requests, never continued); they are evicted before any other parked conversation, and parking one never
-  evicts anything but another of them. Cost under WSL2 (q8 KV, a 1.5k-token side conversation, chunks already
-  allocated): ~25-30 ms to park it (0.4 GB: its rows, recurrent state and checkpoint) and ~8 ms to copy the slot its
-  checkpoint takes, ~25-35 ms to continue it (`side_unpark`); preset D's window rings about double that. Re-reading it
-  instead would take ~0.9 s at 1.5k tokens and ~5 s at 8k.
+  title requests, never continued); they are evicted before any other parked conversation but the low-priority ones
+  (below), and parking one never evicts anything but those. Cost under WSL2 (q8 KV, a 1.5k-token side conversation,
+  chunks already allocated): ~25-30 ms to park it (0.4 GB: its rows, recurrent state and checkpoint) and ~8 ms to copy
+  the slot its checkpoint takes, ~25-35 ms to continue it (`side_unpark`); preset D's window rings about double that.
+  Re-reading it instead would take ~0.9 s at 1.5k tokens and ~5 s at 8k.
 - **Parked conversations** (`--park-mib n`, default 8192 MiB; 0 = off): when a request belongs to another conversation
   (it would discard at least `--park-min` [1024] tokens of the cached one, does not continue its last turn, and differs
   from it before its first reply: a request that repeats the cached conversation up to its first assistant message and
@@ -406,10 +406,15 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   and its replies are the ones it would give had it never been parked (greedy and sampled; with exact reuse any
   checkpoint gives the same bits, so fewer kept checkpoints only cost a longer re-prefill after an edit). Requests run
   one at a time in arrival order and switch only between replies. Parked conversations live within the budget, the
-  least recently parked one evicted first (it is then prefilled again when it comes back). Host memory is allocated on
-  first use and kept for reuse (pinned allocation runs at ~1 GB/s under WSL2, copies at ~26 GB/s): a 38k-token
-  conversation (q8_0 KV, 37 KB per token) takes 1.9 GB with two checkpoints and ~65 ms per park or restore (a
-  101.6k-token one 4.3 GB and ~150 ms), against ~24 s (~80 s) to prefill it again.
+  least recently parked one evicted first (it is then prefilled again when it comes back), after the side
+  conversations (above) and the low-priority ones, least recently parked first among those: a conversation replaced
+  by a request without tools while its own last request had tools (agent clients summarise a conversation before
+  compacting it with such a request), the conversation of that request when the next one replaces it (the compacted
+  conversation), and a conversation replaced right after a side request without tools of at least `--park-min` prompt
+  tokens (its summary); one that comes back is a normal conversation again (console: `low priority: <why>` on the park
+  line). Host memory is allocated on first use and kept for reuse (pinned allocation runs at ~1 GB/s under WSL2,
+  copies at ~26 GB/s): a 38k-token conversation (q8_0 KV, 37 KB per token) takes 1.9 GB with two checkpoints and ~65 ms
+  per park or restore (a 101.6k-token one 4.3 GB and ~150 ms), against ~24 s (~80 s) to prefill it again.
 - **Keep-warm:** after each request (and at startup) `capi.cpp` runs a one-block, 32-thread polling kernel for
   `MK_KEEP_WARM_S` seconds (default 120, 0 = off), each launch ending itself after 50 ms; the next request stops it and
   waits a few microseconds. The driver keys the P-state to utilization, so only a continuous load holds full clocks.
