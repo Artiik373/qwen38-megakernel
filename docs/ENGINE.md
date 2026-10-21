@@ -292,9 +292,10 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
 `--reasoning-format auto|deepseek|deepseek-legacy|none` [auto; env `MK_REASONING_FORMAT`],
 `--chat-template-kwargs JSON` [none; env `MK_CHAT_TEMPLATE_KWARGS`] (both below),
 `--ck-every n` (a checkpoint every n prompt tokens [4096], 0 = off), `--ck-msgs 1|0`
-(a checkpoint at each message start [1]), `--side-max n` (side requests up to n prompt tokens [8192], 0 = off; env
-`MK_SIDE_MAX`), `--park-mib n` (host memory for parked conversations [8192], 0 = off; env `MK_PARK_MIB`), `--park-min n`
-[1024], `--park-cks n` [2] (both below), `--mmproj` (images, below), `--vision-backend auto|cpu|mtmd` [auto],
+(a checkpoint at each message start [1]), `--ck-pin 1|0` (the system prompt's checkpoint pinned [1]; below),
+`--side-max n` (side requests up to n prompt tokens [8192], 0 = off; env `MK_SIDE_MAX`), `--park-mib n` (host memory
+for parked conversations [8192], 0 = off; env `MK_PARK_MIB`), `--park-min n` [1024], `--park-cks n` [2] (both below),
+`--mmproj` (images, below), `--vision-backend auto|cpu|mtmd` [auto],
 `--vision-threads` [0 = every logical CPU but two], `--image-min-tokens` / `--image-max-tokens` [the mmproj's],
 `--image-cache` [8; images kept between requests], `--video-fps` [4], `--video-max-tokens` [0 = the image limit],
 `--video-cache` [2; videos kept between requests], `--ffmpeg` [ffmpeg on PATH; env `MK_FFMPEG`] (video, below).
@@ -356,6 +357,17 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   divergence. Checkpoints are saved inside the batched prefill (at the generation prompt, at each message start and
   every `--ck-every` tokens) into a pool of `MK_CK_SLOTS` slots in pinned host memory. Anything else starts over with a
   batched prefill.
+- **Pinned prefix checkpoint** (`--ck-pin 1|0`, default 1): the checkpoint at the end of a prompt's system message (the
+  start of the first message after it) is pinned. That is where a client's instructions and tool definitions end,
+  which every session of the client sends unchanged. The pool never evicts it (its thinning drops checkpoints that old
+  once a conversation passes ~20-35k tokens), and it is parked with the conversation, so a new session of the same
+  client (an agent's next task, another subagent of the same kind) resumes after the system prompt instead of reading
+  it again. When a new session leaves the cached conversation inside its system message (a client whose system prompt
+  ends with per-session text: a date, the working directory, a session id), that point is pinned too, and the sessions
+  after it resume there. A parked conversation that a new session restores only for its system prompt is parked again
+  at once, so it is not lost. Prompts without a system message, or with one under 1024 tokens, pin nothing. At most
+  two per conversation, inside the pool (no memory of their own; `MK_CK_SLOTS` under 8: one, under 4: none); a parked
+  conversation keeps them besides its newest `--park-cks` checkpoints. Libraries without `mk_ck_pin`: off (logged).
 - **Exact reuse** (`--exact-reuse`, sets `MK_EXACT=1`): the server never appends to rows the decode kernels wrote; it
   restores the last checkpoint at or before the divergence and prefills from there. The prefill computes rows that do
   not depend on where its chunks start (attention over absolute key segments, checkpoints on the absolute 32-token scan
@@ -401,9 +413,10 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   differs only later is that conversation with its history edited, such as a client moving or dropping a block or
   clearing old tool results, or a chat message edited, and is served from the engine's state without parking a copy
   that would never be continued; the console says so), the cached conversation is first copied to pinned host memory
-  (`MKEngine::park`: its KV rows, window rings, recurrent state, sequence, image spans, draft vocabulary and its
-  newest `--park-cks` [2] checkpoints; the engine keeps it too, so a shared system prompt is still reused). A later
-  request that continues a parked conversation better than the cached one (by at least `--park-min` tokens) parks the
+  (`MKEngine::park`: its KV rows, window rings, recurrent state, sequence, image spans, draft vocabulary, its newest
+  `--park-cks` [2] checkpoints and its pinned ones (above: one more checkpoint, 174 MiB with the q8_0 cache, 288 MiB
+  with preset D); the engine keeps it too, so a shared system prompt is still reused). A later request that continues
+  a parked conversation better than the cached one (by at least `--park-min` tokens) parks the
   cached one and restores the parked one (`MKEngine::unpark`): the engine is then bit for bit as when it was parked,
   and its replies are the ones it would give had it never been parked (greedy and sampled; with exact reuse any
   checkpoint gives the same bits, so fewer kept checkpoints only cost a longer re-prefill after an edit). Requests run

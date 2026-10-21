@@ -14,7 +14,8 @@ server around it, with image and video input. It contains:
   strings), the Anthropic Messages API (`/v1/messages`, streaming, `/v1/messages/count_tokens`: Anthropic SDK clients
   such as Claude Code), the OpenAI Responses API (`/v1/responses`, streaming, stateless: the OpenAI SDK, Codex CLI),
   llama-server's `/health`, `/props`, `/v1/models`, `/slots`, `/metrics`, `/tokenize`, `/detokenize`,
-  `/apply-template`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints.
+  `/apply-template`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints, and a new
+  session of the same client resumes after its system prompt and tools, however long the conversation before it grew.
   Several conversations (chats, coding agents) can share the engine: requests run one at a time, and the other
   conversations wait in host memory and come back bit for bit instead of being read again. After each request the
   engine keeps the GPU's clocks up for a while (keep-warm), so a reply after a pause starts at full speed.
