@@ -12,8 +12,9 @@ server around it, with image and video input. It contains:
   conversation answers bit for bit like the same request sent fresh.
 - **The server** (`server/mk_server.py`): `/v1/chat/completions` (streaming, tools, `reasoning_content`, stop
   strings), the Anthropic Messages API (`/v1/messages`, streaming, `/v1/messages/count_tokens`: Anthropic SDK clients
-  such as Claude Code), llama-server's `/health`, `/props`, `/v1/models`, `/slots`, `/metrics`, `/tokenize`,
-  `/detokenize`, `/apply-template`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints.
+  such as Claude Code), the OpenAI Responses API (`/v1/responses`, streaming, stateless: the OpenAI SDK, Codex CLI),
+  llama-server's `/health`, `/props`, `/v1/models`, `/slots`, `/metrics`, `/tokenize`, `/detokenize`,
+  `/apply-template`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints.
   Several conversations (chats, coding agents) can share the engine: requests run one at a time, and the other
   conversations wait in host memory and come back bit for bit instead of being read again. After each request the
   engine keeps the GPU's clocks up for a while (keep-warm), so a reply after a pause starts at full speed.
@@ -265,6 +266,30 @@ What the API supports:
   values as they come, other values whole); a call counts only when it is complete. One cut by `max_tokens` is
   returned as text in `content` (a stream has already started it: its arguments never become valid JSON), with
   `finish_reason` "length". A value may contain any text, tool-call markup included.
+- **OpenAI Responses API** (`/v1/responses`): stateless, as Codex CLI and other `store: false` clients use it (the whole
+  conversation in every request; `previous_response_id` is a 400). The thinking comes back as `reasoning_text` content
+  (there are no reasoning summaries), tool calls as `function_call` items streamed as they are generated; tools the
+  server would have to run (`web_search`, ...) are not offered to the model. Every turn of a conversation reuses the
+  earlier ones. Details: [docs/ENGINE.md](docs/ENGINE.md#server). Codex CLI (0.163 on native Windows), in
+  `~/.codex/config.toml`:
+  ```toml
+  model = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+  model_provider = "mk"
+  model_context_window = 230000     # the server's -c: Codex has no metadata for this model (it warns, harmless)
+  show_raw_agent_reasoning = true   # show the thinking (not in exec --json output)
+  [model_providers.mk]
+  name = "qwen38-megakernel"
+  base_url = "http://127.0.0.1:8080/v1"
+  wire_api = "responses"
+  env_key = "MK_API_KEY"            # set it to any value: the server checks no keys
+  ```
+  `model_reasoning_effort` low, medium, high (= xhigh, the template's default) and xhigh work, minimal = low, none =
+  no thinking. Tasks run (2026-10-21): create a file, find and fix a failing test, a `codex exec resume` follow-up
+  that adds a function and its test, a question about a 4,900-line file read in chunks (to 69k tokens of context),
+  an image (`-i` and Codex's `view_image` tool). A new session prefilled ~8.8k tokens (Codex's instructions and
+  tools) once, then each turn a few hundred tokens plus its tool output. In these runs `-s workspace-write` refused
+  every command ("blocked by policy"); the tasks ran with `--dangerously-bypass-approvals-and-sandbox` in scratch
+  directories.
 - **Limits:** request bodies up to 128 MB (`MK_MAX_BODY_MB`), 32 images per request (`MK_MAX_IMAGES`), 100 megapixels
   per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded), 256 video frames per request
   (`MK_MAX_VIDEO_FRAMES`: 64 s at 4 fps). A refused upload still gets its 4xx answer:
