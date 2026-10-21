@@ -315,6 +315,57 @@ What the API supports:
 
 [docs/ENGINE.md](docs/ENGINE.md#server) has the details, the server's options and the engine's environment variables.
 
+## Client configuration
+
+Agent harnesses and chat UIs that were run against the server (native Windows, 230k context, preset D, 2026-10-21).
+In every one: the base URL is the server's (`http://127.0.0.1:8080/v1`, Claude Code without `/v1`), any API key
+works, the model id is the GGUF's file name (`GET /v1/models`), and clients that take a context window or a vision flag
+from their own model tables need both set by hand: the server's `-c`, and images on when it runs with an mmproj.
+Their title, tags, commit-message and session-name requests, and most summary requests, run beside the session (side
+requests, above) with no setting of their own. What each needs:
+- **Claude Code** (2.1.306): `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, and `ANTHROPIC_MODEL`,
+  `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `_SONNET_MODEL` / `_OPUS_MODEL` set to the model id
+  (subagents and small calls use the same model). Recommended: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` = the server's `-c`
+  (it assumes 200k for an unknown model and compacts early), and `CLAUDE_CODE_ATTRIBUTION_HEADER=0` with
+  `--exclude-dynamic-system-prompt-sections`, so a new session reuses the ~9k tokens of system prompt and tools it
+  shares with the last one instead of reading them again.
+- **Codex CLI** (0.163): see the Responses API entry above.
+- **Qwen Code** (0.25.3): `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`, auth type `openai`. Needed in
+  `settings.json`: `model.generationConfig.contextWindowSize` = the server's `-c` (it assumes 1M tokens and would never
+  compact before the server's limit) and `model.generationConfig.modalities.image: true` for images (model ids that
+  start with "qwen" are taken as text-only). Recommended: `memory.enableManagedAutoMemory: false`: its memory
+  extractor runs after every reply (4-66 s here) and its memory block moves to the end of every request, so each turn
+  reads its previous reply again.
+- **Pi** (1.3.0): a `models.json` provider (`api` openai-completions, `contextWindow`, `maxTokens`, `reasoning: true`,
+  `input` text and image). Needed for `--thinking off`: `"thinkingLevelMap": {"off": "none"}` on the model (Pi sends
+  no `reasoning_effort` for off, and the template's default then thinks the most).
+- **DeepSeek Harness** (`dsh`, 0.2.1-rc.2): a `cordis.patch.yml` provider (`api` openai-completions, `baseURL`,
+  `contextWindow`, `input` text and image) and the default model; for its thinking levels a `reasoningEfforts` map
+  (`off: none`, `low: low`, `medium: medium`, `high: high`). Its session titles (4,096 tokens) need no cap.
+- **Crush** (v0.98.1): `provider add <name> --type openai-compat --base-url ...` and `model add ... --context-window
+  <-c> --default-max-tokens 32768 --supports-images true` (images need the last flag). Its title requests end in
+  `/no_think` and an empty `<think></think>`, which the server applies (Qwen3.8's template ignores them), so titles
+  come back short without turning thinking off for the whole provider.
+- **Goose** (1.55.0): the `openai` provider (`OPENAI_HOST`, `OPENAI_BASE_PATH` `v1/chat/completions`) or, for images,
+  a custom provider file whose model has `supports_vision: true` (otherwise images are dropped); `GOOSE_MODE=auto` runs
+  tools unattended. Optional: `GOOSE_DISABLE_SESSION_NAMING=true` saves its naming request (1-3 s, thinking on) per
+  new session. Its compaction summaries think as long as they like (85 s once): there is no per-request switch.
+- **Hermes Agent** (v0.22.3): a `config.yaml` provider with `api_mode: chat_completions` (it reads the context size
+  from `/props`). Recommended: `model.supports_vision: true` (images go into the request instead of a separate
+  describe-the-image request) and `auxiliary.title_generation.enabled: false` (its title request asks for a JSON
+  schema, which the server refuses with a 400).
+- **Aider** (0.86.2): needed, for `openai/<model id>` in `.aider.model.settings.yml`: `edit_format: diff`,
+  `use_repo_map: true`, `weak_model_name` the same model, `examples_as_sys_msg: true` (for an unknown model it uses
+  the "whole" format: stray files and long thinking); in `.aider.model.metadata.json`: `max_input_tokens` = the server's
+  `-c`, `max_output_tokens` 32768, `supports_vision: true`. Pass the chat's files on every call
+  (`--restore-chat-history` drops them).
+- **Open WebUI** (0.12.3): the connection is set under Admin > Settings > Connections (the environment variable only
+  counts on the first start). Recommended task settings: model parameters `{"reasoning_effort": "none"}` (follow-up
+  suggestions think 1-2k tokens otherwise) and title / tags templates that quote only the end of the chat
+  (`{{MESSAGES:END:2|middletruncate:1500}}` / `{{MESSAGES:END:6|middletruncate:1500}}`): by default each task quotes
+  the whole chat, so a long one is read again for every task (a 52k-token paste: +63 s per turn).
+- **OpenCode** (2.0.32): an openai-compatible provider with the base URL; nothing else.
+
 ## Windows
 
 The same sources build natively with MSVC and nvcc. On an RTX 3090 we compared the Windows build with the Linux build
