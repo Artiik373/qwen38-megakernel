@@ -4396,10 +4396,11 @@ def main():
     ap.add_argument("--side-max", type=int, default=env_int("MK_SIDE_MAX", 8192, 0), metavar="N",
                     help="side requests: a first-turn prompt (no assistant reply in it) of at most N tokens that would discard "
                          "at least twice its length of the cached conversation (with parking on: one without tools, "
-                         "such as a client's title or summary request, or one that asks for at most 1024 tokens) runs "
-                         "without evicting it: the KV rows it overwrites go to host memory and come back after its "
-                         "reply; with parking on, its own conversation is parked too (evicted first), so a follow-up "
-                         "without tools or with a capped reply continues it the same way (0: off; env MK_SIDE_MAX)")
+                         "such as a client's title or summary request, or one that asks for at most 1024 tokens; and "
+                         "any request without tools beside a conversation whose last request had tools) runs without "
+                         "evicting it: the KV rows it overwrites go to host memory and come back after its reply; "
+                         "with parking on, its own conversation is parked too (evicted first), so a follow-up without "
+                         "tools or with a capped reply continues it the same way (0: off; env MK_SIDE_MAX)")
     ap.add_argument("--park-mib", type=int, default=env_int("MK_PARK_MIB", 8192, 0), metavar="MIB",
                     help="host memory for parked conversations: a request for another conversation parks the cached one "
                          "(KV, recurrent state, checkpoints) and it comes back bit for bit when its next request arrives; "
