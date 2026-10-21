@@ -507,7 +507,9 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   `truncation` and `max_tool_calls` are accepted (nothing is stored; `text.verbosity` and reasoning summaries are not
   generated: console warning). Replies: a `response` object whose `output` holds `reasoning` (the thinking, trimmed, as
   `reasoning_text` content, `summary` empty; with `include: ["reasoning.encrypted_content"]` also `encrypted_content`,
-  the same text compressed: not secret, it brings the reasoning back from clients that return only that), `message`
+  the same text compressed: not secret, it brings the reasoning back from clients that return only that; all of a
+  request's `encrypted_content` together may inflate to what the model's full context could hold, its GGUF context
+  length times its longest token, else a 400), `message`
   (`output_text`) and `function_call` / `custom_tool_call` items; `status` completed, or incomplete with
   `incomplete_details.reason` max_output_tokens; `usage` with `input_tokens` (the whole prompt),
   `input_tokens_details.cached_tokens` (reused), `output_tokens`, `output_tokens_details.reasoning_tokens`. Streams:

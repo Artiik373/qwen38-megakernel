@@ -7,7 +7,10 @@ import base64
 import http.client
 import io
 import json
+import os
+import struct
 import sys
+import tempfile
 import time
 import unittest
 import zlib
@@ -222,9 +225,48 @@ class RequestMappingTests(unittest.TestCase):
         cut = mk.RESP_REASONING + base64.b64encode(base64.b64decode(sealed[len(mk.RESP_REASONING):])[:-6]).decode()
         for s in (None, "gAAAAB", mk.RESP_REASONING + "!!", mk.RESP_REASONING + "aGk=", 5, cut):  # (cut: truncated)
             self.assertIsNone(mk.reasoning_open(s), s)
-        # a zlib stream that inflates past the body limit is not ours
-        bomb = mk.RESP_REASONING + base64.b64encode(zlib.compress(b"x" * ((mk.MAX_BODY_MB << 20) + 10))).decode()
-        self.assertIsNone(mk.reasoning_open(bomb))
+        # a zlib stream that inflates past what the model's full context holds: a 400, never a large allocation
+        with mock.patch.object(mk, "REASONING_MAX_BYTES", 1 << 20):
+            bomb = mk.RESP_REASONING + base64.b64encode(zlib.compress(b"x" * ((1 << 20) + 10))).decode()
+            with self.assertRaises(mk.BadRequest):
+                mk.reasoning_open(bomb)
+
+    def test_reasoning_budget_is_per_request(self) -> None:
+        mk = self.mk
+        item = {"type": "reasoning", "summary": [], "encrypted_content": mk.reasoning_seal("y" * 600)}
+        user = {"type": "message", "role": "user", "content": "hi"}
+        with mock.patch.object(mk, "REASONING_MAX_BYTES", 1000):
+            chat, _ = mk.responses_to_chat({"model": "m", "input": [item, user]})
+            self.assertEqual(chat["messages"][0]["reasoning_content"], "y" * 600)
+            # each item fits alone, together they pass the budget: many small items cannot inflate to gigabytes
+            with self.assertRaises(mk.BadRequest):
+                mk.responses_to_chat({"model": "m", "input": [item, user, item, user]})
+
+    def test_gguf_text_limits(self) -> None:
+        mk = self.mk
+
+        def s(b):
+            return struct.pack("<Q", len(b)) + b
+        kv = [s(b"general.architecture") + struct.pack("<I", 8) + s(b"qwen35"),
+              s(b"llama.context_length") + struct.pack("<II", 4, 4096),  # (another architecture's: ignored)
+              s(b"qwen35.context_length") + struct.pack("<II", 4, 262144),
+              s(b"tokenizer.ggml.scores") + struct.pack("<IIQ3f", 9, 6, 3, 0, 0, 0),
+              s(b"tokenizer.ggml.tokens") + struct.pack("<IIQ", 9, 8, 3) + s(b"a") + s("ĠĠĠ".encode())
+              + s(b"<|im_start|>")]
+        fd, path = tempfile.mkstemp(suffix=".gguf")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
+            self.assertEqual(mk.gguf_text_limits(path), (262144, 12))
+            with open(path, "r+b") as f:  # (truncated inside the token list: what was read before it)
+                f.truncate(len(b"GGUF") + 20 + sum(map(len, kv[:4])) + 30)
+            self.assertEqual(mk.gguf_text_limits(path), (262144, None))
+            with open(path, "wb") as f:
+                f.write(b"not a gguf file")
+            self.assertEqual(mk.gguf_text_limits(path), (None, None))
+        finally:
+            os.remove(path)
+        self.assertEqual(mk.gguf_text_limits(path), (None, None))
 
 
 def _items(events):

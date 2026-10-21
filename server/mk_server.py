@@ -1857,21 +1857,33 @@ ANTHROPIC_ERRORS = {400: "invalid_request_error", 404: "not_found_error", 413: "
 # return only encrypted_content, so the next prompt renders the turn as it was generated
 RESP_REASONING = "mk-reasoning-1:"
 RESP_KEEPALIVE_S = 10.0  # a stream's response.in_progress events during a long prefill (clients time out idle streams)
+# bytes all of a request's encrypted_content may inflate to: the model's full context x its longest token (set in main)
+REASONING_MAX_BYTES = 262144 * 256
 
 
 def reasoning_seal(text):
     return RESP_REASONING + base64.b64encode(zlib.compress(text.encode(), 6)).decode()
 
 
-def reasoning_open(s):
-    """the reasoning text of an encrypted_content this server made (reasoning_seal), else None (another server's)"""
+def reasoning_open(s, budget=None):
+    """this server's encrypted_content as text, else None; budget: [bytes left for the request], past it a BadRequest"""
     if not isinstance(s, str) or not s.startswith(RESP_REASONING):
         return None
+    budget = [REASONING_MAX_BYTES] if budget is None else budget
+    d = zlib.decompressobj()
+    try:  # (max_length budget + 1 > 0: zlib reads 0 as no limit)
+        raw = d.decompress(base64.b64decode(s[len(RESP_REASONING):], validate=True), budget[0] + 1)
+    except (binascii.Error, zlib.error, ValueError):
+        return None
+    if len(raw) > budget[0]:
+        raise BadRequest(f"reasoning encrypted_content: the request's reasoning inflates to more than the model's full "
+                         f"context could hold ({REASONING_MAX_BYTES} bytes in all)")
+    budget[0] -= len(raw)
+    if not d.eof or d.unconsumed_tail or d.unused_data:
+        return None
     try:
-        d = zlib.decompressobj()
-        text = d.decompress(base64.b64decode(s[len(RESP_REASONING):], validate=True), MAX_BODY_MB << 20)
-        return text.decode() if d.eof and not d.unconsumed_tail and not d.unused_data else None
-    except (binascii.Error, zlib.error, UnicodeDecodeError, ValueError):
+        return raw.decode()
+    except UnicodeDecodeError:
         return None
 
 
@@ -1982,6 +1994,7 @@ def responses_to_chat(body, notes=None, mid_system=True):
     if not isinstance(items, list):
         bad("input", "a string or an array of input items is required")
     msgs = []
+    budget = [REASONING_MAX_BYTES]  # (one decompression budget for all of the request's encrypted_content)
     if body.get("instructions") is not None:
         if not isinstance(body["instructions"], str):
             bad("instructions", "a string")
@@ -2016,7 +2029,7 @@ def responses_to_chat(body, notes=None, mid_system=True):
         elif t == "reasoning":
             parts = it.get("content") if isinstance(it.get("content"), list) else []
             texts = [str(p.get("text") or "") for p in parts if isinstance(p, dict) and p.get("type") == "reasoning_text"]
-            text = "".join(texts) if texts else reasoning_open(it.get("encrypted_content"))
+            text = "".join(texts) if texts else reasoning_open(it.get("encrypted_content"), budget)
             if text is None:
                 summary = it.get("summary") if isinstance(it.get("summary"), list) else []
                 text = "\n\n".join(str(p.get("text") or "") for p in summary if isinstance(p, dict))
@@ -4161,8 +4174,60 @@ def env_int(name, default, minimum=1):
     return int(v)
 
 
+def gguf_text_limits(path):
+    """(the GGUF's <arch>.context_length, the byte length of its longest token string), None where unreadable"""
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}  # (GGUF scalar value types)
+    ints = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 10: "<Q", 11: "<q"}
+    arch, ctxs, longest = None, {}, None
+    try:
+        with open(path, "rb") as f:
+            def rd(fmt):
+                b = f.read(struct.calcsize(fmt))
+                if len(b) != struct.calcsize(fmt):
+                    raise EOFError
+                return struct.unpack(fmt, b)[0]
+
+            def skip(vt, n=1):
+                if vt == 8:  # (strings: u64 length + bytes)
+                    for _ in range(n):
+                        f.seek(rd("<Q"), 1)
+                elif vt == 9:  # (arrays: element type, count, elements)
+                    for _ in range(n):
+                        et, m = rd("<I"), rd("<Q")
+                        skip(et, m)
+                else:
+                    f.seek(sizes[vt] * n, 1)
+            if f.read(4) != b"GGUF" or rd("<I") < 2:
+                return None, None
+            rd("<Q")  # (tensor count)
+            for _ in range(rd("<Q")):
+                key = f.read(rd("<Q")).decode("utf-8", "replace")
+                vt = rd("<I")
+                if key == "general.architecture" and vt == 8:
+                    arch = f.read(rd("<Q")).decode("utf-8", "replace")
+                elif key.endswith(".context_length") and vt in ints:
+                    ctxs[key] = rd(ints[vt])
+                elif key == "tokenizer.ggml.tokens" and vt == 9:
+                    et, m = rd("<I"), rd("<Q")
+                    if et != 8:
+                        skip(et, m)
+                        continue
+                    longest = 0
+                    for _ in range(m):  # (a token string's UTF-8 length >= its decoded piece's bytes)
+                        n = rd("<Q")
+                        f.seek(n, 1)
+                        longest = max(longest, n)
+                else:
+                    skip(vt)
+                if longest is not None and arch and f"{arch}.context_length" in ctxs:
+                    break
+    except (OSError, EOFError, KeyError, struct.error):
+        pass
+    return (ctxs.get(f"{arch}.context_length") if arch else None), longest
+
+
 def main():
-    global MAX_BODY_MB, MAX_IMAGES, MAX_VIDEO_FRAMES, IMAGE_MAX_PIXELS
+    global MAX_BODY_MB, MAX_IMAGES, MAX_VIDEO_FRAMES, IMAGE_MAX_PIXELS, REASONING_MAX_BYTES
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
@@ -4292,6 +4357,8 @@ def main():
     MAX_BODY_MB = env_int("MK_MAX_BODY_MB", MAX_BODY_MB)
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     MAX_VIDEO_FRAMES = env_int("MK_MAX_VIDEO_FRAMES", MAX_VIDEO_FRAMES)
+    n_train, longest = gguf_text_limits(args.model)
+    REASONING_MAX_BYTES = max(n_train or 0, args.ctx) * (longest or 256)
     if args.mmproj:  # (the vision library checks images against it; the video decoder, frames)
         IMAGE_MAX_PIXELS = env_int("MK_IMAGE_MAX_PIXELS", IMAGE_MAX_PIXELS)
     if args.exact_reuse:
