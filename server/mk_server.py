@@ -258,6 +258,12 @@ class Engine:
         if self.side_keep:
             L.mk_side_end_park.restype, L.mk_side_end_park.argtypes = ctypes.c_int, [vp, ctypes.c_int, ip]
             L.mk_side_unpark.restype, L.mk_side_unpark.argtypes = ctypes.c_int, [vp, ctypes.c_int]
+        # pinned checkpoints: a prompt's shared prefix (a client's system prompt and tools) survives the pool's thinning
+        # and parking (libraries before them: nothing is pinned, parked conversations keep their newest checkpoints only)
+        self.ck_pins = hasattr(L, "mk_ck_pin") and hasattr(L, "mk_ck_pinned")
+        if self.ck_pins:
+            L.mk_ck_pin.restype, L.mk_ck_pin.argtypes = ctypes.c_int, [vp, ip, ctypes.c_int]
+            L.mk_ck_pinned.restype, L.mk_ck_pinned.argtypes = ctypes.c_int, [vp, ip, ctypes.c_int]
         self.n_vocab = 0  # (libraries before mk_n_vocab: unknown)
         if hasattr(L, "mk_n_vocab"):
             L.mk_n_vocab.restype, L.mk_n_vocab.argtypes = ctypes.c_int, [vp]
@@ -454,6 +460,21 @@ class Engine:
         if not self.pool:
             return pos == self.checkpoint_pos() and self.rewind_to_checkpoint()
         return self.L.mk_rewind_to(self.h, pos) == 0
+
+    def ck_pin(self, positions):
+        """pins, for each position P, the checkpoint at the last position in (P - 32, P]: one there now, else the one the
+        next prefill saves there (MKEngine::ck_pin). Pinned checkpoints are never evicted from the pool and are parked
+        with the conversation (besides its newest --park-cks)"""
+        arr = (ctypes.c_int * max(len(positions), 1))(*positions)
+        if self.L.mk_ck_pin(self.h, arr, len(positions)) < 0:
+            raise self._err("checkpoint pin")
+
+    def pinned(self):
+        """positions of the pinned checkpoints (ascending)"""
+        n = self.L.mk_ck_pinned(self.h, None, 0)
+        out = (ctypes.c_int * max(n, 1))()
+        self.L.mk_ck_pinned(self.h, out, n)
+        return list(out[:n])
 
     # ---- host store: side requests, parked conversations (MKEngine::store_budget, side_begin, park) ----
     def store_budget(self, nbytes):
@@ -2236,12 +2257,12 @@ class Parked:
     """a conversation parked in the engine's host store (Engine.park): what the server matches prompts against. side: a
     side request's own conversation (Engine.side_end_park); low: one that is likely never continued (a summary request's
     and the conversation it summarised: Server.cache_switch); both kinds are evicted before the others. tools: its last
-    request had tools (None: unknown)"""
+    request had tools (None: unknown). pins: its pinned checkpoints (in cks too: Server.ck_pins)"""
 
-    def __init__(self, pid, seq, cks, committed, img_spans, gen, nbytes, side=False, low=False, tools=None):
+    def __init__(self, pid, seq, cks, committed, img_spans, gen, nbytes, side=False, low=False, tools=None, pins=()):
         self.id, self.seq, self.cks, self.committed = pid, seq, cks, committed
         self.img_spans, self.gen, self.nbytes, self.t, self.side = img_spans, gen, nbytes, time.time(), side
-        self.low, self.tools = low, tools
+        self.low, self.tools, self.pins = low, tools, tuple(pins)
 
 
 SIDE_STORE_MIB = 1024  # host store of side requests when parking is off (--park-mib 0)
@@ -2252,6 +2273,7 @@ SIDE_KEEP_MAX = 4  # side requests' conversations kept at most (the oldest goes 
 # a side request without tools that quotes at least --park-min tokens and answers at least this many (thinking aside) is
 # taken for a summary of the conversation beside it (titles, tags, follow-ups and commit messages answer in tens)
 SUMMARY_ANSWER_MIN = 256
+PIN_MIN = 1024  # a shared prefix shorter than this is not pinned (Server.ck_pins: it is prefilled again in under ~0.5 s)
 
 
 def mib(n):
@@ -2311,6 +2333,10 @@ class Server:
         self.im_start = im[0] if len(im) == 1 else None  # checkpoint at the start of the generation prompt
         if self.im_start is not None:
             self.asst_marker = tuple(self.eng.tokenize("<|im_start|>assistant"))
+        self.sys_role = self.eng.tokenize("system")  # (a prompt that opens with a system message: ck_pins)
+        if getattr(args, "ck_pin", 0) and not getattr(self.eng, "ck_pins", False):
+            log(f"pinned checkpoints off: {os.path.basename(args.lib)} has no mk_ck_pin (rebuild it): a new session "
+                f"re-reads a client's system prompt once the cached conversation has grown or was parked")
         if args.mmproj:
             if not self.eng.images:
                 raise RuntimeError(f"{args.lib} has no image input (mk_prefill_img): rebuild it")
@@ -2450,6 +2476,9 @@ class Server:
             if best:
                 self.park_live(seq, "another conversation came back", keep=best[0].id, low=self.live_low)
                 self.unpark(best[0])
+                e, r = best
+                if r[2] in e.pins and r[0] < e.gen:  # (a new session that shares only its system prompt: it stays parked)
+                    self.park_live(eng.sequence(), "a new session reuses its system prompt")
                 return
         # a first turn, or (parking on) a request without tools that would displace a conversation with tools: an agent
         # session stays live while a chat without tools or a client's summary (the conversation as messages) runs
@@ -2536,13 +2565,15 @@ class Server:
                 f"(--park-mib {a.park_mib:,})")
             return
         self.make_room(need, budget, keep)
-        cks = sorted(eng.checkpoints())[-a.park_cks:] if a.park_cks > 0 else []
+        # (the engine parks the newest --park-cks checkpoints and the pinned ones: Engine.ck_pin)
+        pins = eng.pinned() if a.park_cks > 0 and getattr(eng, "ck_pins", False) else []
+        cks = sorted(set(sorted(eng.checkpoints())[-a.park_cks:]) | set(pins)) if a.park_cks > 0 else []
         pid = eng.park(a.park_cks)
         if pid is None:
             log(f"#{self.rid} not parked: no room in the host store for the cached {len(seq):,} tok ({mib(need)})")
             return
         self.parked[pid] = Parked(pid, seq, cks, eng.committed(), self.img_spans, self.live_gen, need, low=bool(low),
-                                  tools=self.live_tools)
+                                  tools=self.live_tools, pins=pins)
         info = self.store_update()
         self.count(parks=1)
         why += f", low priority: {low}" if low else ""
@@ -2727,6 +2758,7 @@ class Server:
             "draft_vocab": os.path.basename(a.draft_vocab) if isinstance(g(a, "draft_vocab"), str) else None,
             "exact_reuse": bool(g(e, "exact", False)),
             "checkpoints": {"pool": bool(g(e, "pool", False)), "every": g(a, "ck_every"), "messages": bool(g(a, "ck_msgs")),
+                            "pinned": bool(g(a, "ck_pin") and g(e, "ck_pins", False)),
                             "slots": int(os.environ.get("MK_CK_SLOTS") or 8)},
             "keep_warm_s": self.warm_s, "prefill_cancel": bool(g(e, "_cancel", False)),
             "host_cache": None if self.parked is None else {
@@ -2958,6 +2990,29 @@ class Server:
             cks.update(k for k in range(start + 1, len(toks) - 1) if toks[k] == self.im_start)
         return sorted(cks)
 
+    def ck_pins(self, toks, lcp, spans):
+        """checkpoints the engine pins for this prompt (--ck-pin; Engine.ck_pin: never evicted from the pool, parked with
+        the conversation): the end of its system block (the start of the first message after it), which every session
+        of the same client shares, tools included; and, when the prompt leaves the cached conversation (lcp) or a parked
+        one inside that block, the point where it does: a client whose system prompt ends with per-session text (a date,
+        a directory, a session id) shares up to there with its other sessions. That one comes first (it serves every
+        session of the client). A prompt without a system message, or a prefix under PIN_MIN tokens: none."""
+        role = getattr(self, "sys_role", None)
+        if (not getattr(self.args, "ck_pin", 0) or not getattr(self.eng, "ck_pins", False) or self.im_start is None
+                or not role or toks[:1 + len(role)] != [self.im_start] + role):
+            return []
+        end = next((k for k in range(1 + len(role), len(toks) - 1) if toks[k] == self.im_start), 0)
+        if end < PIN_MIN:
+            return []
+        left = [lcp]
+        if lcp < end:
+            for e in (self.parked or {}).values():
+                if not e.side:
+                    r = self.resume_point(e.seq, e.committed, e.cks, e.img_spans, toks, spans)
+                    left.append(r[0] if r[1] is None else r[1])
+        cut = max((x for x in left if PIN_MIN <= x < end), default=0)
+        return [cut, end] if cut else [end]
+
     @contextlib.contextmanager
     def prefill_status(self, n_new):
         """the console's status line during a prefill call: the engine's progress (mk_prefill_progress), its rate and the
@@ -3085,6 +3140,9 @@ class Server:
                 imgs.append((p, im.nx, im.ny, im.rows()))
             # (a side request saves the generation prompt's checkpoint only: where its own conversation's follow-up resumes)
             cks = self.ck_positions(toks, start) if self.side is None else []
+            pins = self.ck_pins(toks, lcp, spans) if self.side is None else []
+            if pins:
+                eng.ck_pin(pins)
             with eng.cancel_when(gone), self.prefill_status(len(toks) - start), self.prompt_progress(start, len(toks)):
                 if imgs:
                     return eng.prefill(toks[start:], gen, cks, imgs), start
@@ -4397,6 +4455,10 @@ def main():
     ap.add_argument("--ck-every", type=int, default=4096,
                     help="DeltaNet checkpoint every N prompt tokens (0: off); see MK_CK_SLOTS for the pool size")
     ap.add_argument("--ck-msgs", type=int, default=1, help="DeltaNet checkpoint at each message start (1/0)")
+    ap.add_argument("--ck-pin", type=int, default=1,
+                    help="pin the DeltaNet checkpoint at the end of a prompt's system message (and where a new session "
+                         "left the cached one inside it) against the pool's eviction, and park it with the conversation: "
+                         "new sessions of a client resume after its system prompt and tools (1/0)")
     ap.add_argument("--exact-reuse", action="store_true",
                     help="reused requests answer exactly as fresh ones (MK_EXACT=1): restore a checkpoint and prefill "
                          "instead of appending to decoded rows (costs prompt time when a long reply is reused)")
@@ -4416,8 +4478,8 @@ def main():
                     help="conversations of fewer tokens are not parked; a parked one comes back when its prompt reuses at "
                          "least N more tokens than the cached one's")
     ap.add_argument("--park-cks", type=int, default=2, metavar="N",
-                    help="checkpoints kept with a parked conversation (the newest; with exact reuse any checkpoint gives "
-                         "the same bits, fewer only mean more re-prefill after an edit)")
+                    help="checkpoints kept with a parked conversation (the newest, besides its pinned ones: --ck-pin; with "
+                         "exact reuse any checkpoint gives the same bits, fewer only mean more re-prefill after an edit)")
     ap.add_argument("--content-specials", choices=["text", "parse"],
                     default=os.environ.get("MK_CONTENT_SPECIALS") or "text",
                     help="special-token text (<|im_end|>, <|im_start|>, ...) inside messages, tool results, tool calls and "
