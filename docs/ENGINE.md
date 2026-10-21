@@ -366,8 +366,10 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   a fixed seed, are those of the request sent fresh too (before, the abandoned reply's tokens stayed in it).
 - **Side requests** (`--side-max n`, default 8192): a prompt of at most n tokens without an earlier assistant reply in
   it (a client's title request, a quick test) that would otherwise discard at least twice its length of the cached
-  sequence (with parking on, below: one that also asks for at most 1024 tokens; other new chats are parked like any
-  conversation, so their next turns find them cached) runs without evicting it (`MKEngine::side_begin` / `side_end`):
+  sequence (with parking on, below: one without tools, whatever its `max_tokens`, or one that asks for at most 1024
+  tokens; the agent harnesses send every one-shot request (title, tags, follow-ups, commit message, session name,
+  summary) without tools and every new session's first turn with tools, so a new session is parked like any
+  conversation and its next turns find it cached) runs without evicting it (`MKEngine::side_begin` / `side_end`):
   the engine keeps the cached sequence aside (its recurrent state, 183 MB, is copied to pinned host memory at once; its
   KV and window-ring rows only when a launch of the side request is about to overwrite them, 1024 rows at a time), hides
   its checkpoints, and runs the request from position 0 as a reset engine would (same reply as on a fresh server). The
@@ -375,17 +377,19 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   checkpoints is copied to host memory first. After the reply (also after a disconnect or an error) everything is
   copied back and the cached sequence is bit for bit as before, so the next request of that conversation reuses it as
   usual. Cost: ~10-20 ms each way under WSL2 for a 2.7k-8k-token side prompt, whatever the length of the cached
-  sequence. If the host store runs out of room during the side request, or the engine fails, the cached sequence is
-  dropped and the next prompt is prefilled in full (logged; never a corrupt cache).
+  sequence. Before it starts, room in the host store is made (other side conversations first, below) for the rows of
+  its prompt and its reply: `max_tokens`, or 8192 tokens when the request sets none (titles: tens to hundreds of
+  tokens; a summary: thousands). If the host store runs out of room during the side request, or the engine fails, the
+  cached sequence is dropped and the next prompt is prefilled in full (logged; never a corrupt cache).
 - **Side conversations** (with parking on): after a side request whose prompt was processed, its own conversation is
   parked first (`MKEngine::side_end_park`: as a parked conversation, below, with its one checkpoint), then the cached
   sequence comes back. A later request that continues it (it matches up to that conversation's generation prompt) and
   would be a side request but for its earlier turns runs as a side request again, resumed from the parked conversation
   (`MKEngine::side_unpark`: the cached sequence stays aside, only the rows the short conversation needs move), so a chat
-  with a capped reply keeps its prefix cached beside a long conversation, and its replies are those of the same
-  conversation on a fresh server. At most 4 of them are kept (the oldest goes first: most are clients' title requests,
-  never continued); they are evicted before any other parked conversation, and parking one never evicts anything but
-  another of them. Cost under WSL2 (q8 KV, a 1.5k-token side conversation, chunks already
+  without tools (or with a capped reply) keeps its prefix cached beside a long conversation, and its replies are those
+  of the same conversation on a fresh server. At most 4 of them are kept (the oldest goes first: most are clients'
+  title requests, never continued); they are evicted before any other parked conversation, and parking one never
+  evicts anything but another of them. Cost under WSL2 (q8 KV, a 1.5k-token side conversation, chunks already
   allocated): ~25-30 ms to park it (0.4 GB: its rows, recurrent state and checkpoint) and ~8 ms to copy the slot its
   checkpoint takes, ~25-35 ms to continue it (`side_unpark`); preset D's window rings about double that. Re-reading it
   instead would take ~0.9 s at 1.5k tokens and ~5 s at 8k.

@@ -213,9 +213,11 @@ conversations only between replies (a reply in progress is never paused):
 - **Side requests:** a new conversation's first request of at most `MK_SIDE_MAX` tokens (default 8192; `0` = off) that
   would otherwise throw away a much longer cached conversation, such as a client's title request, runs beside it. Only
   the rows it overwrites go to host memory and back (12-20 ms), and the cached conversation is not touched. With
-  parking on, this applies to requests that cap their reply at `max_tokens` <= 1024 (other new conversations are parked
-  like any other), and the side request's own conversation is parked after its reply too, so a follow-up turn with a
-  capped reply continues it beside the cached conversation again instead of reading it again. Up to 4 of these short
+  parking on, this applies to one-shot requests: those without tools, whatever their `max_tokens` (clients' title,
+  tags, commit-message, session-name and summary requests), and those that cap their reply at `max_tokens` <= 1024; an
+  agent's new session sends tools and is parked like any other conversation. The side request's own conversation is
+  parked after its reply too, so a follow-up turn (a chat without tools, or a capped reply) continues it beside the
+  cached conversation again instead of reading it again. Up to 4 of these short
   conversations are kept (the oldest goes first), and they are the first to go when host memory is full: they never push
   out a parked conversation.
 - **In practice:** with OpenCode 2.0.32 on native Windows (230k context, preset D), two coding sessions running at the

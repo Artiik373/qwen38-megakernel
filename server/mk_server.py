@@ -2214,7 +2214,8 @@ class Parked:
 
 
 SIDE_STORE_MIB = 1024  # host store of side requests when parking is off (--park-mib 0)
-SIDE_REPLY_MAX = 1024  # with parking on, a side request asks for at most this many tokens (Server.cache_switch)
+SIDE_REPLY_MAX = 1024  # with parking on, a side request with tools asks for at most this many tokens (cache_switch)
+SIDE_REPLY_ROOM = 8192  # store room a side request takes for the rows of a reply it does not cap (Server.side_start)
 SIDE_PARK_CKS = 1  # checkpoints kept with a side request's conversation (its generation prompt's: where a follow-up resumes)
 SIDE_KEEP_MAX = 4  # side requests' conversations kept at most (the oldest goes first): most are titles, never continued
 
@@ -2365,22 +2366,25 @@ class Server:
         ck = max((p for p in cks if 0 < p <= lcp), default=0)
         return match, img_cut, ck, "checkpoint" if ck else "reset"
 
-    def cache_switch(self, toks, spans, first_turn, max_tokens=-1):
+    def cache_switch(self, toks, spans, first_turn, max_tokens=-1, tools=True):
         """before load_prompt's own matching: brings back a parked conversation that this prompt continues better than
         the live one (parking the live one), or runs the request as a side request, or parks the live conversation when
-        the request would discard it. Requests switch only here, between replies. With parking on, only a request whose
-        reply is bounded (0 < max_tokens <= SIDE_REPLY_MAX: a title, a one-off question) is a side request: a new chat's
-        first turn is parked like any conversation, so its next turns find it cached."""
+        the request would discard it. Requests switch only here, between replies. With parking on, a side request is a
+        one-shot: a request without tools (a client's title, tags, commit message, session name, summary; every agent
+        harness sends its sessions' first turns with tools) whatever its max_tokens, or one whose reply is bounded
+        (0 < max_tokens <= SIDE_REPLY_MAX); its own conversation is parked after it (side_finish), so a chat without
+        tools continues as side requests. A new agent session's first turn (tools, a long reply) parks the live
+        conversation like any conversation, so its next turns find it cached."""
         eng, a = self.eng, self.args
         self.cache_pre = ""
         seq = eng.sequence()
         live = self.resume_point(seq, eng.committed(), eng.checkpoints(), self.img_spans, toks, spans)
         lost = len(seq) - live[2]  # cached positions the normal path would discard
         cont = self.live_gen >= 0 and live[0] >= self.live_gen  # (diverges in the live one's generation prompt / reply)
-        # a side request's own conversation that this bounded prompt continues (it matches up to that conversation's
+        # a side request's own conversation that this one-shot prompt continues (it matches up to that conversation's
         # generation prompt): a side request again, resumed there, while the live conversation stays aside
         side_ok = (a.side_max > 0 and len(toks) <= a.side_max and not cont and lost >= max(2 * len(toks), a.park_min)
-                   and (a.park_mib <= 0 or 0 < max_tokens <= SIDE_REPLY_MAX))
+                   and (a.park_mib <= 0 or not tools or 0 < max_tokens <= SIDE_REPLY_MAX))
         if side_ok and self.side_keep() and self.parked:
             best = None
             for e in self.parked.values():
@@ -2390,7 +2394,7 @@ class Server:
                 if r[0] >= e.gen and r[2] > live[2] and (best is None or r[2] > best[1][2]):
                     best = (e, r)
             if best:
-                self.side_start(seq, len(toks), resume=best[0])
+                self.side_start(seq, len(toks), max_tokens, resume=best[0])
                 return
         if a.park_mib > 0 and self.parked:
             best = None
@@ -2403,7 +2407,7 @@ class Server:
                 self.unpark(best[0])
                 return
         if side_ok and first_turn:
-            self.side_start(seq, len(toks))
+            self.side_start(seq, len(toks), max_tokens)
             return
         if a.park_mib > 0 and not cont and lost >= a.park_min:
             self.park_live(seq, "a new conversation")
@@ -2476,13 +2480,16 @@ class Server:
         log(f"#{self.rid} restored the parked conversation of {len(e.seq):,} tok: {mib(info['last_bytes'])} copied in "
             f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} in use")
 
-    def side_start(self, seq, n, resume=None):
+    def side_start(self, seq, n, max_tokens=-1, resume=None):
         """runs the request as a side request: the live sequence stays cached (Engine.side_begin; side_finish brings it
         back after the reply). resume: a side request's parked conversation it continues (Engine.side_unpark)"""
         eng = self.eng
-        pt, rings, state, ck = eng.kv_sizes()  # (room for what the request may overwrite: its prompt and a reply, and
-        # the checkpoint blocks of the live one in the slots it saves into)
-        self.make_room(state + rings + pt * min(len(seq), n + 4096) + 2 * ck, self.store_mib << 20,
+        # room for what the request may overwrite: its prompt and its reply (max_tokens, else SIDE_REPLY_ROOM: past that
+        # the engine saves more rows while there is room, else the kept sequence is dropped), and the checkpoint blocks
+        # of the live one in the slots it saves into
+        pt, rings, state, ck = eng.kv_sizes()
+        reply = min(max_tokens, SIDE_REPLY_ROOM) if max_tokens > 0 else SIDE_REPLY_ROOM
+        self.make_room(state + rings + pt * min(len(seq), n + reply) + 2 * ck, self.store_mib << 20,
                        keep=resume.id if resume else None)
         if not eng.side_begin():
             log(f"#{self.rid} side request: no room in the host store: the cached {len(seq):,} tok are not kept")
@@ -2922,15 +2929,16 @@ class Server:
         ph = ", ".join(f"{k} {v:,}" for k, v in phase.items() if v)
         return s + (f" | {ph}" if ph else "") + f" | {secs(el)}"
 
-    def load_prompt(self, toks, images=(), gone=None, first_turn=False, max_tokens=-1):
+    def load_prompt(self, toks, images=(), gone=None, first_turn=False, max_tokens=-1, tools=True):
         """brings the engine to `toks` processed, reusing what it has; returns (first token, reused count).
         images: [(pos, Vision.Image)] of the prompt. gone (the client left: () -> bool) is watched during the prefill,
         which then stops at a chunk boundary with PrefillCancelled (Engine.cancel_when). first_turn: the prompt has no
-        earlier assistant reply; max_tokens: the request's (-1: none); both for cache_switch's side request rule"""
+        earlier assistant reply; max_tokens: the request's (-1: none); tools: the request has tools (not tool_choice
+        "none"); all three for cache_switch's side request rule"""
         eng = self.eng
         self.cache_pre = ""
         if self.parked is not None:  # (the host cache: --side-max / --park-mib)
-            self.cache_switch(toks, [(p, im.n, im.key) for p, im in images], first_turn, max_tokens)
+            self.cache_switch(toks, [(p, im.n, im.key) for p, im in images], first_turn, max_tokens, tools)
         seq = eng.sequence()
         lcp = 0
         for a, b in zip(seq, toks):
@@ -3104,7 +3112,7 @@ class Server:
         enc0 = [im.encode_s for _, im in images]
         first_turn = not any(isinstance(m, dict) and m.get("role") == "assistant" for m in body.get("messages") or [])
         try:
-            tok, reused = self.load_prompt(toks, images, gone, first_turn, asked)
+            tok, reused = self.load_prompt(toks, images, gone, first_turn, asked, bool(tools))
         except PrefillCancelled as e:  # (the engine kept nothing of it)
             log(f"#{rid} the client disconnected during the prefill of {len(toks):,} tok: stopped after "
                 f"{secs(time.time() - t0)} ({e})")
@@ -4258,10 +4266,11 @@ def main():
                          "instead of appending to decoded rows (costs prompt time when a long reply is reused)")
     ap.add_argument("--side-max", type=int, default=env_int("MK_SIDE_MAX", 8192, 0), metavar="N",
                     help="side requests: a first-turn prompt (no assistant reply in it) of at most N tokens that would discard "
-                         "at least twice its length of the cached conversation (with parking on: and asks for at most 1024 "
-                         "tokens) runs without evicting it: the KV rows it overwrites go to host memory and come back "
-                         "after its reply; with parking on, its own conversation is parked too (evicted first), so a "
-                         "follow-up with a capped reply continues it the same way (0: off; env MK_SIDE_MAX)")
+                         "at least twice its length of the cached conversation (with parking on: one without tools, "
+                         "such as a client's title or summary request, or one that asks for at most 1024 tokens) runs "
+                         "without evicting it: the KV rows it overwrites go to host memory and come back after its "
+                         "reply; with parking on, its own conversation is parked too (evicted first), so a follow-up "
+                         "without tools or with a capped reply continues it the same way (0: off; env MK_SIDE_MAX)")
     ap.add_argument("--park-mib", type=int, default=env_int("MK_PARK_MIB", 8192, 0), metavar="MIB",
                     help="host memory for parked conversations: a request for another conversation parks the cached one "
                          "(KV, recurrent state, checkpoints) and it comes back bit for bit when its next request arrives; "

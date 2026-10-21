@@ -1894,16 +1894,17 @@ class HostCacheTests(_HttpCase):
         info = srv.engine_info()["host_cache"]
         self.assertEqual((info["parked"], info["parked_tokens"], info["park_mib"]), (1, [len(kept_b)], 4))
 
-    def test_with_parking_on_only_a_bounded_reply_is_a_side_request(self) -> None:
+    def test_with_parking_on_a_side_request_has_no_tools_or_a_bounded_reply(self) -> None:
         eng = _StoreEngine(["a", "b"])
         srv, http_ = self.serve_store(eng, park_mib=4)
 
         def run():
             self.chat(http_, [{"role": "user", "content": self.LONG}])
             self.chat(http_, [{"role": "user", "content": "a title please"}], max_tokens=8)  # (side request)
-            self.chat(http_, [{"role": "user", "content": "a new chat"}])  # (no max_tokens: the cached one is parked)
+            self.chat(http_, [{"role": "user", "content": "a title, uncapped"}])  # (no tools: a side request too)
+            self.chat(http_, [{"role": "user", "content": "a new task"}], tools=TOOLS)  # (tools: the cached one parks)
         log = self.quiet(run)
-        self.assertEqual([o[0] for o in eng.ops], ["side_begin", "side_end", "park"], log)
+        self.assertEqual([o[0] for o in eng.ops], ["side_begin", "side_end"] * 2 + ["park"], log)
 
     def test_the_conversation_coming_back_is_never_evicted_to_park_the_cached_one(self) -> None:
         eng = _StoreEngine(["a", "b"])
