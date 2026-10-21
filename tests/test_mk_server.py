@@ -1293,7 +1293,7 @@ class ExtraRouteTests(_HttpCase):
 
     def test_unsupported_routes_are_501_unknown_404(self) -> None:
         _, http_ = self.serve(_ScriptEngine(["ok"]))
-        for path in ("/v1/completions", "/completion", "/v1/embeddings", "/infill", "/v1/rerank", "/v1/responses",
+        for path in ("/v1/completions", "/completion", "/v1/embeddings", "/infill", "/v1/rerank", "/v1/responses/compact",
                      "/slots/0?action=save"):
             status, o = self._post(http_, path, {})
             self.assertEqual(status, 501, path)

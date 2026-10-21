@@ -15,6 +15,8 @@ what the engine already processed, it rewinds to the last DeltaNet checkpoint at
 divergence (saved during earlier prefills: at each generation prompt, each message start and every
 --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
 POST /v1/messages (+ /v1/messages/count_tokens): the Anthropic Messages API over the same chat path.
+POST /v1/responses (+ /v1/responses/input_tokens): the OpenAI Responses API over the same chat path, stateless (the client
+sends the whole conversation each time, as Codex CLI does).
 GET /health (503 "Loading model" until the model is loaded), /v1/models, /props, /slots, /metrics; POST /tokenize,
 /detokenize, /apply-template, /v1/chat/completions/input_tokens (llama-server's shapes).  One request at a time.
 After each request the engine keeps the GPU's clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a
@@ -1845,6 +1847,316 @@ ANTHROPIC_ERRORS = {400: "invalid_request_error", 404: "not_found_error", 413: "
 
 
 # ---------------------------------------------------------------------------------------------
+# OpenAI Responses API (POST /v1/responses, /v1/responses/input_tokens): translated to the chat request above and back,
+# as the Anthropic Messages API is (llama-server's server_chat_convert_responses_to_chatcmpl). Stateless: the client
+# sends the whole conversation every time (store false, as Codex does); nothing is stored, so previous_response_id,
+# conversation and item_reference are a 400.
+
+# a reasoning item's encrypted_content (include reasoning.encrypted_content): this prefix + the reasoning text, zlib +
+# base64. Not secret (the item has the text as reasoning_text content too): it brings the reasoning back for clients that
+# return only encrypted_content, so the next prompt renders the turn as it was generated
+RESP_REASONING = "mk-reasoning-1:"
+RESP_KEEPALIVE_S = 10.0  # a stream's response.in_progress events during a long prefill (clients time out idle streams)
+
+
+def reasoning_seal(text):
+    return RESP_REASONING + base64.b64encode(zlib.compress(text.encode(), 6)).decode()
+
+
+def reasoning_open(s):
+    """the reasoning text of an encrypted_content this server made (reasoning_seal), else None (another server's)"""
+    if not isinstance(s, str) or not s.startswith(RESP_REASONING):
+        return None
+    try:
+        d = zlib.decompressobj()
+        text = d.decompress(base64.b64decode(s[len(RESP_REASONING):], validate=True), MAX_BODY_MB << 20)
+        return None if d.unconsumed_tail else text.decode()
+    except (binascii.Error, zlib.error, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _resp_content(content, where):
+    """a message item's or function output's content (a string, or input_text / output_text / refusal / input_image
+    parts) as chat content: one string (text parts joined as the chat template joins a part list: nothing between),
+    or with images the chat parts (normalize_messages flattens them as llama-server does)"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise BadRequest(f"{where}: a string or an array of content parts")
+    parts = []
+    for p in content:
+        if not isinstance(p, dict):
+            raise BadRequest(f"{where}: content parts must be objects")
+        t = p.get("type")
+        if t in ("input_text", "output_text", "text"):
+            parts.append({"type": "text", "text": str(p.get("text") or "")})
+        elif t == "refusal":
+            parts.append({"type": "text", "text": str(p.get("refusal") or "")})
+        elif t == "input_image":
+            url = p.get("image_url")
+            if not url and p.get("file_id"):
+                raise BadRequest("input_image: file_id is not supported (the server stores no files): send the image as "
+                                 "a data: URL in image_url")
+            parts.append({"type": "image_url", "image_url": {"url": str((url.get("url") if isinstance(url, dict) else url)
+                                                                     or "")}})
+        elif t == "input_file":
+            raise BadRequest("input_file is not supported: send the file's text as input_text (images as input_image)")
+        else:
+            raise BadRequest(f"{where}: content part type {t!r} is not supported (input_text, output_text, refusal, "
+                             "input_image)")
+    if any(p["type"] == "image_url" for p in parts):
+        return parts
+    return "".join(p["text"] for p in parts)
+
+
+def responses_tools(tools, notes):
+    """a Responses request's tools as chat tools: (tools, {function name: its namespace}, {custom tool names}).
+    function -> function; namespace -> its functions (plain names; a call to one gets its namespace back); custom
+    (freeform input) -> a function with one string parameter "input"; the others (web_search, file_search, mcp, ...:
+    tools the server would have to run) are dropped with a note"""
+    out, ns, custom = [], {}, set()
+
+    def add(t, space=None):
+        name = t.get("name")
+        if not isinstance(name, str) or not name:
+            raise BadRequest(f"tools: a {t.get('type')} tool needs a name")
+        if any(o["function"]["name"] == name for o in out):
+            raise BadRequest(f"tools: two tools are named {name!r} (namespaces are flattened)")
+        f = {"name": name, "description": str(t.get("description") or "")}
+        if t.get("type") == "custom":
+            fmt = t.get("format") if isinstance(t.get("format"), dict) else {}
+            what = "The tool's input, free-form text"
+            if fmt.get("type") == "grammar" and fmt.get("definition"):
+                what += " in this " + (f"{fmt['syntax']} " if fmt.get("syntax") else "") + f"grammar:\n{fmt['definition']}"
+            f["parameters"] = {"type": "object", "properties": {"input": {"type": "string", "description": what}},
+                               "required": ["input"]}
+            custom.add(name)
+        else:
+            f["parameters"] = t.get("parameters") if isinstance(t.get("parameters"), dict) else {}
+        if space:
+            ns[name] = space
+        out.append({"type": "function", "function": f})
+
+    for t in tools:
+        if not isinstance(t, dict):
+            raise BadRequest("tools: each tool must be an object")
+        kind = t.get("type")
+        if kind in ("function", "custom"):
+            add(t)
+        elif kind == "namespace":
+            for sub in t.get("tools") or []:
+                if not isinstance(sub, dict) or sub.get("type") not in ("function", "custom"):
+                    raise BadRequest(f"tools: namespace {t.get('name')!r}: function or custom tools only")
+                add(sub, str(t.get("name") or ""))
+        else:
+            notes.append((f"responses-tool-{kind}", f"Responses tool type {kind!r} is not supported (the server runs no "
+                          "tools): it is not offered to the model"))
+    return out, ns, custom
+
+
+def responses_to_chat(body, notes=None, mid_system=True):
+    """a Responses API request as the server's chat request: (chat body, {"ns": function namespaces, "custom": custom
+    tool names}: what the output items need). input: a string (one user message) or items: messages (roles user,
+    assistant, system, developer -> system), reasoning (-> reasoning_content: its reasoning_text content, else this
+    server's encrypted_content, else its summary), function_call / custom_tool_call (-> tool_calls) and their outputs
+    (-> tool messages); the assistant-side items of one turn become one assistant message in generation order.
+    instructions and the leading system / developer messages become one system message (their trimmed texts joined by
+    newlines, as Qwen's templates merge them); a later one becomes a user message in its place when the template takes
+    a system message only at the start (mid_system False). Whatever would change the output and cannot be honoured is
+    a BadRequest (stored state, forced tool calls, JSON output, logprobs, files). notes: gets (key, message) for what was
+    dropped or converted (the console's one-time warnings)"""
+    notes = [] if notes is None else notes
+
+    def bad(field, why):
+        raise BadRequest(f"{field}: {why}")
+    for k in ("previous_response_id", "conversation"):
+        if body.get(k):
+            bad(k, "not supported: the server stores no responses (send the whole conversation in input, with store "
+                   "false)")
+    if body.get("background"):
+        bad("background", "not supported: the server stores no responses")
+    if body.get("prompt"):
+        bad("prompt", "stored prompt templates are not supported")
+    inp = body.get("input")
+    items = [{"type": "message", "role": "user", "content": inp}] if isinstance(inp, str) else inp
+    if not isinstance(items, list):
+        bad("input", "a string or an array of input items is required")
+    msgs = []
+    if body.get("instructions") is not None:
+        if not isinstance(body["instructions"], str):
+            bad("instructions", "a string")
+        msgs.append({"role": "system", "content": body["instructions"]})
+    # stage of the last message when it is an assistant message: 0 reasoning, 1 text, 2 tool calls (the order the model
+    # generates them in, one reasoning and one text each); an item that cannot come next starts a new assistant message
+    stage = [None]
+
+    def turn(s):
+        if stage[0] is None or stage[0] > s or (stage[0] == s and s < 2):
+            msgs.append({"role": "assistant", "content": ""})
+        stage[0] = s
+        return msgs[-1]
+
+    def other(m):
+        msgs.append(m)
+        stage[0] = None
+
+    for it in items:
+        if not isinstance(it, dict):
+            bad("input", "input items must be objects")
+        t = it.get("type") or ("message" if "role" in it else None)
+        if t == "message":
+            role = it.get("role")
+            if role not in ("user", "assistant", "system", "developer"):
+                bad("input", f"message role {role!r}: user, assistant, system or developer")
+            content = _resp_content(it.get("content"), "input message content")
+            if role == "assistant":
+                turn(1)["content"] = content
+            else:
+                other({"role": "system" if role == "developer" else role, "content": content})
+        elif t == "reasoning":
+            parts = it.get("content") if isinstance(it.get("content"), list) else []
+            texts = [str(p.get("text") or "") for p in parts if isinstance(p, dict) and p.get("type") == "reasoning_text"]
+            text = "".join(texts) if texts else reasoning_open(it.get("encrypted_content"))
+            if text is None:
+                summary = it.get("summary") if isinstance(it.get("summary"), list) else []
+                text = "\n\n".join(str(p.get("text") or "") for p in summary if isinstance(p, dict))
+            turn(0)["reasoning_content"] = text
+        elif t in ("function_call", "custom_tool_call"):
+            if not isinstance(it.get("name"), str) or not it.get("name"):
+                bad("input", f"a {t} item needs a name")
+            args = it.get("arguments") if t == "function_call" else json.dumps({"input": str(it.get("input") or "")},
+                                                                                ensure_ascii=False)
+            turn(2).setdefault("tool_calls", []).append({"id": str(it.get("call_id") or ""), "type": "function", "function": {
+                "name": it["name"], "arguments": args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)}})
+        elif t in ("function_call_output", "custom_tool_call_output"):
+            other({"role": "tool", "tool_call_id": str(it.get("call_id") or ""),
+                   "content": _resp_content(it.get("output") if it.get("output") is not None else "", f"{t} output")})
+        elif t == "item_reference":
+            bad("input", "item_reference is not supported: the server stores no items (send the items themselves)")
+        else:  # (built-in tool calls the server never makes: web_search_call, local_shell_call, compaction, ...)
+            notes.append((f"responses-item-{t}", f"Responses input item type {t!r} is not supported: skipped"))
+    # one system message at the start (Qwen's templates merge leading system / developer messages this way; the original
+    # template takes only the first)
+    lead = 0
+    while lead < len(msgs) and msgs[lead]["role"] == "system" and isinstance(msgs[lead]["content"], str):
+        lead += 1
+    if lead > 1:
+        msgs[:lead] = [{"role": "system", "content": "\n".join(
+            s for s in (m["content"].strip() for m in msgs[:lead]) if s)}]
+    if not mid_system:
+        for i, m in enumerate(msgs):
+            if i and m["role"] == "system":
+                m["role"] = "user"
+                notes.append(("responses-mid-system", "Responses system / developer messages inside the conversation are "
+                              "rendered as user messages in their place: the chat template takes a system message only "
+                              "at the start"))
+    out = {"messages": msgs, "stream": bool(body.get("stream"))}
+    if body.get("max_output_tokens") is not None:
+        out["max_tokens"] = body["max_output_tokens"]
+    # (temperature, top_p: the API's; the others: the chat path's extensions, as llama-server passes the body through)
+    for k in ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty",
+              "chat_template_kwargs", "top_logprobs"):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    include = body.get("include") or []
+    if not isinstance(include, list):
+        bad("include", "an array of strings")
+    if "message.output_text.logprobs" in include:
+        bad("include", "message.output_text.logprobs: token log-probabilities are not available from the megakernel")
+    text = body.get("text")
+    if text is not None:
+        if not isinstance(text, dict):
+            bad("text", "an object")
+        fmt = text.get("format")
+        if fmt is not None and not (isinstance(fmt, dict) and fmt.get("type", "text") == "text"):
+            bad("text.format", "only {\"type\": \"text\"}: JSON output needs constrained sampling (a grammar), which the "
+                               "megakernel does not have")
+        if text.get("verbosity") not in (None, "medium"):
+            notes.append(("responses-verbosity", "Responses text.verbosity is not supported (the model has no such "
+                          "control): the reply is generated as usual"))
+    reasoning = body.get("reasoning")
+    if reasoning is not None:
+        if not isinstance(reasoning, dict):
+            bad("reasoning", "an object")
+        if isinstance(reasoning.get("effort"), str) and reasoning["effort"]:
+            out["reasoning_effort"] = reasoning["effort"]  # (Server.render: none = thinking off, minimal = low)
+        if (reasoning.get("summary") or reasoning.get("generate_summary")) not in (None, "none"):
+            notes.append(("responses-summary", "Responses reasoning summaries are not generated: the reasoning is "
+                          "returned whole as reasoning_text content (Codex shows it with show_raw_agent_reasoning)"))
+    tools = body.get("tools")
+    info = {"ns": {}, "custom": set()}
+    if tools:
+        if not isinstance(tools, list):
+            bad("tools", "an array of tools")
+        out["tools"], info["ns"], info["custom"] = responses_tools(tools, notes)
+    tc = body.get("tool_choice")
+    if tc not in (None, "auto", "none"):
+        bad("tool_choice", "\"auto\" or \"none\": forcing a tool call (required / a named or allowed tool) needs "
+                           "constrained sampling, which the megakernel does not have")
+    if tc is not None:
+        out["tool_choice"] = tc
+    if body.get("parallel_tool_calls") is False:
+        out["parallel_tool_calls"] = False
+    return out, info
+
+
+def responses_usage(usage, reasoning_tokens=0):
+    """the chat usage as a Response's (input_tokens counts the reused ones, as OpenAI's does)"""
+    return {"input_tokens": usage["prompt_tokens"],
+            "input_tokens_details": {"cached_tokens": usage["prompt_tokens_details"]["cached_tokens"], "cache_write_tokens": 0},
+            "output_tokens": usage["completion_tokens"], "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
+            "total_tokens": usage["total_tokens"]}
+
+
+def responses_reasoning(text, rid, sealed, status="completed"):
+    item = {"type": "reasoning", "id": rid, "summary": [], "content": [{"type": "reasoning_text", "text": text}],
+            "encrypted_content": reasoning_seal(text) if sealed else None, "status": status}
+    return item
+
+
+def responses_message(text, mid, status="completed"):
+    return {"type": "message", "id": mid, "status": status, "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": [], "logprobs": []}]}
+
+
+def responses_call(call_id, name, arguments, info, status="completed"):
+    """a tool call as a function_call item (with its namespace), or a custom_tool_call for a custom tool (its input:
+    the call's "input" argument)"""
+    key = call_id.removeprefix("call_")
+    if name in info["custom"]:
+        try:
+            inp = json.loads(arguments).get("input")
+        except (ValueError, AttributeError):
+            inp = None
+        return {"type": "custom_tool_call", "id": "ctc_" + key, "call_id": call_id, "name": name,
+                "input": inp if isinstance(inp, str) else "", "status": status}
+    item = {"type": "function_call", "id": "fc_" + key, "call_id": call_id, "name": name, "arguments": arguments,
+            "status": status}
+    if name in info["ns"]:
+        item["namespace"] = info["ns"][name]
+    return item
+
+
+def response_object(rid, created, body, model, status, output, usage=None, error=None, incomplete=None):
+    """a Response object (the request's settings echoed as OpenAI does; store false: nothing is kept)"""
+    r = body.get("reasoning") if isinstance(body.get("reasoning"), dict) else {}
+    text = body.get("text") if isinstance(body.get("text"), dict) else {}
+    return {"id": rid, "object": "response", "created_at": created, "status": status, "background": False,
+            "completed_at": int(time.time()) if status == "completed" else None, "error": error,
+            "incomplete_details": incomplete, "instructions": body.get("instructions"),
+            "max_output_tokens": body.get("max_output_tokens"), "max_tool_calls": body.get("max_tool_calls"),
+            "model": model, "output": output, "parallel_tool_calls": body.get("parallel_tool_calls") is not False,
+            "previous_response_id": None, "reasoning": {"effort": r.get("effort"), "summary": r.get("summary")},
+            "service_tier": "default", "store": False,
+            "temperature": body["temperature"] if body.get("temperature") is not None else DEF_TEMP,
+            "text": {"format": {"type": "text"}, "verbosity": text.get("verbosity") or "medium"},
+            "tool_choice": body.get("tool_choice") or "auto", "tools": body.get("tools") or [],
+            "top_p": body["top_p"] if body.get("top_p") is not None else DEF_TOP_P,
+            "truncation": body.get("truncation") or "disabled", "usage": usage, "user": body.get("user"),
+            "metadata": body.get("metadata") or {}}
+
+
+# ---------------------------------------------------------------------------------------------
 
 
 class FifoLock:
@@ -1905,6 +2217,7 @@ class Server:
     img_spans = ()  # the images of the engine's sequence: (pos, n, key); replaced, never mutated
     stop_word = None  # the stop string that ended the last reply (None: it ended otherwise)
     last_prompt = (0, 0)  # the running request's prompt: (tokens, reused tokens), once it is processed
+    reasoning_tokens = 0  # the last reply's tokens generated inside its thinking (a Response's reasoning_tokens)
     rids = itertools.count(1)  # request numbers for the console
     rid = 0  # the running (or last) request's number: "#rid" on its console lines
     req = ("chat", None, 0.0)  # its (route, model field, start time), set by the handler when it gets the engine
@@ -2859,6 +3172,7 @@ class Server:
         for kind, delta in parser.feed(stopper.feed(dec.decode(b"", final=True), final=True), final=True):
             emit(kind, delta)
         self.stop_word = stopper.word
+        self.reasoning_tokens = phase["thinking"]
         calls = parser.calls
         if body.get("parallel_tool_calls") is False:
             calls = calls[:1]  # (the first call only)
@@ -2900,10 +3214,11 @@ class Server:
 POST_ROUTES = {"/v1/chat/completions": "chat", "/chat/completions": "chat", "/v1/messages": "messages",
                "/v1/messages/count_tokens": "count_tokens", "/tokenize": "tokenize", "/detokenize": "detokenize",
                "/apply-template": "apply_template", "/v1/chat/completions/input_tokens": "input_tokens",
-               "/chat/completions/input_tokens": "input_tokens"}
-# llama-server's other POST routes: 501 (not supported here) instead of 404
-UNSUPPORTED = {"/completion", "/completions", "/v1/completions", "/v1/responses", "/responses", "/v1/responses/input_tokens",
-               "/responses/input_tokens", "/infill", "/embedding", "/embeddings", "/v1/embeddings", "/rerank", "/reranking",
+               "/chat/completions/input_tokens": "input_tokens", "/v1/responses": "responses", "/responses": "responses",
+               "/v1/responses/input_tokens": "responses_input_tokens", "/responses/input_tokens": "responses_input_tokens"}
+# llama-server's other POST routes (and OpenAI's compaction route): 501 (not supported here) instead of 404
+UNSUPPORTED = {"/completion", "/completions", "/v1/completions", "/v1/responses/compact", "/responses/compact",
+               "/infill", "/embedding", "/embeddings", "/v1/embeddings", "/rerank", "/reranking",
                "/v1/rerank", "/v1/reranking", "/v1/audio/transcriptions", "/audio/transcriptions", "/lora-adapters",
                "/v1/chat/completions/control", "/models", "/v1/streams/lookup", "/tools", "/cors-proxy"}
 
@@ -3233,7 +3548,8 @@ def make_handler(srv):
                     self.close_connection = True
                     return
             route = POST_ROUTES.get(path)
-            anth = path.startswith("/v1/messages")  # (errors in Anthropic's shape)
+            # (errors in Anthropic's shape on /v1/messages, OpenAI's on /v1/responses: _error)
+            anth = "responses" if path.startswith(("/v1/responses", "/responses")) else path.startswith("/v1/messages")
             if route is None:
                 known = path in UNSUPPORTED or path.startswith(("/slots", "/props", "/models/"))
                 self._error(501 if known else 404, f"{path} is not supported by the megakernel server", anth)
@@ -3245,7 +3561,7 @@ def make_handler(srv):
             if not isinstance(body, dict):
                 self._error(400, "the request body must be a JSON object", anth)
                 return
-            if route in ("tokenize", "detokenize", "apply_template", "input_tokens", "count_tokens"):
+            if route in ("tokenize", "detokenize", "apply_template", "input_tokens", "count_tokens", "responses_input_tokens"):
                 try:  # (no generation: the tokenizer, from this thread; images take the engine's lock)
                     self._json(200, getattr(self, "_" + route)(body))
                 except BadRequest as e:
@@ -3261,6 +3577,8 @@ def make_handler(srv):
                 try:
                     if route == "messages":
                         self._anthropic(body)
+                    elif route == "responses":
+                        self._responses(body)
                     elif body.get("stream"):
                         self._stream(body)
                     else:
@@ -3285,11 +3603,15 @@ def make_handler(srv):
                     srv.eng.keep_warm()  # (MK_KEEP_WARM_S: the window restarts after every request)
 
         def _error(self, code, message, anthropic=False, rid=None, kind=None, extra=None):
-            """answers with an error (OpenAI / llama-server's shape with its code, or Anthropic's); a 4xx is also logged
-            (a 5xx was logged with its exception). kind: the type instead of the code's; extra: more fields"""
+            """answers with an error (OpenAI / llama-server's shape with its code, Anthropic's, or with anthropic
+            "responses" the OpenAI API's: code a string or null); a 4xx is also logged (a 5xx was logged with its
+            exception). kind: the type instead of the code's; extra: more fields"""
             if code < 500:
                 log(f"#{rid} {code}: {message}" if rid else f"{self.command} {self.path.split('?')[0]} -> {code}: {message}")
-            if anthropic:
+            if anthropic == "responses":
+                kind = kind or {400: "invalid_request_error", 404: "not_found_error", 501: "not_supported"}.get(code, "server_error")
+                self._json(code, {"error": {"message": message, "type": kind, "param": None, "code": None, **(extra or {})}})
+            elif anthropic:
                 err = {"type": kind or ANTHROPIC_ERRORS.get(code, "api_error"), "message": message, **(extra or {})}
                 self._json(code, {"type": "error", "error": err})
             else:
@@ -3301,6 +3623,8 @@ def make_handler(srv):
             if not isinstance(e, ContextOverflow):
                 return self._error(400, str(e), anthropic, rid)
             extra = {"n_prompt_tokens": e.n_prompt, "n_ctx": e.n_ctx}
+            if anthropic == "responses":  # (OpenAI's error code for it)
+                return self._error(400, str(e), anthropic, rid, extra={**extra, "code": "context_length_exceeded"})
             if anthropic:
                 return self._error(400, e.anthropic, True, rid, extra=extra)
             self._error(400, str(e), False, rid, "exceed_context_size_error", extra)
@@ -3474,6 +3798,193 @@ def make_handler(srv):
                 "stop_reason": anthropic_stop_reason(finish, srv.stop_word), "stop_sequence": srv.stop_word},
                 "usage": anthropic_usage(usage)})
             event("message_stop", {"type": "message_stop"}, last=True)
+
+        # ---- OpenAI Responses ----
+        def _responses_chat(self, body):
+            """responses_to_chat; what it dropped or converted is a one-time console warning per kind"""
+            notes = []
+            if getattr(srv, "mid_system", None) is None:  # (the template's answer, once)
+                srv.mid_system = takes_mid_system(srv.template)
+            chat, info = responses_to_chat(body, notes, srv.mid_system)
+            for key, msg in notes:
+                srv.warn_once(key, msg)
+            return chat, info
+
+        def _responses_input_tokens(self, body):
+            return {"object": "response.input_tokens", "input_tokens": srv.prompt_tokens(self._responses_chat(body)[0])}
+
+        def _responses(self, body):
+            chat, info = self._responses_chat(body)
+            rid, created = "resp_" + uuid.uuid4().hex, int(time.time())
+            sealed = "reasoning.encrypted_content" in (body.get("include") or [])
+            if chat["stream"]:
+                return self._responses_stream(body, chat, info, rid, created, sealed)
+            parts = {"reasoning": [], "content": []}
+            finish, calls, usage, _ = srv.generate(chat, lambda k, t: parts[k].append(t), self.client_gone)
+            output = []
+            reasoning = "".join(parts["reasoning"]).strip()
+            if reasoning:
+                output.append(responses_reasoning(reasoning, "rs_" + uuid.uuid4().hex, sealed))
+            if parts["content"]:
+                output.append(responses_message("".join(parts["content"]), "msg_" + uuid.uuid4().hex))
+            output += [responses_call(c["id"], c["function"]["name"], c["function"]["arguments"], info) for c in calls]
+            done = finish != "length"
+            self._json(200, response_object(
+                rid, created, body, srv.model_id, "completed" if done else "incomplete", output,
+                responses_usage(usage, srv.reasoning_tokens), incomplete=None if done else {"reason": "max_output_tokens"}))
+
+        def _responses_stream(self, body, chat, info, rid, created, sealed):
+            """the Responses API's SSE: response.created and response.in_progress when the prefill starts (a request
+            refused before that is an HTTP error), response.in_progress every RESP_KEEPALIVE_S during a long prefill (a
+            client times out a silent stream: Codex after 300 s), then the output items as they are generated, each
+            opened with output_item.added and closed with its done events: reasoning (reasoning_text deltas, trimmed at
+            both ends as the non-streamed item), message (output_text deltas), function_call (its arguments' JSON
+            text as it is generated) or custom_tool_call (its input whole at the end); then response.completed
+            (response.incomplete after max_output_tokens) with the usage. An error once it has started is
+            response.failed (code server_error, invalid_prompt for a bad request). Every event has its sequence_number."""
+            st = {"started": False, "seq": 0, "items": [], "open": None, "ws": "", "t": 0.0}
+
+            def send(data, last=False):
+                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
+                self.wfile.flush()
+
+            def event(obj, last=False):
+                obj["sequence_number"] = st["seq"]
+                st["seq"] += 1
+                st["t"] = time.monotonic()
+                send(f"event: {obj['type']}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n".encode(), last)
+
+            def response(status, **kw):
+                return response_object(rid, created, body, srv.model_id, status, list(st["items"]), **kw)
+
+            def start():
+                if st["started"]:
+                    return
+                st["started"] = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                event({"type": "response.created", "response": response("in_progress")})
+                event({"type": "response.in_progress", "response": response("in_progress")})
+
+            def progress(cached, processed, total):  # (Server.prompt_progress: the prefill's start, every 0.5 s, its end)
+                try:
+                    if not st["started"]:
+                        start()
+                    elif time.monotonic() - st["t"] >= RESP_KEEPALIVE_S:
+                        event({"type": "response.in_progress", "response": response("in_progress")})
+                except (BrokenPipeError, ConnectionResetError):  # (generate notices the disconnect)
+                    pass
+
+            def where():
+                o = st["open"]
+                return {"item_id": o["item"]["id"], "output_index": o["index"]}
+
+            def open_item(item):
+                close()
+                st["open"] = {"index": len(st["items"]), "item": item, "text": ""}
+                st["items"].append(item)
+                event({"type": "response.output_item.added", "output_index": st["open"]["index"], "item": item})
+
+            def close():
+                o = st["open"]
+                if o is None:
+                    return
+                item, text, at = o["item"], o["text"], where()
+                if item["type"] == "reasoning":
+                    event({"type": "response.reasoning_text.done", **at, "content_index": 0, "text": text})
+                    event({"type": "response.content_part.done", **at, "content_index": 0,
+                           "part": {"type": "reasoning_text", "text": text}})
+                    done = responses_reasoning(text, item["id"], sealed)
+                elif item["type"] == "message":
+                    done = responses_message(text, item["id"])
+                    event({"type": "response.output_text.done", **at, "content_index": 0, "text": text, "logprobs": []})
+                    event({"type": "response.content_part.done", **at, "content_index": 0, "part": done["content"][0]})
+                else:  # (a call's arguments are valid JSON only when it is complete: ToolCallParser)
+                    try:
+                        json.loads(text)
+                        status = "completed"
+                    except ValueError:
+                        status = "incomplete"
+                    done = responses_call(item["call_id"], item["name"], text, info, status)
+                    if done["type"] == "custom_tool_call":
+                        if done["input"]:
+                            event({"type": "response.custom_tool_call_input.delta", **at, "delta": done["input"]})
+                        event({"type": "response.custom_tool_call_input.done", **at, "input": done["input"]})
+                    else:
+                        event({"type": "response.function_call_arguments.done", **at, "name": item["name"],
+                               "arguments": text})
+                st["items"][o["index"]] = done
+                st["open"] = None
+                event({"type": "response.output_item.done", "output_index": o["index"], "item": done})
+
+            def emit(kind, x):
+                try:
+                    start()
+                    o = st["open"]
+                    if kind == "reasoning":
+                        t = st["ws"] + x
+                        if not o or o["item"]["type"] != "reasoning":
+                            t = t.lstrip()
+                            if not t:
+                                return True
+                            open_item({"type": "reasoning", "id": "rs_" + uuid.uuid4().hex, "summary": [], "content": [],
+                                       "encrypted_content": None, "status": "in_progress"})
+                            event({"type": "response.content_part.added", **where(), "content_index": 0,
+                                   "part": {"type": "reasoning_text", "text": ""}})
+                        piece = t.rstrip()
+                        st["ws"] = t[len(piece):]
+                        if piece:
+                            st["open"]["text"] += piece
+                            event({"type": "response.reasoning_text.delta", **where(), "content_index": 0, "delta": piece})
+                    elif kind == "tool_call":  # (ToolCallParser's events: a call's start, then its arguments' JSON text)
+                        if "id" in x:
+                            item = responses_call(x["id"], x["function"]["name"], "", info, "in_progress")
+                            if item["type"] == "custom_tool_call":
+                                item["input"] = ""
+                            open_item(item)
+                        frag = x["function"].get("arguments")
+                        if frag:
+                            st["open"]["text"] += frag
+                            if st["open"]["item"]["type"] == "function_call":  # (a custom tool's input: at its end)
+                                event({"type": "response.function_call_arguments.delta", **where(), "delta": frag})
+                    else:
+                        if not o or o["item"]["type"] != "message":
+                            open_item(responses_message("", "msg_" + uuid.uuid4().hex, "in_progress") | {"content": []})
+                            event({"type": "response.content_part.added", **where(), "content_index": 0,
+                                   "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []}})
+                        st["open"]["text"] += x
+                        event({"type": "response.output_text.delta", **where(), "content_index": 0, "delta": x,
+                               "logprobs": []})
+                except (BrokenPipeError, ConnectionResetError):
+                    return False
+                return True
+
+            check_params(chat)  # (parameter / render errors: a 400 before the stream starts)
+            srv.render(chat)
+            srv.on_progress = progress
+            try:
+                finish, calls, usage, _ = srv.generate(chat, emit, self.client_gone)
+                start()
+                close()
+            except Exception as e:
+                if not st["started"] or isinstance(e, (BrokenPipeError, ConnectionResetError, ClientGone)):
+                    raise  # nothing sent yet: do_POST answers with a status (400 / 500)
+                bad = isinstance(e, BadRequest)
+                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
+                event({"type": "response.failed", "response": response("failed", error={
+                    "code": "invalid_prompt" if bad else "server_error", "message": str(e)})}, last=True)
+                return
+            finally:
+                srv.on_progress = None
+            usage = responses_usage(usage, srv.reasoning_tokens)
+            if finish == "length":
+                event({"type": "response.incomplete", "response": response(
+                    "incomplete", usage=usage, incomplete={"reason": "max_output_tokens"})}, last=True)
+            else:
+                event({"type": "response.completed", "response": response("completed", usage=usage)}, last=True)
 
         def _complete(self, body):
             parts = {"reasoning": [], "content": []}
