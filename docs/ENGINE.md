@@ -412,8 +412,9 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   conversations (above) and the low-priority ones, least recently parked first among those: a conversation replaced
   by a request without tools while its own last request had tools (agent clients summarise a conversation before
   compacting it with such a request), the conversation of that request when the next one replaces it (the compacted
-  conversation), and a conversation replaced right after a side request without tools of at least `--park-min` prompt
-  tokens (its summary); one that comes back is a normal conversation again (console: `low priority: <why>` on the park
+  conversation), and a conversation replaced right after a side request without tools that quoted at least
+  `--park-min` prompt tokens and answered at least 256 (its summary: titles, tags, follow-ups and commit messages answer
+  in tens); one that comes back is a normal conversation again (console: `low priority: <why>` on the park
   line). Host memory is allocated on first use and kept for reuse (pinned allocation runs at ~1 GB/s under WSL2,
   copies at ~26 GB/s): a 38k-token conversation (q8_0 KV, 37 KB per token) takes 1.9 GB with two checkpoints and ~65 ms
   per park or restore (a 101.6k-token one 4.3 GB and ~150 ms), against ~24 s (~80 s) to prefill it again.

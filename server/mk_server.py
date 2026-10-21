@@ -2249,6 +2249,9 @@ SIDE_REPLY_MAX = 1024  # with parking on, a side request with tools asks for at 
 SIDE_REPLY_ROOM = 8192  # store room a side request takes for the rows of a reply it does not cap (Server.side_start)
 SIDE_PARK_CKS = 1  # checkpoints kept with a side request's conversation (its generation prompt's: where a follow-up resumes)
 SIDE_KEEP_MAX = 4  # side requests' conversations kept at most (the oldest goes first): most are titles, never continued
+# a side request without tools that quotes at least --park-min tokens and answers at least this many (thinking aside) is
+# taken for a summary of the conversation beside it (titles, tags, follow-ups and commit messages answer in tens)
+SUMMARY_ANSWER_MIN = 256
 
 
 def mib(n):
@@ -2263,6 +2266,7 @@ class Server:
     stop_word = None  # the stop string that ended the last reply (None: it ended otherwise)
     last_prompt = (0, 0)  # the running request's prompt: (tokens, reused tokens), once it is processed
     reasoning_tokens = 0  # the last reply's tokens generated inside its thinking (a Response's reasoning_tokens)
+    answer_tokens = 0  # the running (or last) reply's tokens of its answer (not thinking, not a tool call)
     rids = itertools.count(1)  # request numbers for the console
     rid = 0  # the running (or last) request's number: "#rid" on its console lines
     req = ("chat", None, 0.0)  # its (route, model field, start time), set by the handler when it gets the engine
@@ -2451,9 +2455,10 @@ class Server:
         # session stays live while a chat without tools or a client's summary (the conversation as messages) runs
         # beside it
         if side_ok and (first_turn or (not tools and self.live_tools and a.park_mib > 0)):
-            # a long one beside the live conversation (a summary of it?): if the next request replaces the live
-            # conversation instead of continuing it, it was the summarised one, parked with low priority
-            after = "replaced right after a long request without tools beside it" if (
+            # a summary of the live conversation (a long one without tools that answers at length: side_finish): if the
+            # next request replaces the live conversation instead of continuing it, it was the summarised one, parked
+            # with low priority
+            after = "replaced right after a summary request beside it" if (
                 not tools and len(toks) >= a.park_min and a.park_mib > 0) else ""
             self.side_start(seq, len(toks), max_tokens, after=after)
             return
@@ -2577,7 +2582,7 @@ class Server:
         if not eng.side_begin():
             log(f"#{self.rid} side request: no room in the host store: the cached {len(seq):,} tok are not kept")
             return
-        self.side = (len(seq), self.img_spans, self.live_gen, self.live_tools, after or self.live_low)
+        self.side = (len(seq), self.img_spans, self.live_gen, self.live_tools, self.live_low, after)
         self.side_ready = False
         self.count(side_requests=1)
         self.cache_pre = f"side request: the cached {len(seq):,} tok are kept aside; "
@@ -2598,7 +2603,7 @@ class Server:
         checkpoint to resume from)"""
         if self.side is None:
             return
-        n, spans, gen, tools, low = self.side
+        n, spans, gen, tools, low, after = self.side
         self.side, eng, a = None, self.eng, self.args
         ok, pid, own, room = False, None, None, True
         try:
@@ -2630,7 +2635,8 @@ class Server:
         elif own is not None and ok:
             kept = "; its own conversation was not parked (no room in the host store)"
         if ok:
-            self.img_spans, self.live_gen, self.live_tools, self.live_low = spans, gen, tools, low
+            self.img_spans, self.live_gen, self.live_tools = spans, gen, tools
+            self.live_low = after if after and self.answer_tokens >= SUMMARY_ANSWER_MIN else low
             log(f"#{self.rid} side request done: the cached {n:,} tok are back ({mib(info['last_bytes'])}: kept in "
                 f"{info['side_ms']:.0f} ms, back in {info['last_ms']:.0f} ms){kept}")
         elif own is not None and room:  # (side_end_park: the kept sequence was lost, the side request's conversation stays)
@@ -3161,6 +3167,7 @@ class Server:
         closed its connection; asked before the prefill, during it by a watcher thread (the prefill stops at its next
         chunk) and before each engine cycle) stops it with ClientGone."""
         check_params(body)
+        self.answer_tokens = 0
         CON.status(f"#{self.rid} preparing the prompt (template, tokens, media)")
         text, thinking, media = self.render(body)
         toks, images = self.tokenize_prompt(text, media)
@@ -3290,7 +3297,7 @@ class Server:
         for kind, delta in parser.feed(stopper.feed(dec.decode(b"", final=True), final=True), final=True):
             emit(kind, delta)
         self.stop_word = stopper.word
-        self.reasoning_tokens = phase["thinking"]
+        self.reasoning_tokens, self.answer_tokens = phase["thinking"], phase["answer"]
         calls = parser.calls
         if body.get("parallel_tool_calls") is False:
             calls = calls[:1]  # (the first call only)

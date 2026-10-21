@@ -229,8 +229,8 @@ class DebrisTests(base._HttpCase):
     LONG = base.HostCacheTests.LONG
     serve = EditedHistoryTests.serve
 
-    def setup(self, side_max=200, park_mib=4):
-        eng = side._SideEngine(["a", "b"])
+    def setup(self, side_max=200, park_mib=4, pieces=("a", "b")):
+        eng = side._SideEngine(list(pieces))
         srv, http_ = base.HostCacheTests.serve_store(self, eng, side_max=side_max, park_mib=park_mib)
         return eng, srv, http_
 
@@ -280,12 +280,15 @@ class DebrisTests(base._HttpCase):
         self.assertNotIn(("drop", z[1]), eng.ops, log)
         self.assertEqual(self.entries(srv)[0][:2], (z[2], False), log)
 
-    def test_after_a_long_summary_beside_it_a_replaced_conversation_is_low_a_continued_one_is_not(self) -> None:
+    def test_after_a_summary_beside_it_a_replaced_conversation_is_low_a_continued_one_is_not(self) -> None:
         summary = [{"role": "user", "content": "Summarize: " + "the user asked to read files. " * 3}]  # (side request)
         task = [{"role": "user", "content": "A: " + self.LONG}]
-        for then, low in (([{"role": "user", "content": "Summary: done. go on"}], True),  # (the compacted one: new)
-                          (None, False)):  # (the conversation continues uncompacted, then a new one comes)
-            eng, srv, http_ = self.setup()
+        new = [{"role": "user", "content": "Summary: done. go on"}]  # (the compacted conversation)
+        long, short = ["w"] * (self.mk.SUMMARY_ANSWER_MIN + 8), ["a", "b"]  # (a summary's answer, a title's)
+        for pieces, then, low in ((long, new, True),  # (a summary, then the compacted conversation: low)
+                                  (long, None, False),  # (the conversation continues uncompacted, then a new one)
+                                  (short, new, False)):  # (a long one-shot with a short answer: not a summary)
+            eng, srv, http_ = self.setup(pieces=pieces)
 
             def run():
                 r = self.chat(http_, task, tools=TOOLS)
@@ -297,9 +300,8 @@ class DebrisTests(base._HttpCase):
             log = self.quiet(run)
             self.assertIn("side request done", log)
             real = [e for e in srv.parked.values() if not e.side]
-            self.assertEqual([e.low for e in real], [low], log)
-            if low:
-                self.assertIn("low priority: replaced right after a long request without tools beside it", log)
+            self.assertEqual([e.low for e in real], [low], (len(pieces), then is None, log))
+            self.assertEqual("low priority: replaced right after a summary request beside it" in log, low)
 
     def test_a_low_entry_that_comes_back_is_parked_normally_again(self) -> None:
         eng, srv, http_ = self.setup()
