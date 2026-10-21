@@ -32,50 +32,44 @@ greedy unless noted. The same binary can run several percent faster or slower fr
 temperature and clocks), so every number below carries its date, and changes made after the last full run are given as
 A-B-A deltas against the build before them, not added onto its numbers.
 
-### Last full run: 2026-10-15
+### Last full run: 2026-10-20
 
-This engine at commit 7d67c5d on Linux (WSL2), in the configuration served that day (wide verify, 7 drafts, exact
-reuse), one session. The llama.cpp column is b11548's `llama-server`, tuned (q8_0 KV, 4 MTP drafts), with the same
-client, prompts and model file: the best value of each row over three earlier sessions (2026-10-12 and 2026-10-13).
+This engine at commit 7322fbd on Linux (WSL2), in the configuration served that day (wide verify, 7 drafts, exact
+reuse, side requests and parked conversations on), one session with the GPU fans at 100%. The llama.cpp column is
+b11548's `llama-server`, tuned (q8_0 KV, 4 MTP drafts), with the same client, prompts and model file: the best value of
+each row over three earlier sessions (2026-10-12 and 2026-10-13).
 
-| | llama.cpp (10-12 / 10-13) | this, q8_0 KV | this, preset D' |
+| | llama.cpp (10-12 / 10-13) | this, q8_0 KV | this, preset D |
 |---|---|---|---|
-| greedy decode, short prompts (4 x 512 tokens) | 82.7 tok/s | **151.3** | 150.2 |
-| sampled decode, thinking on (8 runs) | 65.8 tok/s | **134.9** | 134.1 |
-| decode at 11.6k context | 69.3 tok/s | **135.1** | 131.3 |
-| decode at 38k context | 62.3 tok/s | **114.3** | 101.7 |
-| decode at 101.6k context | 53.4 tok/s | **105.4** | 96.8 |
-| read an 11.6k / 38k / 101.6k-token prompt | 8.24 / 29.6 / 101.0 s | **6.15 / 22.7 / 77.7 s** | 6.32 / 23.6 / 82.2 s |
-| first token, short prompt | 124 ms | **68 ms** | 70 ms |
-| follow-up turn in an 11.8k chat, prompt time | 323 ms | **182 ms** | 190 ms |
-| edit an earlier message in an 11.7k chat | 329 ms | **75 ms** | 79 ms |
-| edit the end of a 9.1k system prompt | 956 ms | **90 ms** | 100 ms |
-| VRAM, whole card, server idle | 22.8 GB | 21.3 GB | **20.3 GB** |
-| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,727 s (10-13) | 230 right, **1,739 s** | 230 right, 1,775 s |
+| greedy decode, short prompts (4 x 512 tokens) | 82.7 tok/s | 155.1 | **155.5** |
+| sampled decode, thinking on (8 runs) | 65.8 tok/s | 136.5 | **136.8** |
+| decode at 11.6k context | 69.3 tok/s | **137.3** | 136.1 |
+| decode at 38k context | 62.3 tok/s | **117.9** | 101.9 |
+| decode at 101.6k context | 53.4 tok/s | **108.7** | 98.6 |
+| read an 11.6k / 38k / 101.6k-token prompt | 8.24 / 29.6 / 101.0 s | **5.98 / 23.2 / 74.5 s** | 6.09 / 24.1 / 77.6 s |
+| first token, short prompt | 124 ms | 66 ms | **65 ms** |
+| follow-up turn in an 11.8k chat, prompt time | 323 ms | **178 ms** | 185 ms |
+| edit an earlier message in an 11.7k chat | 329 ms | **76 ms** | 76 ms |
+| edit the end of a 9.1k system prompt | 956 ms | **89 ms** | 97 ms |
+| VRAM, whole card, server idle | 22.8 GB | 21.1 GB | **20.0 GB** |
+| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,727 s (10-13) | 230 right, **1,681 s** | 230 right, 1,722 s |
 
 - The two short-prompt rows are means of the per-request rates, as the client reports them, for both engines. Weighted
-  by tokens (total tokens / total time), the same commit decoded these prompts at 128.3 tok/s greedy and 124.0 sampled
-  (CLI, 2026-10-16); llama.cpp's best session decoded them at 76.2 and 63.9 (2026-10-12).
+  by tokens (total tokens / total time), this run decoded them at 131.7 tok/s greedy and 130.4 sampled with q8_0 (132.1
+  / 130.8 with preset D); llama.cpp's best session decoded them at 76.2 and 63.9 (2026-10-12).
 - The follow-up turn re-processes the previous reply because exact reuse is on (`MK_EXACT_REUSE=0` turns it off: faster
   follow-up turns, not bit-identical to a fresh request).
-- With preset D' the reply texts, and with them the draft acceptance, can differ from the q8_0 run, so its long-context
+- The 101.6k-token prompt was read from scratch on a server started with `--side-max 0 --park-mib 0`: with side requests
+  on, the short request the client sends to clear the cache runs beside the cached conversation and leaves it in place.
+- With preset D the reply texts, and with them the draft acceptance, can differ from the q8_0 run, so its long-context
   decode rows are not a like-for-like comparison.
+- The previous full run (2026-10-15, commit 7d67c5d, the same client) measured 151.3 / 134.9 / 135.1 / 114.3 / 105.4
+  tok/s for the five decode rows with q8_0, read the 101.6k-token prompt in 77.7 s, and answered the same 230 questions
+  in 1,739 s.
 
-**Since then** (up to 147054b, 2026-10-17), every change kept the text output bit-identical (greedy ids at 0, 4 and 7
-drafts, the KL-divergence report and the server replies, checked at each merge). Speed changes, each measured A-B-A in
-one session:
-- **K5**, a split grid barrier between the DeltaNet projections and the DeltaNet core: decode +1.1% at 38k and +0.75% at
-  101.6k context (2026-10-17, Linux; at the edge of the run-to-run noise).
-- **Prefill one chunk ahead**: the host queues a prompt chunk before it waits for the previous one. On native Windows
-  the GPU's idle time during a 38k-token prefill went from 11.8 to 0.19 ms (2026-10-17); prefill time did not change
-  measurably.
-- **Keep-warm**, new: on native Windows at 147054b, a 255-token reply after 65 s of idle started in ~65 ms instead of
-  391-397 ms and decoded at 80.2 instead of 61-63 tok/s (2026-10-17). Holding the clocks costs power: ~165 W instead of
-  30-35 W at idle on this card.
-- **Draft head from a Q4_K copy** (on by default after 147054b; `MK_DRAFT_Q4=0` turns it off): greedy decode +2.1% on
-  the short bench prompts, no measurable change at 38k and 101.6k, +90 MiB of VRAM (2026-10-17, Linux). Greedy output
-  is unchanged; sampled replies keep the same distribution but differ from earlier builds for the same seed, because
-  the drafts' probabilities changed (docs/ENGINE.md, "The GGUF").
+**Keep-warm**, measured separately: on native Windows at 147054b, a 255-token reply after 65 s of idle started in
+~65 ms instead of 391-397 ms and decoded at 80.2 instead of 61-63 tok/s (2026-10-17). Holding the clocks costs power:
+~165 W instead of 30-35 W at idle on this card.
 
 **Q4_K_M:** unsloth's plain file runs on the same engine. Its last full run was on 2026-10-14 (commit b3be928, one
 session with UD-Q4_K_XL, q8_0 KV, 7 drafts): short prompts 148.1 vs UD's 144.7 tok/s, 145.7 vs 128.6 at 11.6k, 109.4 vs
@@ -100,13 +94,17 @@ Upstream's engine (open-jet 2993f47, 4 drafts) ran the same scripts on this card
   0.00166 against that reference (2026-10-11). At 32k context: 99.121% / 0.00219. Details:
   [docs/ENGINE.md](docs/ENGINE.md#correctness).
 
-**Preset D'** (`MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048`) stores K at 6 bits and V at 5 bits, and keeps 8 bits for the
-most recent 2,048 positions and for the MTP layer. Measured on 2026-10-15 at 7d67c5d:
-- KL against llama.cpp: 0.00119 vs q8_0's 0.00119 on the short prompts, 0.00236 vs 0.00219 at 32k, and 0.00161 vs
-  0.00163 at 64k. A plain 4-bit cache (`MK_KV='*=4'`) scores 0.00547 on the short prompts.
-- The idle server holds 20.3 GB instead of 21.3 GB at 120k, and the model's full **262,144-token context** fits on 24 GB.
-  At that size, reading a 260,896-token prompt took 334 s, decode at that depth ran at 63 tok/s, a follow-up turn took
-  1.3 s, and the card held 23.4 GB.
+**Preset D** (`MK_KV='K*=6,V*=5' MK_KV_WIN=2048`) stores K at 6 bits and V at 5 bits, and keeps 8 bits for the most
+recent 2,048 positions. Measured on 2026-10-20 at 7322fbd:
+- KL against llama.cpp: 0.00119 vs q8_0's 0.00119 on the short prompts (98.737% top-token agreement for both), and
+  0.00236 vs 0.00219 at 32k.
+- The idle server holds 20.0 GB instead of 21.1 GB at 120k, and the model's full **262,144-token context** fits on 24 GB.
+  At that size, reading a 260,896-token prompt took 326 s, decode at that depth ran at 66 tok/s, a follow-up turn took
+  1.3 s, the card held 23.5 GB, and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2 questions at that length were
+  right.
+- Preset D' (`MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048`, the same plus 8 bits for the MTP layer) measured 0.00119 /
+  0.00236 and 0.00161 vs q8_0's 0.00163 at 64k on 2026-10-15 (7d67c5d), with 20.3 GB at 120k. A plain 4-bit cache
+  (`MK_KV='*=4'`) scores 0.00547 on the short prompts.
 
 **Images** (Ryzen 9 5900XT, 2026-10-16):
 - A 196 / 300 / 1024-token image encodes in 0.51 / 0.78 / 3.56 s back to back (llama.cpp's libmtmd on the same CPU:
@@ -191,7 +189,7 @@ The MTP layer only proposes drafts, which the main model verifies: output is the
 ```sh
 scripts/serve.sh                  # http://127.0.0.1:8080, 120k context, q8_0 KV, 7 drafts, exact reuse, images on
 scripts/serve.sh 8080 64000       # port, context
-MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048 scripts/serve.sh 8080 262144   # preset D', the full context
+MK_KV='K*=6,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 262144   # preset D, the full context
 ```
 
 The settings (model path, host, drafts, prefill chunk, exact reuse, KV preset, keep-warm) are listed at the top of
@@ -350,7 +348,7 @@ set MK_PYTHON=%CD%\.venv\Scripts\python.exe
 scripts\serve.bat                 :: http://127.0.0.1:8080, 120k context, q8_0 KV, 7 drafts
 ```
 
-`scripts\serve.bat` takes the same settings as `scripts/serve.sh`, for example `MK_KV` / `MK_KV_WIN` for preset D', or
+`scripts\serve.bat` takes the same settings as `scripts/serve.sh`, for example `MK_KV` / `MK_KV_WIN` for preset D, or
 `MK_HOST=0.0.0.0` for the LAN. Images are on when `mmproj-BF16.gguf` sits next to the model or `MK_MMPROJ` names it;
 `MK_MMPROJ=off` turns them off. From an NVMe disk the server is ready in ~7 s.
 

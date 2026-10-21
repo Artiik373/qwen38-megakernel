@@ -77,7 +77,7 @@ next-token distributions (same GGUF; reference: llama.cpp b10246 generating toke
 | this engine, prefill kernels only, q8_0 KV | 98.744% | 0.00124 | 2.8073 |
 
 The engine's rows were measured on 2026-10-17 (Linux, the served flags with K5; the `mixed` report has been the same
-since 2026-10-15, and the native Windows build of 147054b gives it byte for byte). The engine is at least as close to
+since 2026-10-15, still at 7322fbd on 2026-10-20, and the native Windows builds give it byte for byte). The engine is at least as close to
 llama.cpp's token-by-token run as llama.cpp's own batched run is. Most top-token disagreements are near-ties: the
 median lead of llama.cpp's token over the engine's is 0.043 nats (llama.cpp batched: 0.051), and 1 of 168 exceeds 0.5
 nats.
@@ -573,8 +573,8 @@ positions past it (since 2026-10-17; before, those rows overwrote the first rows
 layer 3's cache, and a reused prefix then decoded differently; the server, which stops 16 tokens before the end, never
 got there, a CLI or C API run decoding to "context full" did).
 
-Presets (opt-in): D' = `MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048` (the README has its accuracy, VRAM and the
-262,144-token context), D = `MK_KV='K*=6,V*=5' MK_KV_WIN=2048`. In the per-layer scans made for the low-bit formats, K
+Presets (opt-in): D = `MK_KV='K*=6,V*=5' MK_KV_WIN=2048` (the README has its accuracy, VRAM and the
+262,144-token context), D' = `MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048` (8 bits for the MTP layer too). In the per-layer scans made for the low-bit formats, K
 was ~2.3x as sensitive as V, and no setting that saved 0.5 GB or more stayed within the KL-divergence noise of the
 q8_0 cache, so the presets are opt-in.
 
