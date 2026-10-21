@@ -91,6 +91,23 @@ class SideRuleTests(base._HttpCase):
         self.assertGreater(out["c2"]["usage"]["prompt_tokens_details"]["cached_tokens"], 0, log)
         self.assertIn("its parked conversation (", log)
 
+    def test_a_request_without_tools_runs_beside_an_agent_conversation_after_its_first_turn_too(self) -> None:
+        c1 = [{"role": "user", "content": "hello there"}]
+        c2 = c1 + [{"role": "assistant", "content": "ab"}, {"role": "user", "content": "and more"}]
+        # (an engine without side conversations: turn 1 is not kept, so turn 2 has nothing to resume)
+        for first, tools, want in (((self.LONG, TOOLS), None, ["side_begin", "side_end"] * 2),  # (beside an agent)
+                                   ((self.LONG, None), None, ["side_begin", "side_end", "park"])):  # (beside a chat)
+            eng = base._StoreEngine(["a", "b"])
+            srv, http_ = self.serve_store(eng, park_mib=4)
+            log = self.quiet(lambda: (self.chat(http_, [{"role": "user", "content": first[0]}], tools=first[1]),
+                                      self.chat(http_, c1, tools=tools), self.chat(http_, c2, tools=tools)))
+            self.assertEqual([o[0] for o in eng.ops], want, (first[1] is not None, log))
+        eng = base._StoreEngine(["a", "b"])  # (parking off: as before, a later turn is no side request)
+        srv, http_ = self.serve_store(eng, park_mib=0)
+        self.quiet(lambda: (self.chat(http_, [{"role": "user", "content": self.LONG}], tools=TOOLS),
+                            self.chat(http_, c2)))
+        self.assertEqual(eng.ops, [])
+
     def test_side_requests_off_or_parking_off_give_the_previous_behaviour(self) -> None:
         msgs, kw = self.ONE_SHOTS["goose session name (no max_tokens)"]
         eng = side._SideEngine(["a", "b"])

@@ -2410,11 +2410,12 @@ class Server:
         """before load_prompt's own matching: brings back a parked conversation that this prompt continues better than
         the live one (parking the live one), or runs the request as a side request, or parks the live conversation when
         the request would discard it. Requests switch only here, between replies. With parking on, a side request is a
-        one-shot: a request without tools (a client's title, tags, commit message, session name, summary; every agent
-        harness sends its sessions' first turns with tools) whatever its max_tokens, or one whose reply is bounded
+        one-shot: a first turn without tools (a client's title, tags, commit message, session name, summary; every
+        agent harness sends its sessions' first turns with tools) whatever its max_tokens, or one whose reply is bounded
         (0 < max_tokens <= SIDE_REPLY_MAX); its own conversation is parked after it (side_finish), so a chat without
-        tools continues as side requests. A new agent session's first turn (tools, a long reply) parks the live
-        conversation like any conversation, so its next turns find it cached."""
+        tools continues as side requests, and any request without tools that would displace a conversation with tools
+        runs beside it too. A new agent session's first turn (tools, a long reply) parks the live conversation like any
+        conversation, so its next turns find it cached."""
         eng, a = self.eng, self.args
         self.cache_pre, self.next_low = "", ""
         seq = eng.sequence()
@@ -2446,7 +2447,10 @@ class Server:
                 self.park_live(seq, "another conversation came back", keep=best[0].id, low=self.live_low)
                 self.unpark(best[0])
                 return
-        if side_ok and first_turn:
+        # a first turn, or (parking on) a request without tools that would displace a conversation with tools: an agent
+        # session stays live while a chat without tools or a client's summary (the conversation as messages) runs
+        # beside it
+        if side_ok and (first_turn or (not tools and self.live_tools and a.park_mib > 0)):
             # a long one beside the live conversation (a summary of it?): if the next request replaces the live
             # conversation instead of continuing it, it was the summarised one, parked with low priority
             after = "replaced right after a long request without tools beside it" if (

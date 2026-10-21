@@ -369,7 +369,9 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   sequence (with parking on, below: one without tools, whatever its `max_tokens`, or one that asks for at most 1024
   tokens; the agent harnesses send every one-shot request (title, tags, follow-ups, commit message, session name,
   summary) without tools and every new session's first turn with tools, so a new session is parked like any
-  conversation and its next turns find it cached) runs without evicting it (`MKEngine::side_begin` / `side_end`):
+  conversation and its next turns find it cached; with parking on, a later request without tools, such as a chat's
+  next turn or a summary that quotes the whole conversation, is one too when the cached conversation's last request
+  had tools) runs without evicting it (`MKEngine::side_begin` / `side_end`):
   the engine keeps the cached sequence aside (its recurrent state, 183 MB, is copied to pinned host memory at once; its
   KV and window-ring rows only when a launch of the side request is about to overwrite them, 1024 rows at a time), hides
   its checkpoints, and runs the request from position 0 as a reset engine would (same reply as on a fresh server). The

@@ -218,11 +218,12 @@ conversations only between replies (a reply in progress is never paused):
   the rows it overwrites go to host memory and back (12-20 ms), and the cached conversation is not touched. With
   parking on, this applies to one-shot requests: those without tools, whatever their `max_tokens` (clients' title,
   tags, commit-message, session-name and summary requests), and those that cap their reply at `max_tokens` <= 1024; an
-  agent's new session sends tools and is parked like any other conversation. The side request's own conversation is
-  parked after its reply too, so a follow-up turn (a chat without tools, or a capped reply) continues it beside the
-  cached conversation again instead of reading it again. Up to 4 of these short
-  conversations are kept (the oldest goes first), and they are the first to go when host memory is full: they never push
-  out a parked conversation.
+  agent's new session sends tools and is parked like any other conversation. Any later request without tools (a chat
+  without tools, a summary that quotes the whole conversation) runs beside an agent's conversation the same way. The
+  side request's own conversation is parked after its reply too, so a follow-up turn (a chat without tools, or a
+  capped reply) continues it beside the cached conversation again instead of reading it again. Up to 4 of these short
+  conversations are kept (the oldest goes first); they go first when host memory is full, together with the
+  low-priority ones (above), and parking one never evicts any other parked conversation.
 - **In practice:** with OpenCode 2.0.32 on native Windows (230k context, preset D), two coding sessions running at the
   same time finished in 110 s with ~72k prompt tokens prefilled, against 242 s and ~232k with the store off
   (2026-10-19).
