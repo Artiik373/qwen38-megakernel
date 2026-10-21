@@ -65,6 +65,30 @@ class ConsoleTests(base._HttpCase):
             self.assertEqual("tok/s" in reply, rate, reply)
 
 
+class _AbortEngine(base._ScriptEngine):
+    """a decode cycle that meets Windows' WinError 10053 (the client aborted the connection while the reply was sent)"""
+
+    def step(self):
+        raise ConnectionAbortedError(10053, "An established connection was aborted by the software in your host machine")
+
+
+class DisconnectTests(base._HttpCase):
+    quiet = ConsoleTests.quiet
+    metrics = base.HostCacheTests.metrics
+
+    def test_a_connection_aborted_by_the_client_is_a_disconnect_not_an_error(self) -> None:
+        srv, http_ = self.serve(_AbortEngine(["a", "b", "c"]))
+
+        def run():
+            with self.assertRaises(http.client.HTTPException):  # (no answer: the connection is closed)
+                http_.post({"messages": [{"role": "user", "content": "hi"}]})
+        log = self.quiet(run)
+        self.assertIn("the client disconnected (ConnectionAbortedError)", log)
+        self.assertNotIn(" error: ", log)
+        m = self.metrics(http_)
+        self.assertEqual((m["megakernel:requests_cancelled_total"], m["megakernel:requests_failed_total"]), ("1", "0"))
+
+
 class ThinkingTests(base._HttpCase):
     def server(self, **kwargs):
         srv = base._chat_server(self.mk, base._ScriptEngine(["a"]))

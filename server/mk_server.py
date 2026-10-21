@@ -3711,7 +3711,7 @@ def make_handler(srv):
                 except BadRequest as e:
                     srv.count(requests_bad=1)
                     self._bad(e, anth, rid)
-                except (BrokenPipeError, ConnectionResetError, ClientGone) as e:
+                except (ConnectionError, ClientGone) as e:
                     srv.count(requests_cancelled=1)
                     self.close_connection = True
                     if not isinstance(e, ClientGone):  # (generate reports the disconnects it notices itself)
@@ -3901,7 +3901,7 @@ def make_handler(srv):
                         if st["open"] != "text":
                             block({"type": "text", "text": ""})
                         delta({"type": "text_delta", "text": text})
-                except (BrokenPipeError, ConnectionResetError):
+                except ConnectionError:
                     return False
                 return True
 
@@ -3910,7 +3910,7 @@ def make_handler(srv):
             try:
                 finish, calls, usage, _ = srv.generate(chat, emit, self.client_gone)
             except Exception as e:
-                if not st["started"] or isinstance(e, (BrokenPipeError, ConnectionResetError, ClientGone)):
+                if not st["started"] or isinstance(e, (ConnectionError, ClientGone)):
                     raise
                 bad = isinstance(e, BadRequest)
                 log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
@@ -4000,7 +4000,7 @@ def make_handler(srv):
                         start()
                     elif time.monotonic() - st["t"] >= RESP_KEEPALIVE_S:
                         event({"type": "response.in_progress", "response": response("in_progress")})
-                except (BrokenPipeError, ConnectionResetError):  # (generate notices the disconnect)
+                except ConnectionError:  # (generate notices the disconnect)
                     pass
 
             def where():
@@ -4083,7 +4083,7 @@ def make_handler(srv):
                         st["open"]["text"] += x
                         event({"type": "response.output_text.delta", **where(), "content_index": 0, "delta": x,
                                "logprobs": []})
-                except (BrokenPipeError, ConnectionResetError):
+                except ConnectionError:
                     return False
                 return True
 
@@ -4095,7 +4095,7 @@ def make_handler(srv):
                 start()
                 close()
             except Exception as e:
-                if not st["started"] or isinstance(e, (BrokenPipeError, ConnectionResetError, ClientGone)):
+                if not st["started"] or isinstance(e, (ConnectionError, ClientGone)):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 bad = isinstance(e, BadRequest)
                 log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
@@ -4161,7 +4161,7 @@ def make_handler(srv):
                     chunk({"tool_calls": [text]} if kind == "tool_call" else
                           {"reasoning_content": text} if kind == "reasoning" else {"content": text},
                           timings=srv.timings_now() if per_token else None)
-                except (BrokenPipeError, ConnectionResetError):
+                except ConnectionError:
                     return False
                 return True
 
@@ -4174,7 +4174,7 @@ def make_handler(srv):
                     chunk({"role": "assistant", "content": None}, progress={
                         "total": total, "cache": cached, "processed": processed,
                         "time_ms": int((time.monotonic() - t_p[0]) * 1e3)})
-                except (BrokenPipeError, ConnectionResetError):  # (generate notices the disconnect)
+                except ConnectionError:  # (generate notices the disconnect)
                     pass
 
             # parameter / render errors are reported as a 400 before the stream starts
@@ -4184,7 +4184,7 @@ def make_handler(srv):
             try:
                 finish, calls, usage, timings = srv.generate(body, emit, self.client_gone)
             except Exception as e:
-                if not started[0] or isinstance(e, (BrokenPipeError, ConnectionResetError, ClientGone)):
+                if not started[0] or isinstance(e, (ConnectionError, ClientGone)):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 # the status (200) and part of the reply are out: the error is the stream's last event, OpenAI style
                 bad = isinstance(e, BadRequest)
