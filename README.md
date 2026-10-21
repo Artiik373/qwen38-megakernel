@@ -209,7 +209,9 @@ conversations only between replies (a reply in progress is never paused):
   with its next request instead of a full re-prefill. Parking and restoring a 12k / 38k / 120k-token conversation took
   31 / 62 / 177 ms each way, against 7.4 / 23.9 / 98.4 s to read it again (WSL2, 2026-10-19). The first park of a large
   conversation is slower, because page-locked memory is allocated at ~1 GB/s (5.7 s for 120k tokens); after that the
-  memory is reused.
+  memory is reused. A request that repeats the cached conversation up to its first reply and differs only later (a
+  client that edits its own history: a moved memory block, cleared tool results, an edited chat message) continues it
+  and parks nothing.
 - **Side requests:** a new conversation's first request of at most `MK_SIDE_MAX` tokens (default 8192; `0` = off) that
   would otherwise throw away a much longer cached conversation, such as a client's title request, runs beside it. Only
   the rows it overwrites go to host memory and back (12-20 ms), and the cached conversation is not touched. With

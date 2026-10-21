@@ -394,18 +394,22 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   checkpoint takes, ~25-35 ms to continue it (`side_unpark`); preset D's window rings about double that. Re-reading it
   instead would take ~0.9 s at 1.5k tokens and ~5 s at 8k.
 - **Parked conversations** (`--park-mib n`, default 8192 MiB; 0 = off): when a request belongs to another conversation
-  (it would discard at least `--park-min` [1024] tokens of the cached one and does not continue its last turn), the
-  cached conversation is first copied to pinned host memory (`MKEngine::park`: its KV rows, window rings, recurrent
-  state, sequence, image spans, draft vocabulary and its newest `--park-cks` [2] checkpoints; the engine keeps it too,
-  so a shared system prompt is still reused). A later request that continues a parked conversation better than the
-  cached one (by at least `--park-min` tokens) parks the cached one and restores the parked one (`MKEngine::unpark`):
-  the engine is then bit for bit as when it was parked, and its replies are the ones it would give had it never been
-  parked (greedy and sampled; with exact reuse any checkpoint gives the same bits, so fewer kept checkpoints only cost a
-  longer re-prefill after an edit). Requests run one at a time in arrival order and switch only between replies. Parked
-  conversations live within the budget, the least recently parked one evicted first (it is then prefilled again when it
-  comes back). Host memory is allocated on first use and kept for reuse (pinned allocation runs at ~1 GB/s under WSL2,
-  copies at ~26 GB/s): a 38k-token conversation (q8_0 KV, 37 KB per token) takes 1.9 GB with two checkpoints and ~65 ms
-  per park or restore (a 101.6k-token one 4.3 GB and ~150 ms), against ~24 s (~80 s) to prefill it again.
+  (it would discard at least `--park-min` [1024] tokens of the cached one, does not continue its last turn, and differs
+  from it before its first reply: a request that repeats the cached conversation up to its first assistant message and
+  differs only later is that conversation with its history edited, such as a client moving or dropping a block or
+  clearing old tool results, or a chat message edited, and is served from the engine's state without parking a copy
+  that would never be continued; the console says so), the cached conversation is first copied to pinned host memory
+  (`MKEngine::park`: its KV rows, window rings, recurrent state, sequence, image spans, draft vocabulary and its
+  newest `--park-cks` [2] checkpoints; the engine keeps it too, so a shared system prompt is still reused). A later
+  request that continues a parked conversation better than the cached one (by at least `--park-min` tokens) parks the
+  cached one and restores the parked one (`MKEngine::unpark`): the engine is then bit for bit as when it was parked,
+  and its replies are the ones it would give had it never been parked (greedy and sampled; with exact reuse any
+  checkpoint gives the same bits, so fewer kept checkpoints only cost a longer re-prefill after an edit). Requests run
+  one at a time in arrival order and switch only between replies. Parked conversations live within the budget, the
+  least recently parked one evicted first (it is then prefilled again when it comes back). Host memory is allocated on
+  first use and kept for reuse (pinned allocation runs at ~1 GB/s under WSL2, copies at ~26 GB/s): a 38k-token
+  conversation (q8_0 KV, 37 KB per token) takes 1.9 GB with two checkpoints and ~65 ms per park or restore (a
+  101.6k-token one 4.3 GB and ~150 ms), against ~24 s (~80 s) to prefill it again.
 - **Keep-warm:** after each request (and at startup) `capi.cpp` runs a one-block, 32-thread polling kernel for
   `MK_KEEP_WARM_S` seconds (default 120, 0 = off), each launch ending itself after 50 ms; the next request stops it and
   waits a few microseconds. The driver keys the P-state to utilization, so only a continuous load holds full clocks.

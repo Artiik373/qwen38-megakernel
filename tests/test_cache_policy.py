@@ -1,6 +1,6 @@
-"""Tests of server/mk_server.py's host cache policy without a GPU (TODO #19): which requests run as side requests (a
-one-shot without tools, whatever its max_tokens), with request shapes the agent harnesses send. Fake engines and the test
-server come from test_mk_server.py and test_engine_side.py."""
+"""Tests of server/mk_server.py's host cache policy without a GPU: which requests run as side requests (a one-shot
+without tools, whatever its max_tokens) and which edits of a conversation's history park nothing, with request shapes
+the agent harnesses send. Fake engines and the test server come from test_mk_server.py and test_engine_side.py."""
 import os
 import sys
 import unittest
@@ -117,6 +117,89 @@ class SideRuleTests(base._HttpCase):
             prompt = len("<|im_start|>user\na title please<|im_end|>\n<|im_start|>assistant\n")
             self.assertLess(prompt + reply, len(eng.sequence()))  # (the cached sequence is longer: the reply decides)
             self.assertEqual(needs[0], state + rings + pt * (prompt + reply) + 2 * ck, kw)
+
+
+class EditedHistoryTests(base._HttpCase):
+    """S5: a request that repeats the cached conversation up to its first reply and diverges later continues that
+    conversation with edited history: nothing is parked; a new conversation (another first message) is parked"""
+
+    chat, quiet = base.HostCacheTests.chat, base.HostCacheTests.quiet
+    SYS = {"role": "system", "content": "You are an agent. " * 3}
+    CATALOG = " <reminder>memory catalog: " + "entry " * 12 + "</reminder>"  # (Qwen Code's moving block)
+
+    def serve(self, eng, ctx=4096):
+        srv, http_ = super().serve(eng, ctx)
+        srv.im_start = ord("<")  # (the test tokenizer: one token per character)
+        srv.asst_marker = tuple(ord(c) for c in "<|im_start|>assistant")
+        srv.args.ck_msgs = 1  # (a checkpoint at each message start, as the server's default)
+        return srv, http_
+
+    def run_pair(self, first, second, tools=TOOLS):
+        """first, then second (each a list of messages; a reply "ab" in between): (ops, log, second's cached tokens)"""
+        eng = base._StoreEngine(["a", "b"])
+        srv, http_ = base.HostCacheTests.serve_store(self, eng, side_max=0, park_mib=4)
+        out = {}
+        log = self.quiet(lambda: (self.chat(http_, first, tools=tools),
+                                  out.setdefault("r", self.chat(http_, second, tools=tools))))
+        return [o[0] for o in eng.ops], log, out["r"]["usage"]["prompt_tokens_details"]["cached_tokens"]
+
+    def turn(self, *texts):
+        """messages: the system prompt, then user / assistant texts alternately (tool results as ("tool", text))"""
+        msgs = [self.SYS]
+        for i, t in enumerate(texts):
+            if isinstance(t, tuple):
+                msgs.append({"role": t[0], "content": t[1]})
+            else:
+                msgs.append({"role": "user" if i % 2 == 0 else "assistant", "content": t})
+        return msgs
+
+    def test_a_block_moved_out_of_a_later_message_parks_nothing(self) -> None:
+        first = self.turn("fix the bug", "done, run tests?", "yes please" + self.CATALOG)
+        second = self.turn("fix the bug", "done, run tests?", "yes please", "ab", "thanks" + self.CATALOG)
+        ops, log, cached = self.run_pair(first, second)
+        self.assertEqual(ops, [], log)
+        self.assertIn("not parked: the request continues the cached conversation with its history edited", log)
+        self.assertNotIn("parked the cached conversation", log)
+        n = len("".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in second[:3]))
+        self.assertGreaterEqual(cached, n, log)  # (it resumed at the edited message, from the engine's state)
+
+    def test_cleared_tool_results_park_nothing(self) -> None:
+        result = "file contents " * 8
+        first = self.turn("read a and b", "<tool_call>read a</tool_call>", ("tool", result), "<tool_call>read b",
+                          ("tool", result), "both read", "now summarize")
+        second = self.turn("read a and b", "<tool_call>read a</tool_call>", ("tool", "[cleared]"),
+                           "<tool_call>read b", ("tool", result), "both read", "now summarize", "ab", "and more")
+        ops, log, _ = self.run_pair(first, second)
+        self.assertEqual(ops, [], log)
+        self.assertIn("with its history edited", log)
+
+    def test_a_chat_edit_after_the_first_reply_parks_nothing_an_edit_of_the_first_message_parks(self) -> None:
+        first = self.turn("tell me about cats", "cats are mammals " * 4, "and dogs? " * 6)
+        ops, log, _ = self.run_pair(first, self.turn("tell me about cats", "cats are mammals " * 4, "and birds?"),
+                                    tools=None)
+        self.assertEqual(ops, [], log)
+        ops, log, _ = self.run_pair(first, self.turn("tell me about whales", "cats are mammals " * 4, "and dogs? " * 6),
+                                    tools=None)
+        self.assertEqual(ops, ["park"], log)
+        self.assertIn("parked the cached conversation (a new conversation)", log)
+
+    def test_a_new_session_of_the_same_harness_still_parks_the_cached_one(self) -> None:
+        head = "Working directory context: " + "x" * 60 + "\n"  # (shared by both sessions' first messages)
+        first = self.turn(head + "task A", "<tool_call>ls</tool_call>", ("tool", "a.py b.py"), "ok", "next step")
+        for second in (self.turn(head + "task B"),  # (its first turn)
+                       self.turn(head + "task B", "<tool_call>ls</tool_call>", ("tool", "c.py"), "ok", "go on")):
+            ops, log, _ = self.run_pair(first, second)
+            self.assertEqual(ops, ["park"], (second, log))
+            self.assertNotIn("history edited", log)
+
+    def test_without_the_role_tokens_every_divergence_parks_as_before(self) -> None:
+        first = self.turn("fix the bug", "done, run tests?", "yes please" + self.CATALOG)
+        second = self.turn("fix the bug", "done, run tests?", "yes please", "ab", "thanks" + self.CATALOG)
+        eng = base._StoreEngine(["a", "b"])
+        srv, http_ = base.HostCacheTests.serve_store(self, eng, side_max=0, park_mib=4)
+        srv.asst_marker = ()  # (a vocabulary without a single <|im_start|> token)
+        self.quiet(lambda: (self.chat(http_, first, tools=TOOLS), self.chat(http_, second, tools=TOOLS)))
+        self.assertEqual([o[0] for o in eng.ops], ["park"])
 
 
 if __name__ == "__main__":

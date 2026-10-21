@@ -2245,6 +2245,7 @@ class Server:
     side = None
     side_ready = False
     live_gen = -1
+    asst_marker = ()  # the tokens of "<|im_start|>assistant": where a prompt's first reply starts (Server.first_reply)
     # (parked, bytes in use, bytes allocated, their token counts, how many are side requests' own): /metrics and /props read it
     store_gauge = (0, 0, 0, (), 0)
     cache_pre = ""  # what the host cache did for the running request (before cache_note on the prompt line)
@@ -2267,6 +2268,8 @@ class Server:
         self.setup_specials(args)
         im = self.eng.tokenize("<|im_start|>")
         self.im_start = im[0] if len(im) == 1 else None  # checkpoint at the start of the generation prompt
+        if self.im_start is not None:
+            self.asst_marker = tuple(self.eng.tokenize("<|im_start|>assistant"))
         if args.mmproj:
             if not self.eng.images:
                 raise RuntimeError(f"{args.lib} has no image input (mk_prefill_img): rebuild it")
@@ -2410,7 +2413,32 @@ class Server:
             self.side_start(seq, len(toks), max_tokens)
             return
         if a.park_mib > 0 and not cont and lost >= a.park_min:
-            self.park_live(seq, "a new conversation")
+            k = self.first_reply(toks)
+            if k is not None and live[0] >= k + len(self.asst_marker):
+                # everything up to the cached conversation's first reply is unchanged: this is that conversation with
+                # its later history edited (a client moving or dropping a block, clearing old tool results, a chat
+                # message edited); the request resumes from the engine's state either way, and the copy a park would
+                # keep is never continued
+                log(f"#{self.rid} not parked: the request continues the cached conversation with its history edited "
+                    f"(the prompt matches {live[0]:,} of the {len(seq):,} cached tok, past its first reply at {k:,})")
+            else:
+                self.park_live(seq, "a new conversation")
+
+    def first_reply(self, toks):
+        """the position of the prompt's first assistant message (its <|im_start|>assistant tokens; a prompt without
+        one: its generation prompt), or None"""
+        m = self.asst_marker
+        if not m:
+            return None
+        k = 0
+        try:
+            while True:
+                k = toks.index(m[0], k)
+                if tuple(toks[k:k + len(m)]) == m:
+                    return k
+                k += 1
+        except ValueError:
+            return None
 
     def store_update(self):
         """refreshes store_gauge (on the request thread: /metrics and /props never call into the engine)"""
