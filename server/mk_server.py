@@ -36,6 +36,7 @@ import codecs
 import collections
 import contextlib
 import ctypes
+import errno
 import hashlib
 import ipaddress
 import itertools
@@ -1386,6 +1387,33 @@ SAMPLER_OFF = {"mirostat": _off(0), "typical_p": _off(1, True), "typ_p": _off(1,
 REASONING_FORMATS = ("auto", "deepseek", "deepseek-legacy", "none")
 # the chat_template_kwargs the server hands to the template
 TEMPLATE_KWARGS = ("enable_thinking", "preserve_thinking", "reasoning_effort")
+SOFT_SWITCH = re.compile(r"(/no_think|/think|<think>\s*</think>)\s*$")
+
+
+def soft_switch(messages):
+    """Qwen3's soft switches as a client sends them (Qwen3.8's template ignores them, so the server applies them): the
+    last user message's text, else the leading system / developer message's, ending in /no_think (or an empty
+    <think></think> block, as after the last user text or as a trailing assistant message) -> False, in /think -> True;
+    None: no switch. The prompt keeps the text as sent."""
+    def text(m):
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list):  # (parts: the last text one)
+            c = next((p["text"] for p in reversed(c) if isinstance(p, dict) and isinstance(p.get("text"), str)), None)
+        return c if isinstance(c, str) else ""
+
+    def switch(s):
+        m = SOFT_SWITCH.search(s)
+        return None if m is None else m.group(1) == "/think"
+    msgs = [m for m in messages if isinstance(m, dict)]
+    if msgs and msgs[-1].get("role") == "assistant" and re.fullmatch(r"\s*<think>\s*</think>\s*", text(msgs[-1])):
+        return False
+    user = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
+    s = switch(text(user)) if user is not None else None
+    if s is None and msgs and msgs[0].get("role") in ("system", "developer"):
+        s = switch(text(msgs[0]))
+    return s
+
+
 # llama.cpp's default sampler chain (its `samplers` field: names, or a string of their letters); the engine applies
 # penalties, top_k, top_p, min_p and temperature in this order
 SAMPLER_CHAIN = ("penalties", "dry", "top_n_sigma", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature")
@@ -2801,7 +2829,19 @@ class Server:
             if eff == "none":  # (as llama-server)
                 kw.setdefault("enable_thinking", False)
             else:  # (the template knows low / medium / high / xhigh)
+                if eff in ("max", "ultra"):  # (Codex offers them for its own models: the template's highest instead)
+                    self.warn_once(f"effort-{eff}", f"reasoning effort {eff!r} is taken as 'xhigh' (the chat "
+                                                    f"template's highest)")
+                    eff = "xhigh"
                 kw.setdefault("reasoning_effort", {"minimal": "low"}.get(eff, eff))
+        if "enable_thinking" not in kw:  # (Qwen3's soft switches, which Qwen3.8's template ignores: the request's own)
+            soft = soft_switch(body.get("messages") or [])
+            if soft is not None:
+                self.warn_once("soft-switch", "a request's trailing /no_think or /think (last user message, else the "
+                                              "system message) or an empty <think></think> after the last user text "
+                                              "turns its thinking off / on (chat_template_kwargs and reasoning_effort "
+                                              "none win)")
+                kw["enable_thinking"] = soft
         media = [] if self.vision else None
         ctx = dict(messages=normalize_messages(body.get("messages") or [], media), add_generation_prompt=True)
         if body.get("tools"):
@@ -3260,7 +3300,8 @@ class Server:
             finish = "tool_calls"
         t2 = time.time()
         dt = max(t2 - t1, 1e-9)
-        parts = [f"{n_gen:,} tok in {secs(dt)} = {n_gen / dt:.1f} tok/s"]
+        # (one token is the prefill's: no decode rate)
+        parts = [f"{n_gen:,} tok in {secs(dt)}" + (f" = {n_gen / dt:.1f} tok/s" if n_gen > 1 else "")]
         ph = ", ".join(f"{k} {v:,}" for k, v in phase.items() if v)
         if ph:
             parts.append(ph)
@@ -3637,7 +3678,17 @@ def make_handler(srv):
                 return
             if route in ("tokenize", "detokenize", "apply_template", "input_tokens", "count_tokens", "responses_input_tokens"):
                 try:  # (no generation: the tokenizer, from this thread; images take the engine's lock)
-                    self._json(200, getattr(self, "_" + route)(body))
+                    t0 = time.time()
+                    out = getattr(self, "_" + route)(body)
+                    if route.endswith("_tokens"):  # (a client counting its prompt: one console line each)
+                        msgs = body.get("messages") if route != "responses_input_tokens" else body.get("input")
+                        what = [plural(len(msgs), "message" if route != "responses_input_tokens" else "item")
+                                if isinstance(msgs, list) else "a text input"]
+                        if body.get("tools"):
+                            what.append(plural(len(body["tools"]), "tool"))
+                        ms = (time.time() - t0) * 1e3
+                        log(f"{path}: {out['input_tokens']:,} tok ({', '.join(what)}) in {ms:.0f} ms")
+                    self._json(200, out)
                 except BadRequest as e:
                     self._bad(e, anth)
                 return
@@ -4207,6 +4258,15 @@ class HTTPServer(ThreadingHTTPServer):
     client is not reset in the middle of its upload and gets the answer (the reason) instead of a connection error."""
     daemon_threads = True
     gate = None  # the request Gate (main sets it; None: every request is answered)
+    # Windows: SO_REUSEADDR (the base class's allow_reuse_address) lets a second server bind a port that is in use with
+    # no error, and requests then reach either one; an exclusive bind makes the second one fail at startup instead.
+    # (Linux: SO_REUSEADDR only allows a restart over connections in TIME_WAIT; a port in use still fails to bind.)
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def handle_error(self, request, client_address):
         """a client that resets its connection (an idle keep-alive one at the end of its session) is not an error; other
@@ -4223,6 +4283,18 @@ class HTTPServer(ThreadingHTTPServer):
         else:
             linger(request)
         self.close_request(request)
+
+
+def listen(host, port, handler):
+    """the HTTPServer on host:port; a port that is taken (another server on it) ends the process with a message"""
+    try:
+        return HTTPServer((host, port), handler)
+    except OSError as e:
+        taken = (e.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", None))
+                 or getattr(e, "winerror", 0) in (10048, 10013))  # (Windows: in use / held exclusively)
+        sys.exit(f"cannot listen on {host}:{port}: {e.strerror or e}" + (
+            " (another server is using the port: choose another with --port, or the scripts' first argument)"
+            if taken else ""))
 
 
 def env_int(name, default, minimum=1):
@@ -4427,7 +4499,7 @@ def main():
         os.environ["MK_EXACT"] = "1"  # read by the engine at construction
     # the port opens first (a busy port fails before the model loads); until the load is done every request gets a 503
     # (llama-server's "Loading model"), then the handler is swapped for the real one (new connections take it)
-    httpd = HTTPServer((args.host, args.port), make_loading_handler())
+    httpd = listen(args.host, args.port, make_loading_handler())
     httpd.gate = gate
     log(f"listening on http://{args.host}:{args.port} (503 until the model is loaded)")
     if gate.any_host or gate.hosts != {"localhost"}:

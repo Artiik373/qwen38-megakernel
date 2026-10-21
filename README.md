@@ -288,13 +288,13 @@ What the API supports:
   wire_api = "responses"
   env_key = "MK_API_KEY"            # set it to any value: the server checks no keys
   ```
-  `model_reasoning_effort` low, medium, high (= xhigh, the template's default) and xhigh work, minimal = low, none =
-  no thinking. Tasks run (2026-10-21): create a file, find and fix a failing test, a `codex exec resume` follow-up
-  that adds a function and its test, a question about a 4,900-line file read in chunks (to 69k tokens of context),
-  an image (`-i` and Codex's `view_image` tool). A new session prefilled ~8.8k tokens (Codex's instructions and
-  tools) once, then each turn a few hundred tokens plus its tool output. In these runs `-s workspace-write` refused
-  every command ("blocked by policy"); the tasks ran with `--dangerously-bypass-approvals-and-sandbox` in scratch
-  directories.
+  `model_reasoning_effort` low, medium, high (= xhigh, the template's default) and xhigh work, minimal = low, max and
+  ultra = xhigh, none = no thinking. Tasks run (2026-10-21): create a file, find and fix a failing test, a
+  `codex exec resume` follow-up that adds a function and its test, a question about a 4,900-line file read in chunks
+  (to 69k tokens of context), an image (`-i` and Codex's `view_image` tool). A new session prefilled ~8.8k tokens
+  (Codex's instructions and tools) once, then each turn a few hundred tokens plus its tool output. In these runs
+  `-s workspace-write` refused every command ("blocked by policy"); the tasks ran with
+  `--dangerously-bypass-approvals-and-sandbox` in scratch directories.
 - **Limits:** request bodies up to 128 MB (`MK_MAX_BODY_MB`), 32 images per request (`MK_MAX_IMAGES`), 100 megapixels
   per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded), 256 video frames per request
   (`MK_MAX_VIDEO_FRAMES`: 64 s at 4 fps). A refused upload still gets its 4xx answer:

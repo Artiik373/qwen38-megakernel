@@ -437,8 +437,12 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   order (others in their default places, penalties first when one is set), e.g. the web UI's "edkypmxt". Handled by
   the server: `tool_choice: "none"` (the tools stay in the prompt, calls come back as text, as in llama-server),
   `parallel_tool_calls: false` (the first call only), OpenAI's top-level `reasoning_effort` ("none" turns thinking
-  off as in llama-server; "minimal" -> "low"; other values go to the template, which knows low / medium / high / xhigh;
-  `chat_template_kwargs` win), `reasoning_format` (above), and llama-server's `return_progress` (a stream gets
+  off as in llama-server; "minimal" -> "low"; "max" / "ultra" (Codex's) -> "xhigh" with a console note; other values
+  go to the template, which knows low / medium / high / xhigh; `chat_template_kwargs` win), Qwen3's soft switches (a
+  last user message, else a leading system message, that ends in `/no_think` or an empty `<think></think>` block, or a
+  trailing assistant message that is one, turns thinking off for that request; `/think` turns it on; the prompt keeps
+  the text as sent; Qwen3.8's template ignores them, and `chat_template_kwargs` / `reasoning_effort` "none" win),
+  `reasoning_format` (above), and llama-server's `return_progress` (a stream gets
   `prompt_progress` chunks while the prompt is processed: `{"total", "cache", "processed", "time_ms"}` with a
   `{"role": "assistant", "content": null}` delta, at the start, about every 0.5 s and at the end, as llama-server's
   web UI shows them), `timings_per_token` (a stream's chunks carry the `timings` so far) and `t_max_predict_ms` (past
@@ -456,7 +460,8 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   reply that was sent (the prompt reuse finds the divergence, as after `max_tokens`).
 - Reporting, in llama-server's shapes: the port opens before the model loads, and until the load is done every request
   gets llama-server's 503 `{"error": {"code": 503, "message": "Loading model", ...}}` (`/health` then answers 200
-  `{"status": "ok"}`; a busy port fails at once instead of after the load). `GET /props`: `default_generation_settings`
+  `{"status": "ok"}`; a busy port fails at once instead of after the load, with a message: on Windows the port is
+  bound exclusively, so a second server cannot share it silently). `GET /props`: `default_generation_settings`
   (`n_ctx`, the sampling defaults), `total_slots` 1, `model_alias`, `model_path`, `modalities` (vision, video, audio),
   `chat_template`, `build_info` (commit and engine flags of `libqwen38mk`, from `mk_build_info`: the Makefile and
   `build.ps1` write them into `mk_build_info.h`; "unknown" for libraries built otherwise), plus an `engine` block with
@@ -515,15 +520,15 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   the model (console warning; Codex always sends `web_search`). `tool_choice` auto / none (`required`, a named or
   allowed tool: 400), `parallel_tool_calls`, `max_output_tokens`, `temperature` / `top_p` (and the chat request's
   `top_k`, `min_p`, `seed`, penalties, `chat_template_kwargs`), `reasoning.effort` (as `reasoning_effort`: `none` turns
-  thinking off), `text.format` text only (JSON schema / object: 400), `include` (`message.output_text.logprobs` and
-  `top_logprobs`: 400); `store`, `metadata`, `prompt_cache_key`, `user`, `safety_identifier`, `service_tier`,
-  `truncation` and `max_tool_calls` are accepted (nothing is stored; `text.verbosity` and reasoning summaries are not
-  generated: console warning). Replies: a `response` object whose `output` holds `reasoning` (the thinking, trimmed, as
-  `reasoning_text` content, `summary` empty; with `include: ["reasoning.encrypted_content"]` also `encrypted_content`,
-  the same text compressed: not secret, it brings the reasoning back from clients that return only that; all of a
-  request's `encrypted_content` together may inflate to what the model's full context could hold, its GGUF context
-  length times its longest token, else a 400), `message`
-  (`output_text`) and `function_call` / `custom_tool_call` items; `status` completed, or incomplete with
+  thinking off, `max` / `ultra` are `xhigh`), `text.format` text only (JSON schema / object: 400), `include`
+  (`message.output_text.logprobs` and `top_logprobs`: 400); `store`, `metadata`, `prompt_cache_key`, `user`,
+  `safety_identifier`, `service_tier`, `truncation` and `max_tool_calls` are accepted (nothing is stored;
+  `text.verbosity` and reasoning summaries are not generated: console warning). Replies: a `response` object whose
+  `output` holds `reasoning` (the thinking, trimmed, as `reasoning_text` content, `summary` empty; with
+  `include: ["reasoning.encrypted_content"]` also `encrypted_content`, the same text compressed: not secret, it
+  brings the reasoning back from clients that return only that; all of a request's `encrypted_content` together may
+  inflate to what the model's full context could hold, its GGUF context length times its longest token, else a 400),
+  `message` (`output_text`) and `function_call` / `custom_tool_call` items; `status` completed, or incomplete with
   `incomplete_details.reason` max_output_tokens; `usage` with `input_tokens` (the whole prompt),
   `input_tokens_details.cached_tokens` (reused), `output_tokens`, `output_tokens_details.reasoning_tokens`. Streams:
   `response.created` and `response.in_progress` when the prefill starts (a refused request gets its HTTP status
@@ -604,8 +609,10 @@ MTP layer from another GGUF of the model; env `MK_MTP`), `--no-mtp` (plain decod
   / restore / eviction / side request logs a line of its own: tokens, bytes copied, ms) and its reply (`tok in s =
   tok/s` over the decode, from the first token to the end of the reply; the tokens of the thinking / answer / tool call;
   `tok/cycle` = tokens per engine cycle, 1 plus the accepted MTP drafts; the share of drafts accepted; finish reason;
-  the whole request's time). A request that waits for the engine, 4xx answers and disconnects are logged with the number
-  too. On a terminal one status line under the log lines is rewritten in place (a carriage return, no escape sequences)
+  the whole request's time; a one-token reply, made by the prefill, shows no rate). A request that waits for the
+  engine, 4xx answers and disconnects are logged with the number too, and each token count (`/v1/messages/count_tokens`,
+  `/v1/chat/completions/input_tokens`, `/v1/responses/input_tokens`) logs a line without one (tokens, messages, tools,
+  ms). On a terminal one status line under the log lines is rewritten in place (a carriage return, no escape sequences)
   while a request runs: image encodes, the prefill's progress from the engine (`mk_prefill_progress` /
   `MKEngine::prefill_progress`: host counters updated per prefill chunk, no device sync), its rate and the time left,
   then the decode's tokens, tok/s and tok/cycle. Off a terminal (a log file) only the log lines are written. A client
