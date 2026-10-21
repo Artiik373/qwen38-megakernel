@@ -452,6 +452,24 @@ int mk_checkpoints(void * hp, int * out, int cap) {
 int mk_rewind_to(void * hp, int pos) {
     return guarded(hp, [&](MKEngine * e) { return e->rewind_to(pos) ? 0 : -1; });
 }
+// pins the checkpoints at the positions pos[0..n) (each: the last one in (P - 32, P], now or as the next prefill saves
+// it; MKEngine::ck_pin): never evicted, parked with the sequence; n = 0 pins nothing new. Returns how many were pinned
+// now (-1 error)
+int mk_ck_pin(void * hp, const int * pos, int n) {
+    try { // (host bookkeeping only: no GPU work)
+        return static_cast<Handle *>(hp)->eng->ck_pin(n > 0 ? std::vector<int>(pos, pos + n) : std::vector<int>{});
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+// positions of the pinned checkpoints (ascending, up to cap); returns their count
+int mk_ck_pinned(void * hp, int * out, int cap) {
+    const auto v = static_cast<Handle *>(hp)->eng->ck_pinned();
+    if (out)
+        for (int i = 0; i < std::min((int) v.size(), cap); i++) out[i] = v[i];
+    return (int) v.size();
+}
 // 1 if the engine runs MK_EXACT (exact reuse: restore a checkpoint instead of appending to decoded rows)
 int mk_exact(void * hp) { return static_cast<Handle *>(hp)->eng->exact() ? 1 : 0; }
 // test helper: MKEngine::draft_vocab (the device's draft-vocabulary rows, checked against the host's list) into out (up
@@ -544,7 +562,8 @@ int mk_side_drop(void * hp) {
     });
 }
 int mk_side_active(void * hp) { return static_cast<Handle *>(hp)->eng->side_active() ? 1 : 0; }
-// parks a snapshot of the sequence: its id (> 0), 0 (empty sequence), -3 (no room in the store), -1 error
+// parks a snapshot of the sequence (its newest max_checkpoints checkpoints and, if max_checkpoints > 0, the pinned ones):
+// its id (> 0), 0 (empty sequence), -3 (no room in the store), -1 error
 int mk_park(void * hp, int max_checkpoints) {
     return guarded(hp, [&](MKEngine * e) {
         const int id = e->park(max_checkpoints);

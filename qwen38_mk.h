@@ -96,6 +96,16 @@ class MKEngine {
     bool rewind_to(int pos);
     int checkpoint_pos() const;
     bool rewind_to_checkpoint();
+    // Pinned checkpoints: ck_pin(positions) pins, for each position P, the checkpoint at the last position in (P - 32, P]
+    // (where a prefill's cks move P onto the scan grid): one there now, else the one the next prefill saves there (it
+    // saves it whether or not cks has P). A pinned checkpoint is never evicted from the pool and goes with every park of
+    // the sequence (besides the newest max_checkpoints); a rewind before it or a reset drops it like any checkpoint. The
+    // caller pins the end of a prompt's shared prefix (a client's system prompt and tools), so a new session resumes
+    // there however long the cached conversation grew. At most min(2, MK_CK_SLOTS / 4) are pinned (none with fewer than
+    // 4 slots); more release the least recently requested. Returns how many were pinned now. ck_pinned(): their
+    // positions (ascending).
+    int ck_pin(const std::vector<int> & positions);
+    std::vector<int> ck_pinned() const;
     // Asks a batched prefill running on another thread (or the next one) to stop at its next chunk boundary: a host flag
     // read between chunks, no GPU work, callable from any thread. That prefill() then waits for the chunks already on
     // the GPU and throws MKCancelled, with nothing of it kept: the sequence, the recurrent state and the checkpoints go
@@ -163,7 +173,8 @@ class MKEngine {
     void side_drop();
     bool side_active() const;
     // Parked conversations: park() copies the whole sequence state (KV rows, window rings, recurrent state, the sequence,
-    // image spans, draft vocabulary, and the newest max_checkpoints checkpoints) into a new store entry and returns its id
+    // image spans, draft vocabulary, the newest max_checkpoints checkpoints and, if max_checkpoints > 0, the pinned ones)
+    // into a new store entry and returns its id
     // (> 0); the engine itself is unchanged. 0: the sequence is empty; -1: no room in the store. unpark(id): the engine
     // becomes that conversation bit for bit (its current sequence is discarded) and the entry is freed; false: no such
     // entry. park_need: the bytes park() would take now.

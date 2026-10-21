@@ -5779,6 +5779,8 @@ struct MKEngine::Impl {
         bool pending = false;                                       // ... may still be running
         char * ring = nullptr;                                      // MK_EXACT + MK_KV_WIN: the q8 window rings at pos
         bool ring_ok = false;                                       // ring holds this checkpoint's rings
+        bool pin = false;                                           // pinned (pin_set; meaningful while pos >= 0)
+        unsigned pin_t = 0;                                         // ... by the request with this stamp
     };
     struct Snap { int pos, slot; };
     std::vector<CkSlot> ck;
@@ -5849,6 +5851,7 @@ struct MKEngine::Impl {
             CK(cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming));
             ck.push_back(s);
         }
+        pin_max = std::min(2, (int) ck.size() / 4);
         CK(cudaStreamCreateWithFlags(&ck_st, cudaStreamNonBlocking));
         CK(cudaStreamCreateWithFlags(&ck_sv, cudaStreamNonBlocking));
         for (cudaEvent_t * e : {&ck_ev_src, &ck_ev_sv, &ck_ev_scr}) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
@@ -6080,6 +6083,7 @@ struct MKEngine::Impl {
         }
         s.ctl = hctl;
         s.pos = hctl.dn_c;
+        s.pin = false;
         s.ring_ok = false; // (no KV window rings: a restore refills them)
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (memlog)
@@ -6124,14 +6128,53 @@ struct MKEngine::Impl {
             if (ck[i].pos == pos && pos >= 0) return i;
         return -1;
     }
+    // Pinned checkpoints (MKEngine::ck_pin): the caller's checkpoint at the end of a prompt's shared prefix (a client's
+    // system prompt and tools), kept against ck_assign's thinning and carried by every park of the sequence, so a new
+    // session of the same client resumes there however long the conversation grew. A request for position P pins the
+    // checkpoint at the last position in (P - 32, P] (where ck_positions moves P, whatever the chunk start); at most
+    // pin_max (min(2, slots / 4)) are pinned, more release the least recently requested ones. The flag goes with its
+    // checkpoint (side requests hide it with the kept sequence, parks carry it, a rewind before it or a reset drops it
+    // with the checkpoint), so a pin always covers a prefix of the live sequence.
+    int pin_max = 0;
+    unsigned pin_clock = 0, pin_stamp = 0; // the requests' stamps; the last ck_pin's
+    std::vector<int> pin_req;              // pins for the next prefill to save (ck_pin; that prefill clears them)
+    int pin_count() const {
+        int n = 0;
+        for (const auto & k : ck) n += k.pos >= 0 && k.pin;
+        return n;
+    }
+    // the slot of the checkpoint a pin request for P covers (-1: none)
+    int pin_slot(int P) const {
+        int best = -1;
+        for (int i = 0; i < (int) ck.size(); i++)
+            if (ck[i].pos > P - 32 && ck[i].pos <= P && (best < 0 || ck[i].pos > ck[best].pos)) best = i;
+        return best;
+    }
+    // pins slot si for the request stamped t; beyond pin_max the least recently requested other pin is released
+    void pin_set(int si, unsigned t) {
+        if (pin_max <= 0) return;
+        ck[si].pin = true;
+        ck[si].pin_t = t;
+        while (pin_count() > pin_max) {
+            int old = -1;
+            for (int i = 0; i < (int) ck.size(); i++)
+                if (i != si && ck[i].pos >= 0 && ck[i].pin &&
+                    (old < 0 || ck[i].pin_t < ck[old].pin_t || (ck[i].pin_t == ck[old].pin_t && ck[i].pos < ck[old].pos)))
+                    old = i;
+            if (old < 0) break;
+            ck[old].pin = false;
+        }
+    }
     // Slots for checkpoints at the new positions `want` (ascending): free ones, else evicting by coverage. While
     // there are more checkpoints (existing + new) than slots, the one dropped is the one (not `keep`; the slot of a
     // restore whose copies may still run only if nothing else is left) whose removal leaves the smallest gap relative
     // to its distance from the end E: (next - prev) / (E - prev). Old checkpoints thin out geometrically, recent ones
     // stay dense. Returns the slot of each new position (-1: dropped); evicted slots become free.
-    // A side request (sw_on) takes free slots that hold none of the kept sequence's checkpoints first; a slot that does
-    // gets its block saved to the host store before it is handed out (sw_ck_take; no room: no checkpoint there).
-    std::vector<int> ck_assign(const std::vector<int> & want, int keep, int E) {
+    // A side request (sw_on) takes free slots that hold none of the kept sequence's checkpoints first (one holding a
+    // kept pinned checkpoint last); a slot that does gets its block saved to the host store before it is handed out
+    // (sw_ck_take; no room: no checkpoint there). Pinned checkpoints and the new positions wpin marks (pin requests) are
+    // never dropped.
+    std::vector<int> ck_assign(const std::vector<int> & want, int keep, int E, const std::vector<char> & wpin = {}) {
         struct C { int pos, slot, wi; }; // slot >= 0: existing checkpoint; wi >= 0: new (index into want)
         std::vector<C> c;
         for (int i = 0; i < (int) ck.size(); i++)
@@ -6143,7 +6186,7 @@ struct MKEngine::Impl {
             double bs = 1e300;
             for (int pass = 0; pass < 2 && best < 0; pass++)
                 for (int i = 0; i < (int) c.size(); i++) {
-                    if (c[i].wi >= 0 && c[i].pos == keep) continue;
+                    if (c[i].wi >= 0 ? c[i].pos == keep || (c[i].wi < (int) wpin.size() && wpin[c[i].wi]) : ck[c[i].slot].pin) continue;
                     if (!pass && c[i].slot >= 0 && (c[i].slot == ck_rs_src || c[i].slot == ck_rs_slot)) continue;
                     const double prev = i ? c[i - 1].pos : 0, next = i + 1 < (int) c.size() ? c[i + 1].pos : E;
                     const double sc = (next - prev) / std::max(1.0, E - prev);
@@ -6159,7 +6202,10 @@ struct MKEngine::Impl {
             if (!used[i]) ck[i].pos = -1;
         std::vector<int> ord(ck.size()); // free slots in this order
         std::iota(ord.begin(), ord.end(), 0);
-        if (sw_on) std::stable_partition(ord.begin(), ord.end(), [&](int i) { return !sw_ck_held(i); });
+        if (sw_on) {
+            auto rank = [&](int i) { return !sw_ck_held(i) ? 0 : sw_ck[i].pin ? 2 : 1; };
+            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return rank(a) < rank(b); });
+        }
         std::vector<int> out(want.size(), -1);
         int f = 0;
         for (const auto & x : c)
@@ -8952,30 +8998,42 @@ struct MKEngine::Impl {
     // n0 < P <= hend, `exact` as it is (saved by a side scan), every other one moved down onto the DeltaNet scan's
     // 32-token grid from its chunk's start; ascending, without duplicates or existing checkpoints, at most stg_n per
     // chunk (one less with `exact`, whose side scan may need a staging slot; dropping the earliest).
-    std::vector<int> ck_positions(const std::vector<int> & cks, int exact, int n0, int hend) {
+    // pins: pin requests (pin_req) to save too, never dropped; *vpin marks their positions in the result.
+    std::vector<int> ck_positions(const std::vector<int> & cks, int exact, int n0, int hend, const std::vector<int> & pins = {},
+                                  std::vector<char> * vpin = nullptr) {
         const int cap = hp.cap;
         auto chunk = [&](int P) { return (P - n0 - 1) / cap; }; // the chunk P belongs to (n < P <= n + T)
-        std::vector<int> v;
-        for (int P : cks) {
-            if (P <= n0 || P > hend) continue;
+        auto at = [&](int P) { // where P is saved (-1: outside this part or on an existing checkpoint)
+            if (P <= n0 || P > hend) return -1;
             if (P != exact) {
                 const int cs = n0 + chunk(P) * cap;
                 P = cs + (P - cs) / 32 * 32;
-                if (P <= n0) continue;
+                if (P <= n0) return -1;
             }
-            if (ck_find(P) < 0) v.push_back(P);
-        }
+            return ck_find(P) < 0 ? P : -1;
+        };
+        std::vector<int> v, pv;
+        for (int P : cks)
+            if ((P = at(P)) >= 0) v.push_back(P);
+        for (int P : pins)
+            if ((P = at(P)) >= 0) v.push_back(P), pv.push_back(P);
         std::sort(v.begin(), v.end());
         v.erase(std::unique(v.begin(), v.end()), v.end());
+        auto kept = [&](int P) { return P == exact || std::find(pv.begin(), pv.end(), P) != pv.end(); };
         for (size_t i = 0; i < v.size();) { // per chunk: at most stg_n staging slots
             size_t j = i;
             while (j < v.size() && chunk(v[j]) == chunk(v[i])) j++;
             const bool ex = std::find(v.begin() + i, v.begin() + j, exact) != v.begin() + j;
             int extra = (int) (j - i) + (ex ? 1 : 0) - stg_n;
-            for (size_t k = i; k < j && extra > 0;)
-                if (v[k] != exact) v.erase(v.begin() + k), j--, extra--;
-                else k++;
+            for (int pass = 0; pass < 2; pass++) // (a pin only when nothing else is left)
+                for (size_t k = i; k < j && extra > 0;)
+                    if (v[k] != exact && (pass || !kept(v[k]))) v.erase(v.begin() + k), j--, extra--;
+                    else k++;
             i = j;
+        }
+        if (vpin) {
+            vpin->assign(v.size(), 0);
+            for (size_t k = 0; k < v.size(); k++) (*vpin)[k] = std::find(pv.begin(), pv.end(), v[k]) != pv.end();
         }
         return v;
     }
@@ -9542,6 +9600,8 @@ struct MKEngine::Impl {
         int pos;
         Ctl ctl;
         bool ring_ok, saved;
+        bool pin;
+        unsigned pin_t;
     };
     std::vector<SwCk> sw_ck;
     double sw_ms_out = 0;
@@ -9588,13 +9648,15 @@ struct MKEngine::Impl {
     // bytes the store can still hand out (free chunks, then new ones within the budget)
     size_t hs_room() const { return hs_free.size() * hs_chunk + (hs_budget > hs_alloc ? (hs_budget - hs_alloc) / hs_chunk * hs_chunk : 0); }
     // Parked conversations (MKEngine::park): a snapshot of everything above, plus up to max_cks of the newest checkpoints
+    // and the pinned ones
     struct Parked {
         Blob blob;
         Book book;
         struct Ck {
             int slot, pos;
             Ctl ctl;
-            bool ring_ok;
+            bool ring_ok, pin;
+            unsigned pin_t;
         };
         std::vector<Ck> cks;
     };
@@ -9606,13 +9668,16 @@ struct MKEngine::Impl {
         return n * hs_chunk;
     }
     int seq_top() const { return std::max({kv_top, (int) seq.size(), hctl.dn_c}); }
-    std::vector<int> park_cks(int max_cks) const { // slots of the newest checkpoints, newest first
+    std::vector<int> park_cks(int max_cks) const { // slots of the newest checkpoints, newest first, then the pinned ones
         std::vector<int> v;
         for (int i = 0; i < (int) ck.size(); i++)
             if (ck[i].pos >= 0) v.push_back(i);
         std::sort(v.begin(), v.end(), [&](int a, int b) { return ck[a].pos > ck[b].pos; });
-        if ((int) v.size() > std::max(0, max_cks)) v.resize(std::max(0, max_cks));
-        return v;
+        const size_t n = std::min(v.size(), (size_t) std::max(0, max_cks));
+        std::vector<int> out(v.begin(), v.begin() + n);
+        for (size_t k = n; k < v.size() && max_cks > 0; k++)
+            if (ck[v[k]].pin) out.push_back(v[k]);
+        return out;
     }
     size_t ck_block_bytes() const { return (CK_NS + CK_NC + CK_NH) * 4; }
     double hs_park_ms = 0;    // the last side_end_park: its park of the side request's conversation
@@ -9636,7 +9701,7 @@ struct MKEngine::Impl {
             if (!ok) break;
             const CkSlot & s = ck[si];
             ok = blob_put(e.blob, s.mem, ck_block_bytes(), !ck_dev) && (!s.ring_ok || blob_put(e.blob, s.ring, ring_bytes_ck, true));
-            e.cks.push_back({si, s.pos, s.ctl, s.ring_ok});
+            e.cks.push_back({si, s.pos, s.ctl, s.ring_ok, s.pin, s.pin_t});
         }
         wait_device("park copies", std::max(wd_limit, 120.0));
         if (!ok) return -1;
@@ -9656,6 +9721,8 @@ struct MKEngine::Impl {
             ck[k].pos = sw_ck[k].pos;
             ck[k].ctl = sw_ck[k].ctl;
             ck[k].ring_ok = sw_ck[k].ring_ok;
+            ck[k].pin = sw_ck[k].pin;
+            ck[k].pin_t = sw_ck[k].pin_t;
             ck[k].pending = false;
         }
         sw_on = false;
@@ -9823,6 +9890,10 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
 
 int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & cks_in, int ck_exact,
                       const std::vector<MKImage> & images_in) {
+    struct PinClear { // (ck_pin's requests are for this call only, whatever happens to it)
+        Impl * p;
+        ~PinClear() { p->pin_req.clear(); }
+    } pin_clear{p_};
     if (tokens.empty()) throw std::runtime_error("empty prompt");
     std::vector<int> cks = cks_in;
     if (p_->exact && ck_exact >= 0) { // MK_EXACT: on the scan grid like the others (a side scan's state is not on it)
@@ -9987,23 +10058,30 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
                 stop_if_cancelled();
             }
         } else {
-            const std::vector<int> want = p_->ck_positions(cks, ck_exact, n0, hend);
-            const std::vector<int> slot = p_->ck_assign(want, ck_exact, (int) seq.size());
+            std::vector<int> pins; // (pin requests no checkpoint covers yet: this prefill saves them)
+            for (int P : p_->pin_req)
+                if (p_->pin_slot(P) < 0) pins.push_back(P);
+            std::vector<char> wpin;
+            const std::vector<int> want = p_->ck_positions(cks, ck_exact, n0, hend, pins, &wpin);
+            const std::vector<int> slot = p_->ck_assign(want, ck_exact, (int) seq.size(), wpin);
             std::vector<Impl::Snap> snaps;
             for (size_t k = 0; k < want.size(); k++)
                 if (slot[k] >= 0) snaps.push_back({want[k], slot[k]});
             const auto t0 = std::chrono::steady_clock::now();
             p_->pf_run(head, n0, nullptr, nullptr, 0, &snaps, er);
             stop_if_cancelled();
-            for (const auto & q : snaps) { // (the state after position q.pos - 1)
-                Impl::CkSlot & k = p_->ck[q.slot];
-                k.ctl = c;
-                k.ctl.dn_c = k.ctl.mtp_valid = q.pos;
-                k.pos = q.pos;
+            for (size_t k = 0; k < want.size(); k++) { // (the state after position want[k] - 1)
+                if (slot[k] < 0) continue;
+                Impl::CkSlot & s = p_->ck[slot[k]];
+                s.ctl = c;
+                s.ctl.dn_c = s.ctl.mtp_valid = want[k];
+                s.pos = want[k];
+                s.pin = false;
+                if (wpin[k]) p_->pin_set(slot[k], p_->pin_stamp);
             }
             if (p_->memlog && !snaps.empty()) {
                 fprintf(stderr, "[mk-mem] prefill %d..%d with %zu checkpoints (", n0, hend, snaps.size());
-                for (const auto & q : snaps) fprintf(stderr, " %d", q.pos);
+                for (const auto & q : snaps) fprintf(stderr, " %d%s", q.pos, p_->ck[q.slot].pin ? " (pinned)" : "");
                 fprintf(stderr, " ) in %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             }
         }
@@ -10078,6 +10156,32 @@ bool MKEngine::rewind_to(int pos) {
 }
 bool MKEngine::rewind_to_checkpoint() { return rewind_to(checkpoint_pos()); }
 
+int MKEngine::ck_pin(const std::vector<int> & positions) {
+    Impl & I = *p_;
+    I.pin_req.clear();
+    if (I.pin_max <= 0) return 0;
+    const unsigned t = I.pin_stamp = ++I.pin_clock;
+    int n = 0;
+    for (size_t k = 0; k < positions.size() && (int) k < I.pin_max; k++) {
+        const int si = I.pin_slot(positions[k]);
+        if (si >= 0) {
+            I.pin_set(si, t);
+            n++;
+        } else if (positions[k] > 0) {
+            I.pin_req.push_back(positions[k]);
+        }
+    }
+    return n;
+}
+
+std::vector<int> MKEngine::ck_pinned() const {
+    std::vector<int> v;
+    for (const auto & k : p_->ck)
+        if (k.pos >= 0 && k.pin) v.push_back(k.pos);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
 void MKEngine::truncate(int len) {
     std::vector<int> & seq = p_->seq;
     if (len < p_->hctl.dn_c || len > (int) seq.size())
@@ -10135,7 +10239,7 @@ bool MKEngine::side_begin() {
     I.hs_quiesce();
     I.sw_book = I.book_get();
     I.sw_ck.clear();
-    for (const auto & k : I.ck) I.sw_ck.push_back({k.pos, k.ctl, k.ring_ok, false});
+    for (const auto & k : I.ck) I.sw_ck.push_back({k.pos, k.ctl, k.ring_ok, false, k.pin, k.pin_t});
     I.sw_top = I.seq_top();
     I.sw_hi = I.sw_rhi = 0;
     I.sw_broken = false;
@@ -10223,6 +10327,8 @@ int MKEngine::side_unpark(int id) {
         s.pos = c.pos;
         s.ctl = c.ctl;
         s.ring_ok = c.ring_ok;
+        s.pin = c.pin;
+        s.pin_t = c.pin_t;
         s.pending = false;
     }
     I.hs_bytes = e.blob.used;
@@ -10267,6 +10373,8 @@ bool MKEngine::unpark(int id) {
         s.pos = c.pos;
         s.ctl = c.ctl;
         s.ring_ok = c.ring_ok;
+        s.pin = c.pin;
+        s.pin_t = c.pin_t;
         s.pending = false;
     }
     I.hs_bytes = e.blob.used;
