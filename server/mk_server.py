@@ -1870,7 +1870,7 @@ def reasoning_open(s):
     try:
         d = zlib.decompressobj()
         text = d.decompress(base64.b64decode(s[len(RESP_REASONING):], validate=True), MAX_BODY_MB << 20)
-        return None if d.unconsumed_tail else text.decode()
+        return text.decode() if d.eof and not d.unconsumed_tail and not d.unused_data else None
     except (binascii.Error, zlib.error, UnicodeDecodeError, ValueError):
         return None
 

@@ -3,6 +3,7 @@ the fake engines of test_mk_server.py: the request mapping (every input item typ
 trip, the streamed event sequence, the non-streamed Response, the errors, the rendered prompt's prefix stability over a
 Codex-like exchange (stateless: every turn resends the whole conversation), and the official openai SDK's parsers when
 installed."""
+import base64
 import http.client
 import io
 import json
@@ -217,10 +218,12 @@ class RequestMappingTests(unittest.TestCase):
         mk = self.mk
         text = "Thinking é中 " * 50
         self.assertEqual(mk.reasoning_open(mk.reasoning_seal(text)), text)
-        for s in (None, "gAAAAB", mk.RESP_REASONING + "!!", mk.RESP_REASONING + "aGk=", 5):
+        sealed = mk.reasoning_seal(text)
+        cut = mk.RESP_REASONING + base64.b64encode(base64.b64decode(sealed[len(mk.RESP_REASONING):])[:-6]).decode()
+        for s in (None, "gAAAAB", mk.RESP_REASONING + "!!", mk.RESP_REASONING + "aGk=", 5, cut):  # (cut: truncated)
             self.assertIsNone(mk.reasoning_open(s), s)
         # a zlib stream that inflates past the body limit is not ours
-        bomb = mk.RESP_REASONING + __import__("base64").b64encode(zlib.compress(b"x" * ((mk.MAX_BODY_MB << 20) + 10))).decode()
+        bomb = mk.RESP_REASONING + base64.b64encode(zlib.compress(b"x" * ((mk.MAX_BODY_MB << 20) + 10))).decode()
         self.assertIsNone(mk.reasoning_open(bomb))
 
 
