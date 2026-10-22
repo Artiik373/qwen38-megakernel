@@ -23,6 +23,7 @@ Every option is listed with its default in [CONFIGURATION.md](CONFIGURATION.md);
 - [Errors, cancels and disconnects](#errors-cancels-and-disconnects)
 - [Security](#security): Host / Origin checks, CORS, special tokens in content
 - [Limits](#limits)
+- [Engine calls behind the server](#engine-calls-behind-the-server)
 - [Windows](#windows)
 
 ## Running it
@@ -74,6 +75,20 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   "messages": [{"role": "user", "content": "Write quicksort in C."}], "max_tokens": 512}'
 ```
 
+### Options at a glance
+
+Defaults in brackets; each is described in full in [CONFIGURATION.md](CONFIGURATION.md), and the sections below say
+what they do.
+
+| topic | options (environment twin) |
+|---|---|
+| model and engine | `-m` / `--model` (required), `-c` / `--ctx` [32768], `-d` / `--draft` [4], `--kv auto\|f16\|q8` [auto], `--draft-vocab` [draft_vocab_32k.bin], `--mtp FILE` (`MK_MTP`), `--no-mtp` (`MK_NO_MTP=1`), `--lib` |
+| network | `--host` [127.0.0.1], `--port` [18080], `--allow-host NAME` (`MK_ALLOW_HOSTS`), `--cors-origin ORIGIN` (`MK_CORS_ORIGINS`): [Security](#security) |
+| conversation cache | `--exact-reuse` (`MK_EXACT=1`), `--ck-every` [4096], `--ck-msgs` [1], `--ck-pin` [1], `--side-max` [8192] (`MK_SIDE_MAX`), `--park-mib` [8192] (`MK_PARK_MIB`), `--park-min` [1024], `--park-cks` [2]: [the conversation cache](#the-conversation-cache) |
+| templates and output | `--chat-template-file PATH`, `--chat-template TEMPLATE`, `--chat-template-kwargs JSON` (`MK_CHAT_TEMPLATE_KWARGS`), `--reasoning-format` [auto] (`MK_REASONING_FORMAT`), `--content-specials` [text] (`MK_CONTENT_SPECIALS`) |
+| images and video | `--mmproj FILE`, `--vision-lib`, `--vision-backend` [auto], `--vision-threads` [0: every logical CPU but two], `--image-min-tokens` / `--image-max-tokens` [0: the mmproj's], `--image-cache` [8], `--video-fps` [4], `--video-max-tokens` [0: the image limit], `--video-cache` [2], `--ffmpeg` (`MK_FFMPEG`) |
+| engine environment | `MK_CK_SLOTS` [8], `MK_KEEP_WARM_S` [120], `MK_STORE_CHUNK_MIB` [32], `MK_MAX_BODY_MB` [128], `MK_MAX_IMAGES` [32], `MK_IMAGE_MAX_PIXELS` [100000000], `MK_MAX_VIDEO_FRAMES` [256] |
+
 ## The conversation cache
 
 A coding agent re-sends its whole conversation with every request: system prompt, tool definitions, every earlier turn
@@ -92,11 +107,11 @@ moves that state around (to host memory and back) without touching its bits.
 
 | situation | reply is identical, bit for bit, to | checked by |
 |---|---|---|
-| follow-up turn; edited message or system prompt | the same request on a fresh server | state-digest probe after each reuse: every K / V row, window-ring row and DeltaNet / conv state compared, 10 / 10 bitwise equal in every release gate; server replies compared |
-| new session resumed at a pinned checkpoint | the same request on a fresh server (greedy and temperature 1.0 with fixed seeds; q8_0 and preset D) | pin gate, 2026-10-21 |
-| parked conversation brought back | that conversation alone on a fresh server (interleaved conversations, greedy and sampled) | conversation gate (8 / 8), every release since 2026-10-19 |
-| side request, and the conversation kept beside it | each of them alone on a fresh server | side gate (5 / 5), 40 titles beside two conversations |
-| a prefill stopped because the client left | a server that never saw that request | cancel gate |
+| follow-up turn; edited message or system prompt | the same request on a fresh server | a state-digest probe after each reuse (every K / V row, window-ring row and DeltaNet / conv state compared): 10 / 10 scenarios bitwise equal in every release gate; server replies compared |
+| new session resumed at a pinned checkpoint | the same request on a fresh server (greedy, and temperature 1.0 with fixed seeds; q8_0 and preset D) | a new session after a live, a parked and a 63k-token conversation, 2026-10-21 |
+| parked conversation brought back | each conversation alone on a fresh server | 8 interleaved requests of 3 conversations, greedy and sampled, q8_0 and preset D: every release gate since 2026-10-19 |
+| side request, and the conversation kept beside it | each of them alone on a fresh server | 5 side-request scenarios, q8_0 and preset D, every release gate since 2026-10-19; 40 titles beside two conversations (2026-10-20) |
+| a prefill stopped because the client left | a server that never saw that request | the requests after a stopped prefill, compared in the release gates since 2026-10-18 |
 
 Sampled replies are identical too when the request sets a `seed`: the draft vocabulary the MTP head uses is rebuilt
 after a rewind exactly as a fresh prefill builds it (since 2026-10-20, 7a59582; before, a sampled follow-up could
@@ -105,15 +120,17 @@ the two give the same replies.
 
 What is not exact, and against what:
 - **Exact reuse off** (`MK_EXACT_REUSE=0` in the launchers, no `--exact-reuse` on the server): a follow-up appends to
-  the cached rows instead of re-prefilling the previous reply. The replies are correct, but not bit-identical to the
-  same request sent fresh. Parking and side requests still restore the engine's state bit for bit.
+  the cached rows instead of re-prefilling the previous reply, and those rows came from the decode kernels, whose
+  arithmetic order differs from the prefill's. Replies are then not bit-identical to the same request sent fresh.
+  Parking and side requests still restore the engine's state bit for bit.
 - **Low-bit KV presets** (`MK_KV`) are near-lossless against the q8_0 cache, not identical to it; each preset is exact
   with itself. Their accuracy is in [BENCHMARKS.md](BENCHMARKS.md).
 - **llama.cpp** gives different bits (different arithmetic order); the distance is measured in
   [BENCHMARKS.md](BENCHMARKS.md).
 
 Why it matters: an agent's run can be replayed request by request; a reply never depends on what the server happened
-to have cached; and an answer you want to debug can be reproduced by sending the request again.
+to have cached; and an answer you want to debug comes back the same when you send the request again (greedy, or with
+the same seed).
 
 ### How a request finds its cache
 
@@ -178,13 +195,14 @@ again (`--ck-pin 1`, the default).
 
 When a client's system prompt ends with per-session text (a date, the working directory, a session id), a new session
 leaves the cached conversation inside the system message. The server then also pins that point, and the client's later
-sessions resume there. At most two pins per conversation, inside the pool (no memory of their own); prompts without a
-system message, or with one under 1,024 tokens, pin nothing. A parked conversation that a new session restores only for
-its system prompt is parked again at once, so it is not lost.
+sessions resume there. At most two pins per conversation, inside the pool (no memory of their own; with `MK_CK_SLOTS`
+under 8 one, under 4 none); prompts without a system message, or with one under 1,024 tokens, pin nothing. A parked
+conversation that a new session restores only for its system prompt is parked again at once, so it is not lost.
 
 Measured on 2026-10-21 (WSL2, preset D, 131,072-token context; the clients' captured first requests; the new session
 arrives after a 52-55k-token conversation of the same client that is either still live or parked; times are the
-client's wall time, including the park of the long conversation):
+client's wall time and include parking the long conversation, ~2.5-3.5 s of which was the first allocation of host
+memory):
 
 | client (prompt of the new session) | before: cached / time | with pins: cached / time |
 |---|---|---|
@@ -279,15 +297,17 @@ engine and the next real turn would wait for it to come back. The server runs th
   tools keeps its prefix cached beside an agent's conversation. At most 4 side conversations are kept (the oldest goes
   first; most are titles, never continued), they are evicted before the other parked conversations, and parking one
   never evicts anything else. Steady state for titles (WSL2, q8_0, 2026-10-20): kept aside in 10-15 ms, back in 10 ms,
-  its own ~400-token conversation parked (363 MiB) in 15-21 ms.
+  its own ~400-token conversation parked (363 MiB) in 15-21 ms. Continuing a 1.5k-token side conversation beside a
+  9k-token one took 27-34 ms with q8_0 (425 MB copied) and 86 ms with preset D (new host memory included), and parking
+  it again with the long conversation's rows back 35-41 ms (q8_0) and 70 ms (preset D).
 - **With parking off** (`--park-mib 0`), side requests still work, with a 1 GiB store: every first turn of at most
   `--side-max` tokens that would throw away a much longer conversation runs beside it, and its own conversation is not
   kept.
 
 A side request starts from position 0: it does not reuse the cached conversation's prefix, even when it shares the
-system prompt. A summary request whose answer runs to at least 256 tokens (titles, tags, follow-ups and commit messages
-answer in tens) marks the conversation beside it as summarised: if the next request replaces that conversation instead
-of continuing it, it is parked with low priority.
+system prompt. A side request without tools that quotes at least `--park-min` tokens and answers in at least 256 (a
+summary; titles, tags, follow-ups and commit messages answer in tens) marks the conversation beside it as summarised: if
+the next request replaces that conversation instead of continuing it, it is parked with low priority.
 
 ### Sizing the host store
 
@@ -351,7 +371,7 @@ reply lengths differ from the live runs):
 | DeepSeek Harness + Aider interleaved: tokens prefilled / cache misses / real evictions | 266k / 32 / 19 | 218k / 7 / 2 |
 
 No request got a 4xx or 5xx. The cost side: a parked conversation with a pin is 288 MiB larger, so the 8 GiB store held
-fewer of them.
+fewer of them (Claude Code's sequence: 4 conversations instead of 6, and two requests cached 4-6k tokens less).
 
 ### Turning parts off
 
@@ -512,9 +532,9 @@ Qwen3.8 thinks before it answers unless told not to. The controls, strongest fir
 | control | effect |
 |---|---|
 | `chat_template_kwargs`: `enable_thinking`, `reasoning_effort`, `preserve_thinking` | handed to the template as given |
+| Anthropic `thinking` | `enabled` / `adaptive`: on; `disabled` or absent: off |
 | `reasoning_effort` (OpenAI's top-level field; Responses `reasoning.effort`) | `none` turns thinking off, as in llama-server; `minimal` = `low`; `max` / `ultra` (Codex's) = `xhigh`, with a console note; others (`low`, `medium`, `high`, `xhigh`) go to the template |
 | Qwen3's soft switches | a last user message (else a leading system message) that ends in `/no_think` or an empty `<think></think>`, or a trailing assistant message that is one, turns thinking off for that request; `/think` turns it on. The prompt keeps the text as sent. Qwen3.8's template ignores them; the server applies them |
-| Anthropic `thinking` | `enabled` / `adaptive`: on; `disabled` or absent: off |
 | `--chat-template-kwargs '{"enable_thinking": false}'` (`MK_CHAT_TEMPLATE_KWARGS`) | server-wide defaults under every request's own, for clients that cannot send `chat_template_kwargs` (keys: `enable_thinking`, `preserve_thinking`, `reasoning_effort`; others are refused at startup) |
 | nothing | the template's default: Unsloth's Qwen3.8 template thinks, at its highest effort (`high` = `xhigh`) |
 
@@ -830,6 +850,28 @@ Read from the environment at startup ([CONFIGURATION.md](CONFIGURATION.md)):
   meant 4.8 GB of RGB per frame). Measured on 2026-10-19: a clip of 11000 x 10000 frames took 5.2 s, 0.66 GB in the
   server and 2 GB in ffmpeg before its frames were refused; with the header check, 0.05 s and ~50 MB.
 - **Context:** no more images are decoded once the prompt cannot fit the context (see the 400 above).
+
+## Engine calls behind the server
+
+The server loads the engine library (`libqwen38mk.so`, `qwen38mk.dll` on Windows; `--lib`) through ctypes and uses its
+C API (`capi.cpp`). Where each feature lives, for reading the code:
+
+| feature | C API | engine (`qwen38_mk.cu`) |
+|---|---|---|
+| prompt reuse, checkpoints | `mk_prefill_cks`, `mk_prefill_img`, `mk_checkpoints`, `mk_rewind_to`, `mk_truncate`, `mk_sequence`, `mk_committed` | `MKEngine::prefill` and the checkpoint pool |
+| exact reuse | `mk_exact` (`MK_EXACT=1` is read when the engine is built) | the prefill's exact attention form |
+| pinned checkpoints | `mk_ck_pin`, `mk_ck_pinned` | `MKEngine::ck_pin` |
+| parking | `mk_park`, `mk_unpark`, `mk_park_drop`, `mk_park_need`, `mk_store_budget`, `mk_store_info`, `mk_kv_sizes` | `MKEngine::park` / `unpark`, the host store of pinned chunks |
+| side requests | `mk_side_begin`, `mk_side_end`, `mk_side_drop`, `mk_side_active`, `mk_side_end_park`, `mk_side_unpark` | `MKEngine::side_begin` / `side_end` / `side_end_park` / `side_unpark` |
+| stopping a prefill | `mk_cancel` (a host flag read between prefill chunks, no device sync) | `MKEngine::cancel` |
+| the console's prefill progress | `mk_prefill_progress` (host counters per chunk, no device sync) | `MKEngine::prefill_progress` |
+| keep-warm | `mk_keep_warm` | `capi.cpp` |
+| `/props` `build_info` | `mk_build_info` (from `mk_build_info.h`, which the Makefile and `build.ps1` write) | - |
+| special-token text as text | `mk_tokenize2`, `mk_token_attr` | - |
+| the reuse probe | `mk_state_digest` | - |
+
+A library built before one of these existed lacks the export: the server then turns that feature off with a startup
+line that says to rebuild (with `--mmproj`, a library without `mk_prefill_img` stops it from starting).
 
 ## Windows
 
