@@ -107,8 +107,8 @@ tokens (prompt read in 275.7 s) with a peak of 24,116 of 24,576 MiB (2026-10-18,
 
 ### How the run was measured
 
-- **Client:** a Python script (not part of this repository; the one of the 2026-10-14 and 10-15 runs, which sends the
-  requests of the 2026-10-12 / 13 llama.cpp sessions plus a clock warm-up), against `/v1/chat/completions` without
+- **Client:** [bench/suite](../bench/suite/README.md)'s `speed_client.py` (the script of the 2026-10-14 and 10-15 runs,
+  which sends the requests of the 2026-10-12 / 13 llama.cpp sessions plus a clock warm-up), against `/v1/chat/completions` without
   streaming; it reads the server's `timings` (prompt and decode time) and `usage` (cached tokens). One warm-up request,
   then ~3 s of decode so the timed requests start at full clocks.
 - **Short prompts:** four chat prompts (a Python prime check with doctests, how a hash map works, a 300-word story, a
