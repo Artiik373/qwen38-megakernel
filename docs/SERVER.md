@@ -101,8 +101,9 @@ sessions of the same client, several conversations that take turns, and the smal
 
 With exact reuse on, the server never builds on rows that the decode kernels wrote (their arithmetic order differs from
 the batched prefill's). It restores the last checkpoint at or before the point where the new prompt differs from the
-cached conversation and prefills from there; the prefill computes rows that do not depend on where its chunks start, so
-the result is the state a prefill of the whole prompt from position 0 would produce. Everything else in this section
+cached conversation and prefills from there; the prefill computes rows that do not depend on where its chunks start
+(attention over absolute key segments, checkpoints on the absolute 32-token grid of the recurrent scan), so the result
+is the state a prefill of the whole prompt from position 0 would produce. Everything else in this section
 moves that state around (to host memory and back) without touching its bits.
 
 | situation | reply is identical, bit for bit, to | checked by |
@@ -254,13 +255,13 @@ allocated):
 | conversation | park | restore | prefill it again |
 |---|---|---|---|
 | 12k tokens | 31 ms | 29 ms | 7.4 s |
-| 38k tokens | 62 ms | 65 ms | 23.9 s |
-| 101.6k tokens | 151 ms | 152 ms | 78.7 s |
+| 38k tokens (1.9 GB) | 62 ms | 65 ms | 23.9 s |
+| 101.6k tokens (4.3 GB) | 151 ms | 152 ms | 78.7 s |
 | 120k tokens (4.99 GB) | 177 ms | 178 ms | 98.4 s |
 
-Preset D's window rings add a little (38k: 63 ms to park, 74-92 ms to restore). The first park of a large conversation
-is slower, because page-locked memory is allocated at ~1 GB/s (5.7 s for the first 120k-token park); after that the
-memory is reused.
+Preset D's window rings add a little (38k: 63 ms to park, 74-92 ms to restore). The copies run at ~26 GB/s, but the
+first park of a large conversation is slower, because page-locked memory is allocated at ~1 GB/s (5.7 s for the first
+120k-token park); after that the memory is reused.
 
 In practice: with OpenCode 2.0.32 on native Windows (230,000-token context, preset D), two coding sessions running at
 the same time finished in 110 s with ~72k prompt tokens prefilled, against 242 s and ~232k tokens with the store off
@@ -316,7 +317,8 @@ out. Three server options size it:
 
 - `--park-mib` [8192]: the budget. On the client traffic we replayed ([below](#measured-on-real-client-traffic)), both
   mixed sequences filled 8 GiB.
-- `--park-cks` [2]: checkpoints kept per parked conversation besides its pins. With 1, less is copied (47.9 instead of
+- `--park-cks` [2]: checkpoints kept per parked conversation besides its pins. With exact reuse any checkpoint gives
+  the same bits, so fewer only cost re-prefill after an edit. With 1, less is copied (47.9 instead of
   62.0 GiB over the two mixed sequences), but a parked conversation can no longer resume before its last turn: 7% more
   tokens were prefilled (2026-10-21, 4937c58, the build before pinned checkpoints).
 - `--park-min` [1024]: conversations shorter than this are not parked, and a parked conversation comes back only when
@@ -536,7 +538,7 @@ Qwen3.8 thinks before it answers unless told not to. The controls, strongest fir
 | `reasoning_effort` (OpenAI's top-level field; Responses `reasoning.effort`) | `none` turns thinking off, as in llama-server; `minimal` = `low`; `max` / `ultra` (Codex's) = `xhigh`, with a console note; others (`low`, `medium`, `high`, `xhigh`) go to the template |
 | Qwen3's soft switches | a last user message (else a leading system message) that ends in `/no_think` or an empty `<think></think>`, or a trailing assistant message that is one, turns thinking off for that request; `/think` turns it on. The prompt keeps the text as sent. Qwen3.8's template ignores them; the server applies them |
 | `--chat-template-kwargs '{"enable_thinking": false}'` (`MK_CHAT_TEMPLATE_KWARGS`) | server-wide defaults under every request's own, for clients that cannot send `chat_template_kwargs` (keys: `enable_thinking`, `preserve_thinking`, `reasoning_effort`; others are refused at startup) |
-| nothing | the template's default: Unsloth's Qwen3.8 template thinks, at its highest effort (`high` = `xhigh`) |
+| nothing | the template's default: Unsloth's Qwen3.8 template thinks, at `xhigh`, its highest effort (it knows `low`, `medium` and `xhigh`, and reads `high` as `xhigh`) |
 
 Where the thinking goes: `--reasoning-format` / a request's `reasoning_format` (llama-server's option, `auto` by
 default). `auto` and `deepseek` return it as `reasoning_content` (streamed too); `none` leaves it in `content` as
@@ -690,11 +692,12 @@ a color change at the right time after 30 s of feed.
 
 The driver lowers the GPU's clocks after a few seconds without work, and a reply that starts from there runs its first
 ~2 s at ramping clocks. After each request (and at startup) the engine therefore keeps a light load on the GPU, a
-one-block polling kernel, for `MK_KEEP_WARM_S` seconds [120; 0 = off]; the next request stops it within microseconds.
-The driver keys its power state to utilization, so only a continuous load holds full clocks; the driver's power
-settings are left alone. Measured on 2026-10-17 (RTX 3090): ~165 W while warm against 30-35 W idle; from idle the clocks
-take 2.2-2.7 s to come up. An image the request encodes on the CPU re-arms it first, so the GPU stays warm until the
-prefill's first launch. `MK_KEEP_WARM_LOAD` changes the load (for measurements; [CONFIGURATION.md](CONFIGURATION.md)).
+one-block polling kernel relaunched every 50 ms, for `MK_KEEP_WARM_S` seconds [120; 0 = off]; the next request stops it
+within microseconds. The driver keys its power state to utilization, so only a continuous load holds full clocks; the
+driver's power settings are left alone. Measured on 2026-10-17 (RTX 3090): ~165 W while warm against 30-35 W idle; from
+idle the clocks take 2.2-2.7 s to come up. An image the request encodes on the CPU re-arms it first, so the GPU stays
+warm until the prefill's first launch. `MK_KEEP_WARM_LOAD` changes the load (for measurements;
+[CONFIGURATION.md](CONFIGURATION.md)).
 
 ## Monitoring
 
