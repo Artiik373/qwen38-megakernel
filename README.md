@@ -1,476 +1,230 @@
 # qwen38-megakernel
 
-The development home of a single-GPU engine for **Qwen3.8-27B on one RTX 3090 (24 GB)** and the OpenAI-compatible
-server around it, with image and video input. It contains:
+A CUDA engine and server for **Qwen3.8-27B on one 24 GB NVIDIA GPU**, built and tuned on an RTX 3090. It decodes with
+the model's own multi-token-prediction (MTP) head drafting up to 7 tokens per step, speaks the OpenAI, Anthropic and
+OpenAI Responses APIs, so coding agents and chat UIs connect to it directly, and keeps their conversations cached
+between requests. As the launchers run it, drafting, cache reuse and the choice of Windows or Linux never change a
+token of its output.
 
-- **The engine**, a CUDA megakernel tuned on an RTX 3090. Each speculative decode cycle is one persistent cooperative
-  kernel launch: the model's own MTP head drafts up to 7 tokens, and the main model verifies all 8 rows in one pass,
-  with its matrix products on int8 tensor cores ("wide verify"). Prompts go through a separate batched tensor-core
-  prefill. Weights stay in their GGUF k-quant encoding: unsloth's `UD-Q4_K_XL` and `Q4_K_M` files run as they are.
-- **Exact output.** Greedy output is the same at every draft depth, so speculation never changes it, and sampled output
-  has the same distribution as without drafts. With exact reuse (the launcher's default), a follow-up turn or an edited
-  conversation answers bit for bit like the same request sent fresh.
-- **The server** (`server/mk_server.py`): `/v1/chat/completions` (streaming, tools, `reasoning_content`, stop
-  strings), the Anthropic Messages API (`/v1/messages`, streaming, `/v1/messages/count_tokens`: Anthropic SDK clients
-  such as Claude Code), the OpenAI Responses API (`/v1/responses`, streaming, stateless: the OpenAI SDK, Codex CLI),
-  llama-server's `/health`, `/props`, `/v1/models`, `/slots`, `/metrics`, `/tokenize`, `/detokenize`,
-  `/apply-template`. Follow-up turns and edits reuse the processed prefix through DeltaNet checkpoints, and a new
-  session of the same client resumes after its system prompt and tools, however long the conversation before it grew.
-  Several conversations (chats, coding agents) can share the engine: requests run one at a time, and the other
-  conversations wait in host memory and come back bit for bit instead of being read again. After each request the
-  engine keeps the GPU's clocks up for a while (keep-warm), so a reply after a pause starts at full speed.
-- **The vision encoder** turns OpenAI `image_url` parts and video clips (llama-server's `input_video`) into model input.
-  It runs **on the CPU** (fp32 AVX2 / FMA), so images and video cost no VRAM and the full context stays available.
-- **KV cache:** q8_0 by default. Opt-in near-lossless presets with 6-bit K and 5-bit V free about 1 GB at 120k context
-  and fit the model's full 262,144-token context on 24 GB.
+Built on the megakernel of [open-jet](https://github.com/L-Forster/open-jet) by Louis Forster
+([credits](#credits-and-license)).
 
-The same sources build natively on Windows (MSVC + nvcc) and on Linux / WSL2, and the two builds give the same output,
-bit for bit ([Windows](#windows)).
+## Exact output
 
-## Numbers
+Speculative decoding is lossless in theory, but in practice verifying several tokens in one pass rounds differently from
+verifying one, so greedy output can change with the number of drafts; a reused cache or a different build can drift in
+the same way. This engine is built so that none of them changes the output, and the release checks test it:
 
-One RTX 3090 (24 GB) and a Ryzen 9 5900XT, unsloth's UD-Q4_K_XL, the server at 120k context, one request at a time,
-greedy unless noted. The same binary can run several percent faster or slower from one session to the next (GPU
-temperature and clocks), so every number below carries its date, and changes made after the last full run are given as
-A-B-A deltas against the build before them, not added onto its numbers.
+- **Drafting never changes the answer.** Greedy token ids are identical at 0, 4 and 7 drafts. With sampling, the
+  output keeps the distribution of sampling without drafts (chi-square and PIT tests). The MTP layer only proposes
+  tokens, so the output is the same with any MTP layer or none.
+- **A cached conversation answers like a fresh one.** With exact reuse (the launchers' default), a follow-up turn, an
+  edited conversation, a new session resumed after its system prompt, a conversation restored from host memory and a
+  conversation kept through a client's title request all continue bit for bit as the same request sent fresh (greedy,
+  and sampled with the same seed). A probe compares every K / V row, ring row and DeltaNet / convolution state with a
+  fresh prefill's.
+- **Windows and Linux agree bit for bit.** The MSVC and g++ builds give the same token ids, the same accuracy report
+  and the same server replies, and since 2026-10-18 the same image-encoder rows.
 
-### Last full run: 2026-10-20
+So an agent's run can be reproduced, an edit or a resumed session gets the answer a fresh request would get, and an odd
+reply is never the speculation's or the cache's doing.
 
-This engine at commit 7322fbd on Linux (WSL2), in the configuration served that day (wide verify, 7 drafts, exact
-reuse, side requests and parked conversations on), one session with the GPU fans at 100%. The llama.cpp column is
-b11548's `llama-server`, tuned (q8_0 KV, 4 MTP drafts), with the same client, prompts and model file: the best value of
-each row over three earlier sessions (2026-10-12 and 2026-10-13).
+What is not bit-identical, and how close it is:
+- **llama.cpp.** Its arithmetic is ordered and rounded differently. Scored against llama.cpp's own next-token
+  distributions (13,299 positions of code and prose, llama.cpp generating token by token), the engine picks the same top
+  token at 98.737% of positions with a mean KL divergence of 0.00119 nats; llama.cpp's own batched mode scores 98.489%
+  / 0.00166 against the same reference (q8_0 KV cache; 2026-10-17, unchanged at 7322fbd on 2026-10-20).
+- **The low-bit KV presets** ([below](#the-full-262k-context-on-24-gb)): opt-in and near-lossless, not identical to
+  q8_0.
+- **`MK_EXACT_REUSE=0`** makes follow-up turns faster by appending to the previous reply instead of reading it again.
 
-| | llama.cpp (10-12 / 10-13) | this, q8_0 KV | this, preset D |
+Evidence and the tests behind each line: [docs/BENCHMARKS.md](docs/BENCHMARKS.md#exactness).
+
+## Speed
+
+One RTX 3090 and a Ryzen 9 5900XT, unsloth's UD-Q4_K_XL, the server at 120k context, q8_0 KV cache, 7 drafts, greedy
+unless noted. This engine: one session on 2026-10-20 at 7322fbd (Linux / WSL2); the current release ef4a6dd runs the
+same GPU code. llama.cpp: b11548's `llama-server`, tuned (q8_0 KV, 4 MTP drafts), the same client, prompts and model
+file, the best value of each row over three sessions on 2026-10-12 and 10-13.
+
+| | llama.cpp | this engine |
+|---|---|---|
+| greedy decode, short prompts (4 x 512 tokens) | 82.7 tok/s | **155.1 tok/s** |
+| sampled decode, thinking on (8 runs) | 65.8 tok/s | **136.5 tok/s** |
+| decode at 38k tokens of context | 62.3 tok/s | **117.9 tok/s** |
+| decode at 101.6k tokens of context | 53.4 tok/s | **108.7 tok/s** |
+| read a 101.6k-token prompt | 101.0 s | **74.5 s** |
+| first token, short prompt | 124 ms | **66 ms** |
+| edit an earlier message in an 11.7k-token chat | 329 ms | **76 ms** |
+| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,727 s | **230 right, 1,681 s** |
+
+The short-prompt rows are means of per-request rates, as the client reports them; the full table, token-weighted
+rates, preset D's column and earlier runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+## Picks up where you left off
+
+The server keeps more than the conversation in front of it, and with exact reuse everything it restores answers as the
+same request sent fresh would:
+
+- **Follow-ups and edits** resume from DeltaNet checkpoints (one at every message start and every 4,096 tokens).
+  Editing an earlier message in an 11.7k-token chat cost 76 ms of prompt time, editing the end of a 9.1k-token system
+  prompt 89 ms (llama.cpp: 329 and 956 ms).
+- **New sessions** of the same client resume after its system prompt and tools: that checkpoint is pinned and never
+  evicted. A new Claude Code session reused 8,288 of its 11,850 prompt tokens and a new Codex CLI session 8,672 of
+  8,847, where the server before reused none (2026-10-21, preset D).
+- **Several conversations** share the engine: a request for another conversation parks the current one in host
+  memory, and it comes back when its next request arrives. A 12k / 38k / 120k-token conversation took 31 / 62 / 177 ms
+  to park and 29 / 65 / 178 ms to restore, against 7.4 / 23.9 / 98.4 s to read it again (q8_0, 2026-10-19).
+- **Title, tag and summary requests** run beside the session (side requests) instead of throwing its cache away.
+
+Replaying the requests that 9 clients sent during their 2026-10-21 test drives (native Windows, preset D, 230k
+context), the current release (ef4a6dd) spent 800 s reading prompts where the server before its pinned checkpoints and
+new side-request rules (538d441, same engine) spent 885 s, and the first turns of new agent sessions took 120 s
+instead of 173 s. How it works and how to size it: [docs/SERVER.md](docs/SERVER.md).
+
+## Works with your coding agent
+
+The server implements OpenAI chat completions (`/v1/chat/completions`), the Anthropic Messages API (`/v1/messages`,
+with token counting), the OpenAI Responses API (`/v1/responses`) and llama-server's endpoints (`/health`, `/props`,
+`/v1/models`, `/slots`, `/metrics`, `/tokenize`, `/detokenize`, `/apply-template`), with streaming, tool calls streamed
+as they are generated, thinking, images and video. These clients ran test tasks against it (the agents: create a file,
+find and fix a failing test, follow-ups, questions about a large file, an image):
+
+| client | version tested | client | version tested |
 |---|---|---|---|
-| greedy decode, short prompts (4 x 512 tokens) | 82.7 tok/s | 155.1 | **155.5** |
-| sampled decode, thinking on (8 runs) | 65.8 tok/s | 136.5 | **136.8** |
-| decode at 11.6k context | 69.3 tok/s | **137.3** | 136.1 |
-| decode at 38k context | 62.3 tok/s | **117.9** | 101.9 |
-| decode at 101.6k context | 53.4 tok/s | **108.7** | 98.6 |
-| read an 11.6k / 38k / 101.6k-token prompt | 8.24 / 29.6 / 101.0 s | **5.98 / 23.2 / 74.5 s** | 6.09 / 24.1 / 77.6 s |
-| first token, short prompt | 124 ms | 66 ms | **65 ms** |
-| follow-up turn in an 11.8k chat, prompt time | 323 ms | **178 ms** | 185 ms |
-| edit an earlier message in an 11.7k chat | 329 ms | **76 ms** | 76 ms |
-| edit the end of a 9.1k system prompt | 956 ms | **89 ms** | 97 ms |
-| VRAM, whole card, server idle | 22.8 GB | 21.1 GB | **20.0 GB** |
-| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,727 s (10-13) | 230 right, **1,681 s** | 230 right, 1,722 s |
+| Claude Code (Anthropic Messages) | 2.1.306 | Goose | 1.55.0 |
+| Codex CLI (OpenAI Responses) | 0.163.0 | Hermes Agent | v0.22.3 |
+| Qwen Code | 0.25.3 | Aider | 0.86.2 |
+| Pi | 1.3.0 | Open WebUI | 0.12.3 |
+| DeepSeek Harness (`dsh`) | 0.2.1-rc.2 | OpenCode | 2.0.32 |
+| Crush | v0.98.1 | | |
 
-- The two short-prompt rows are means of the per-request rates, as the client reports them, for both engines. Weighted
-  by tokens (total tokens / total time), this run decoded them at 131.7 tok/s greedy and 130.4 sampled with q8_0 (132.1
-  / 130.8 with preset D); llama.cpp's best session decoded them at 76.2 and 63.9 (2026-10-12).
-- The follow-up turn re-processes the previous reply because exact reuse is on (`MK_EXACT_REUSE=0` turns it off: faster
-  follow-up turns, not bit-identical to a fresh request).
-- The 101.6k-token prompt was read from scratch on a server started with `--side-max 0 --park-mib 0`: with side requests
-  on, the short request the client sends to clear the cache runs beside the cached conversation and leaves it in place.
-- With preset D the reply texts, and with them the draft acceptance, can differ from the q8_0 run, so its long-context
-  decode rows are not a like-for-like comparison.
-- The previous full run (2026-10-15, commit 7d67c5d, the same client) measured 151.3 / 134.9 / 135.1 / 114.3 / 105.4
-  tok/s for the five decode rows with q8_0, read the 101.6k-token prompt in 77.7 s, and answered the same 230 questions
-  in 1,739 s.
+The others use chat completions. All ran on native Windows with preset D at 230k context, on 2026-10-21 (OpenCode on
+2026-10-18 to 10-20). Each needs the base URL, any API key and the model id (the GGUF's file name); several also need
+the context window or image support set by hand. Per-client settings and quirks: [docs/CLIENTS.md](docs/CLIENTS.md).
 
-**Keep-warm**, measured separately: on native Windows at 147054b, a 255-token reply after 65 s of idle started in
-~65 ms instead of 391-397 ms and decoded at 80.2 instead of 61-63 tok/s (2026-10-17). Holding the clocks costs power:
-~165 W instead of 30-35 W at idle on this card.
+## The full 262k context on 24 GB
 
-**Q4_K_M:** unsloth's plain file runs on the same engine. Its last full run was on 2026-10-14 (commit b3be928, one
-session with UD-Q4_K_XL, q8_0 KV, 7 drafts): short prompts 148.1 vs UD's 144.7 tok/s, 145.7 vs 128.6 at 11.6k, 109.4 vs
-109.9 at 38k and 106.0 vs 102.0 at 101.6k context, 20.7 vs 21.1 GB of VRAM, and 231 vs 230 of the 282 questions right.
-With upstream open-jet's own benchmark scripts in that session, the engine wrote code at 173.3 tok/s, decoded with 30k
-tokens of code in context at 117.5, ran their reasoning test at 125.4 and read a 29.6k-token prompt at 1,811 tok/s.
-Upstream's engine (open-jet 2993f47, 4 drafts) ran the same scripts on this card on 2026-10-13: 133.8, 87.4, 89.1 and
-1,527 tok/s.
+Qwen3.8-27B reads up to 262,144 tokens. With the default q8_0 KV cache the server holds 21.1 GB of the card at 120k
+context; **preset D** fits the whole 262,144 on 24 GB. It stores K at 6 bits and V at 5 bits, and keeps the most
+recent 2,048 positions in an 8-bit ring, because that is where low-bit storage costs accuracy. It is opt-in:
 
-### Exactness
+```sh
+MK_KV='K*=6,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 262144
+```
 
-- Greedy token ids are identical at 0, 4 and 7 drafts. With sampling, the verification keeps the token distribution of
-  sampling without drafts (chi-square and PIT tests).
-- With exact reuse on (`--exact-reuse`, set by the launchers), a reused prefix (an edit or a follow-up turn) answers bit
-  for bit like a fresh prefill of the whole conversation, greedy and sampled with the same seed (the draft vocabulary is
-  rebuilt as a fresh prefill builds it). A parked conversation restored from host memory, and a conversation kept
-  through a side request, continue bit for bit as if nothing else had run in between.
-- The output is not byte-identical to llama.cpp's, whose arithmetic is ordered and rounded differently. Scored against
-  llama.cpp's own next-token distributions (13,299 positions of code and prose; reference: llama.cpp generating token by
-  token with its q8_0 KV cache), the engine agrees on 98.737% of the top tokens with a mean KL divergence of 0.00119
-  nats (q8_0 KV; 2026-10-17, the same report since 2026-10-15). For scale, llama.cpp's own batched run scores 98.489% /
-  0.00166 against that reference (2026-10-11). At 32k context: 99.121% / 0.00219. Details:
-  [docs/ENGINE.md](docs/ENGINE.md#correctness).
+What it costs, from the 2026-10-20 run at 7322fbd (KL: mean KL divergence against llama.cpp, as above):
 
-**Preset D** (`MK_KV='K*=6,V*=5' MK_KV_WIN=2048`) stores K at 6 bits and V at 5 bits, and keeps 8 bits for the most
-recent 2,048 positions. Measured on 2026-10-20 at 7322fbd:
-- KL against llama.cpp: 0.00119 vs q8_0's 0.00119 on the short prompts (98.737% top-token agreement for both), and
-  0.00236 vs 0.00219 at 32k.
-- The idle server holds 20.0 GB instead of 21.1 GB at 120k, and the model's full **262,144-token context** fits on 24 GB.
-  At that size, reading a 260,896-token prompt took 326 s, decode at that depth ran at 66 tok/s, a follow-up turn took
-  1.3 s, the card held 23.5 GB, and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2 questions at that length were
-  right.
-- Preset D' (`MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048`, the same plus 8 bits for the MTP layer) measured 0.00119 /
-  0.00236 and 0.00161 vs q8_0's 0.00163 at 64k on 2026-10-15 (7d67c5d), with 20.3 GB at 120k. A plain 4-bit cache
-  (`MK_KV='*=4'`) scores 0.00547 on the short prompts.
+| | q8_0 | preset D |
+|---|---|---|
+| card memory, idle server at 120k context | 21.1 GB | **20.0 GB** |
+| KL at 32k context (an fp16 cache, 2026-10-12: 0.00226) | 0.00219 | 0.00236 |
+| the 282 questions | 230 right | 230 right |
+| read a 101.6k-token prompt | 74.5 s | 77.6 s |
+| decode time per engine cycle, 11.6k to 101.6k context | | -2% to +4% |
 
-**Images** (Ryzen 9 5900XT, 2026-10-16):
-- A 196 / 300 / 1024-token image encodes in 0.51 / 0.78 / 3.56 s back to back (llama.cpp's libmtmd on the same CPU:
-  0.80 / 1.29 / 6.07 s). A new image after the CPU has been idle takes ~1.2-1.5 s for 300 tokens while the cores ramp up.
-- On six image prompts, the mean KL against llama.cpp fed the same image rows is 0.0006-0.0059 (text only: 0.0012).
-- The encoder's rows are within 4e-6 to 4e-5 (relative) of an fp64 forward of the vision tower.
+At 262,144 tokens of context the card held 23.5 GB; a 260,896-token prompt was read in 326 s, decode at that depth
+ran at 66 tok/s, a follow-up turn took 1.3 s, and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2 questions at that
+length were right. At 64k context the measured KL of D with an 8-bit MTP layer (preset D') was 0.00161, against q8_0's
+0.00163 and the fp16 cache's 0.00161 (2026-10-13 / 10-15).
 
-**Video** (same CPU, 2026-10-18; frames sampled at 4 fps as llama.cpp does, two consecutive frames per grid of tokens):
-- A 640 x 360 clip costs ~450 prompt tokens per second of video (228 at 2 fps) and its frame pairs encode in 0.56 s
-  each, about real time at 4 fps. 320 x 240: 167 tokens per second, 0.22 s per pair; 1280 x 720: 1861 tokens per
-  second, ~3.2 s per pair.
-- The prompt is llama-server's: the same prompt token counts on four clips, the same frames (ffmpeg), and frame-pair
-  rows within 5e-6 to 1.1e-5 of an fp64 forward (libmtmd's: 5.5e-3 to 2.2e-2).
+While a conversation is shorter than the window, preset D keeps all of it at 8 bits and its output is q8_0's. Past
+the window, its KL at 32k is 8% above q8_0's (an fp16 cache, more precise than both, scores 3% above q8_0 on the same
+set), it scored the same on the 282 questions, set by set, and it read prompts about 4% slower. Its lower
+long-context decode rates in the full table come mostly from different reply text accepting fewer drafts (2.98 instead
+of 3.53 tokens per cycle at 38k); per cycle it ran within the table's -2% to +4%.
+Our recommendation: for long-context work, or to free a gigabyte for something else, turn it on; the cost we can
+measure is small. It stays opt-in because it is not bit-identical to q8_0. Every preset and its numbers:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md#kv-cache-presets).
 
-Earlier results with charts and raw data (one session, 2026-10-14) and the gates behind each change up to 2026-10-16
-are in the fork's [perf docs](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf/perf). How the engine works
-inside: [docs/ENGINE.md](docs/ENGINE.md).
+## Quick start
 
-## Requirements
-
-- **GPU:** NVIDIA Ampere or newer (sm_86 tested; the kernels use sm_80+ features) with 24 GB of VRAM and at least 80
-  SMs for more than 4 drafts (50 for up to 4; the engine checks at load).
-- **CUDA:** 13.2 is what we build with; older 12.x versions are untested.
-- **OS:** Linux, WSL2, or Windows 10 / 11 x64 ([Windows](#windows) has its own build steps).
-- **RAM:** about 28 GB free to compile the served configuration (ptxas). The lean build needs ~19 GB.
-- **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `MK_PARK_MIB`
-  (default 8192 MiB; 1024 MiB for side requests alone when it is `0`). It is allocated as it is needed and kept until
-  the server exits.
-- **llama.cpp b10246**, built at `../llama.cpp`. The engine uses its tokenizer (libllama), and the vision library and
-  reference tools use libmtmd.
-- **Python** 3.10+ with jinja2.
-- **CPU for the fast image encoder:** x86-64 with AVX2 + FMA (Zen 2+, Haswell+). Other CPUs fall back to libmtmd.
-- **ffmpeg** for video input only (optional): on `PATH`, named by `MK_FFMPEG` / `--ffmpeg`, or the one bundled with
-  `pip install imageio-ffmpeg`. Without it the server answers video requests with a 400.
-
-## Build
+Linux or WSL2 (CUDA 13.2, llama.cpp next to this repository for its tokenizer and image library):
 
 ```sh
 git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout b10246
 cmake -S ../llama.cpp -B ../llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
 cmake --build ../llama.cpp/build -j
-make -j2        # qwen38_mk (CLI), libqwen38mk.so (server), tools/, libqwen38vision.so: ~15 min
+make -j2                          # the served configuration: about 20 minutes, up to ~34 GB of RAM in ptxas
 pip install -r requirements.txt
-```
-
-- A plain `make` builds the configuration we serve: wide verify, up to 7 drafts, and K5
-  (`MKFLAGS=-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1`).
-- `make MKFLAGS=` builds the lean engine. It compiles in ~10 minutes and takes at most 4 drafts (run it with
-  `MK_DRAFT=4`).
-- Most of the build is ptxas on the megakernel: one thread with ~25 GB of heap. The Makefile sets
-  `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, which lets it use transparent huge pages and runs it ~20% faster (same
-  machine code). It needs THP in `madvise` or `always` mode (`/sys/kernel/mm/transparent_hugepage/enabled`).
-- `make` targets the installed GPU's architecture; override it with `ARCH=sm_89` or similar.
-- `ptxas.log` lists registers and spills per function.
-- The vision library is built when `../llama.cpp/build/bin/libmtmd.so` exists (llama.cpp's default). `make vision`
-  builds it explicitly.
-
-Models (unsloth's files, used unmodified):
-
-```sh
 hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.gguf --local-dir ~/models
+scripts/serve.sh                  # http://127.0.0.1:8080: 120k context, 7 drafts, exact reuse, images on
 ```
 
-Use the BF16 mmproj. The encoder widens any file to fp32, so a Q8_0 mmproj is no faster and is less accurate.
-
-Other Qwen3.8-27B GGUFs (fine-tunes such as abliterated or uncensored conversions) run when every tensor has a type
-the engine reads ([docs/ENGINE.md](docs/ENGINE.md#the-gguf)): `token_embd` Q4_K, Q6_K or Q8_0, `output` Q6_K or Q8_0.
-Some conversions drop the MTP layer (`blk.64`) the engine drafts with:
-
-- Without one the engine loads with a notice and decodes without drafting (depth 0, about a third of the drafted
-  speed); it allocates no MTP weights and no MTP KV slot. `--no-mtp` (`MK_NO_MTP=1`) does the same for a file that has
-  one.
-- `--mtp FILE` (`MK_MTP=FILE` for scripts/serve.sh) takes the MTP layer from another GGUF of the same model, e.g. a
-  separate `mtp-*.gguf`, instead of the model file's own. The engine checks that it belongs to the model
-  (architecture, sizes, vocabulary) and re-quantizes its matrices to Q4_K like the built-in layer's.
-
-The MTP layer only proposes drafts, which the main model verifies: output is the same with any MTP layer or none
-(greedy bit for bit), only the acceptance rate and so the speed can change.
-
-## Run
-
-```sh
-scripts/serve.sh                  # http://127.0.0.1:8080, 120k context, q8_0 KV, 7 drafts, exact reuse, images on
-scripts/serve.sh 8080 64000       # port, context
-MK_KV='K*=6,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 262144   # preset D, the full context
-```
-
-The settings (model path, host, drafts, prefill chunk, exact reuse, KV preset, keep-warm) are listed at the top of
-[scripts/serve.sh](scripts/serve.sh). Under WSL2, keep the GGUF on the Linux filesystem: files on `/mnt/c` load several
-times slower. With the model on ext4 the server was ready ~12 s after start (WSL2), and ~7 s natively on Windows from
-an NVMe disk (2026-10-16).
-
-After each request the engine keeps the GPU's clocks up for `MK_KEEP_WARM_S` seconds (default 120, `0` = off) with a
-one-thread kernel, so a reply after a pause starts at full speed (numbers above); the driver's power settings are left
-alone. It costs power while it runs: an RTX 3090 draws ~165 W instead of 30-35 W at idle.
-
-Several conversations can share the engine. Requests run one at a time, in arrival order, and the engine switches
-conversations only between replies (a reply in progress is never paused):
-- **Parked conversations:** a request for another conversation parks the cached one in host memory (`MK_PARK_MIB`,
-  default 8192 MiB, the least recently parked one goes first when it is full; `0` = off), and it comes back bit for bit
-  with its next request instead of a full re-prefill. Parking and restoring a 12k / 38k / 120k-token conversation took
-  31 / 62 / 177 ms each way, against 7.4 / 23.9 / 98.4 s to read it again (WSL2, 2026-10-19). The first park of a large
-  conversation is slower, because page-locked memory is allocated at ~1 GB/s (5.7 s for 120k tokens); after that the
-  memory is reused. A request that repeats the cached conversation up to its first reply and differs only later (a
-  client that edits its own history: a moved memory block, cleared tool results, an edited chat message) continues it
-  and parks nothing. Conversations a client is unlikely to continue (one it has just summarised to compact it, and the
-  summary request's own) are parked with low priority and go first when host memory is full.
-- **Side requests:** a new conversation's first request of at most `MK_SIDE_MAX` tokens (default 8192; `0` = off) that
-  would otherwise throw away a much longer cached conversation, such as a client's title request, runs beside it. Only
-  the rows it overwrites go to host memory and back (12-20 ms), and the cached conversation is not touched. With
-  parking on, this applies to one-shot requests: those without tools, whatever their `max_tokens` (clients' title,
-  tags, commit-message, session-name and summary requests), and those that cap their reply at `max_tokens` <= 1024; an
-  agent's new session sends tools and is parked like any other conversation. Any later request without tools (a chat
-  without tools, a summary that quotes the whole conversation) runs beside an agent's conversation the same way. The
-  side request's own conversation is parked after its reply too, so a follow-up turn (a chat without tools, or a
-  capped reply) continues it beside the cached conversation again instead of reading it again. Up to 4 of these short
-  conversations are kept (the oldest goes first); they go first when host memory is full, together with the
-  low-priority ones (above), and parking one never evicts any other parked conversation.
-- **In practice:** with OpenCode 2.0.32 on native Windows (230k context, preset D), two coding sessions running at the
-  same time finished in 110 s with ~72k prompt tokens prefilled, against 242 s and ~232k with the store off
-  (2026-10-19).
-
-Details: [docs/ENGINE.md](docs/ENGINE.md#server).
-
-The console shows three lines per request (what it asks for, its prompt: cached / prefilled tokens and prefill speed,
-its reply: decode speed, thinking / answer / tool-call tokens, tokens per engine cycle, drafts accepted), a line for
-each side request, park, restore or eviction (sizes and copy times) and, in a terminal, a status line updated in place
-with the prefill's progress and time left or the decode's speed (see [docs/ENGINE.md](docs/ENGINE.md#server)).
-
-```sh
-curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "messages": [{"role": "user", "content": "Write quicksort in C."}], "max_tokens": 512}'
-
-# an image (base64 data: URL)
-IMG=$(base64 -w0 photo.jpg)
-curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "messages": [{"role": "user", "content": [{"type": "text", "text": "What is in this picture?"},
-    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$IMG"'"}}]}]}'
-
-# a video clip (base64, llama-server's input_video; needs ffmpeg)
-VID=$(base64 -w0 clip.mp4)
-curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "messages": [{"role": "user", "content": [{"type": "text", "text": "What happens in this video?"},
-    {"type": "input_video", "input_video": {"data": "'"$VID"'"}}]}]}'
-```
-
-What the API supports:
-- **Sampling:** temperature, top_p, top_k (1..32; <= 0 means 32), min_p, seed, and presence / frequency penalty.
-  Absent values default to Unsloth's thinking-mode preset for Qwen3.8: temperature 1.0, top_p 0.95, top_k 20 and
-  min_p 0. There is no repetition penalty.
-- **Chat template:** the one stored in the GGUF, with `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...)
-  and OpenAI `tools`; `--chat-template-file` replaces it, as in llama-server (`MK_CHAT_TEMPLATE_FILE` in the launchers).
-  Example: a fine-tune whose GGUF ships Qwen's original template answers a `developer` message, a second system
-  message, a turn without a user query or `reasoning_effort` "high" with a 400; unsloth's template (the one in its
-  Qwen3.8-27B GGUFs) takes all four. As in llama-server, `--chat-template-kwargs` sets defaults for every request
-  (e.g. thinking off: `MK_CHAT_TEMPLATE_KWARGS='{"enable_thinking": false}'`) and `--reasoning-format none` leaves the
-  thinking in `content` instead of `reasoning_content` (`MK_REASONING_FORMAT`; a request's `reasoning_format` wins).
-- **Images:** base64 `data:` URLs only; at most 4096 tokens each (`--image-max-tokens`), also at extreme aspect ratios,
-  where llama.cpp's resize goes past its limit (a 1,000,000 x 1 PNG: 64,000 tokens).
-- **Video:** `input_video` parts (`{"data": <base64>}`, as llama-server) or `video_url` parts with a base64 `data:` URL;
-  ffmpeg samples `--video-fps` frames per second (default 4) and the prompt is laid out as llama.cpp does
-  ([docs/ENGINE.md](docs/ENGINE.md#video)). There is no audio.
-- **Tool calls:** streamed as they are generated (the name first, then the arguments' JSON text in pieces: string
-  values as they come, other values whole); a call counts only when it is complete. One cut by `max_tokens` is
-  returned as text in `content` (a stream has already started it: its arguments never become valid JSON), with
-  `finish_reason` "length". A value may contain any text, tool-call markup included.
-- **OpenAI Responses API** (`/v1/responses`): stateless, as Codex CLI and other `store: false` clients use it (the whole
-  conversation in every request; `previous_response_id` is a 400). The thinking comes back as `reasoning_text` content
-  (there are no reasoning summaries), tool calls as `function_call` items streamed as they are generated; tools the
-  server would have to run (`web_search`, ...) are not offered to the model. Every turn of a conversation reuses the
-  earlier ones. Details: [docs/ENGINE.md](docs/ENGINE.md#server). Codex CLI (0.163 on native Windows), in
-  `~/.codex/config.toml`:
-  ```toml
-  model = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
-  model_provider = "mk"
-  model_context_window = 230000     # the server's -c: Codex has no metadata for this model (it warns, harmless)
-  show_raw_agent_reasoning = true   # show the thinking (not in exec --json output)
-  [model_providers.mk]
-  name = "qwen38-megakernel"
-  base_url = "http://127.0.0.1:8080/v1"
-  wire_api = "responses"
-  env_key = "MK_API_KEY"            # set it to any value: the server checks no keys
-  ```
-  `model_reasoning_effort` low, medium, high (= xhigh, the template's default) and xhigh work, minimal = low, max and
-  ultra = xhigh, none = no thinking. Tasks run (2026-10-21): create a file, find and fix a failing test, a
-  `codex exec resume` follow-up that adds a function and its test, a question about a 4,900-line file read in chunks
-  (to 69k tokens of context), an image (`-i` and Codex's `view_image` tool). A new session prefilled ~8.8k tokens
-  (Codex's instructions and tools) once, then each turn a few hundred tokens plus its tool output. In these runs
-  `-s workspace-write` refused every command ("blocked by policy"); the tasks ran with
-  `--dangerously-bypass-approvals-and-sandbox` in scratch directories.
-- **Limits:** request bodies up to 128 MB (`MK_MAX_BODY_MB`), 32 images per request (`MK_MAX_IMAGES`), 100 megapixels
-  per image (`MK_IMAGE_MAX_PIXELS`, checked before the image is decoded), 256 video frames per request
-  (`MK_MAX_VIDEO_FRAMES`: 64 s at 4 fps). A refused upload still gets its 4xx answer:
-  the server drains the rest of the body (bounded) before it closes. A request whose client disconnects stops at the
-  next prefill chunk (2048 tokens) or decode cycle, and a stopped prompt leaves nothing behind; an engine error in a
-  stream ends it with an error event and `data: [DONE]`.
-- **Requests:** one at a time, in arrival order; the other conversations wait in host memory between their requests
-  (above).
-- **Special-token text in content** (`<|im_end|>`, `<|im_start|>`, ...: in messages, tool results, tool calls and tool
-  definitions) is tokenized as text, so a file an agent reads cannot forge a turn; the template's own special tokens
-  stay special, and prompts without such text get the same tokens as before. `--content-specials parse` restores
-  llama-server's behaviour.
-- **Web pages:** a request for another host name than `localhost`, an IP address or `--host` (DNS rebinding;
-  `--allow-host` adds names) or from a web page of another origin gets a 403, so a page you open cannot drive or read
-  the server; `--cors-origin <origin>` lets a browser UI in (CORS headers, preflights). Clients that are not web pages
-  send no `Origin` and are not affected.
-
-[docs/ENGINE.md](docs/ENGINE.md#server) has the details, the server's options and the engine's environment variables.
-
-## Client configuration
-
-Agent harnesses and chat UIs that were run against the server (native Windows, 230k context, preset D, 2026-10-21).
-In every one: the base URL is the server's (`http://127.0.0.1:8080/v1`, Claude Code without `/v1`), any API key
-works, the model id is the GGUF's file name (`GET /v1/models`), and clients that take a context window or a vision flag
-from their own model tables need both set by hand: the server's `-c`, and images on when it runs with an mmproj.
-Their title, tags, commit-message and session-name requests, and most summary requests, run beside the session (side
-requests, above) with no setting of their own. What each needs:
-- **Claude Code** (2.1.306): `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, and `ANTHROPIC_MODEL`,
-  `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `_SONNET_MODEL` / `_OPUS_MODEL` set to the model id
-  (subagents and small calls use the same model). Recommended: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` = the server's `-c`
-  (it assumes 200k for an unknown model and compacts early), and `CLAUDE_CODE_ATTRIBUTION_HEADER=0` with
-  `--exclude-dynamic-system-prompt-sections`, so a new session reuses the ~9k tokens of system prompt and tools it
-  shares with the last one instead of reading them again.
-- **Codex CLI** (0.163): see the Responses API entry above.
-- **Qwen Code** (0.25.3): `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`, auth type `openai`. Needed in
-  `settings.json`: `model.generationConfig.contextWindowSize` = the server's `-c` (it assumes 1M tokens and would never
-  compact before the server's limit) and `model.generationConfig.modalities.image: true` for images (model ids that
-  start with "qwen" are taken as text-only). Recommended: `memory.enableManagedAutoMemory: false`: its memory
-  extractor runs after every reply (4-66 s here) and its memory block moves to the end of every request, so each turn
-  reads its previous reply again.
-- **Pi** (1.3.0): a `models.json` provider (`api` openai-completions, `contextWindow`, `maxTokens`, `reasoning: true`,
-  `input` text and image). Needed for `--thinking off`: `"thinkingLevelMap": {"off": "none"}` on the model (Pi sends
-  no `reasoning_effort` for off, and the template's default then thinks the most).
-- **DeepSeek Harness** (`dsh`, 0.2.1-rc.2): a `cordis.patch.yml` provider (`api` openai-completions, `baseURL`,
-  `contextWindow`, `input` text and image) and the default model; for its thinking levels a `reasoningEfforts` map
-  (`off: none`, `low: low`, `medium: medium`, `high: high`). Its session titles (4,096 tokens) need no cap.
-- **Crush** (v0.98.1): `provider add <name> --type openai-compat --base-url ...` and `model add ... --context-window
-  <-c> --default-max-tokens 32768 --supports-images true` (images need the last flag). Its title requests end in
-  `/no_think` and an empty `<think></think>`, which the server applies (Qwen3.8's template ignores them), so titles
-  come back short without turning thinking off for the whole provider.
-- **Goose** (1.55.0): the `openai` provider (`OPENAI_HOST`, `OPENAI_BASE_PATH` `v1/chat/completions`) or, for images,
-  a custom provider file whose model has `supports_vision: true` (otherwise images are dropped); `GOOSE_MODE=auto` runs
-  tools unattended. Optional: `GOOSE_DISABLE_SESSION_NAMING=true` saves its naming request (1-3 s, thinking on) per
-  new session. Its compaction summaries think as long as they like (85 s once): there is no per-request switch.
-- **Hermes Agent** (v0.22.3): a `config.yaml` provider with `api_mode: chat_completions` (it reads the context size
-  from `/props`). Recommended: `model.supports_vision: true` (images go into the request instead of a separate
-  describe-the-image request) and `auxiliary.title_generation.enabled: false` (its title request asks for a JSON
-  schema, which the server refuses with a 400).
-- **Aider** (0.86.2): needed, for `openai/<model id>` in `.aider.model.settings.yml`: `edit_format: diff`,
-  `use_repo_map: true`, `weak_model_name` the same model, `examples_as_sys_msg: true` (for an unknown model it uses
-  the "whole" format: stray files and long thinking); in `.aider.model.metadata.json`: `max_input_tokens` = the server's
-  `-c`, `max_output_tokens` 32768, `supports_vision: true`. Pass the chat's files on every call
-  (`--restore-chat-history` drops them).
-- **Open WebUI** (0.12.3): the connection is set under Admin > Settings > Connections (the environment variable only
-  counts on the first start). Recommended task settings: model parameters `{"reasoning_effort": "none"}` (follow-up
-  suggestions think 1-2k tokens otherwise) and title / tags templates that quote only the end of the chat
-  (`{{MESSAGES:END:2|middletruncate:1500}}` / `{{MESSAGES:END:6|middletruncate:1500}}`): by default each task quotes
-  the whole chat, so a long one is read again for every task (a 52k-token paste: +63 s per turn).
-- **OpenCode** (2.0.32): an openai-compatible provider with the base URL; nothing else.
-
-## Windows
-
-The same sources build natively with MSVC and nvcc. On an RTX 3090 we compared the Windows build with the Linux build
-of the same source (fdad907), on the same model file, on 2026-10-16:
-
-| check | Windows vs Linux |
-|---|---|
-| greedy token ids, `-d 7` and `-d 0` | identical |
-| `--kld` report against llama.cpp (13,299 positions) | identical |
-| server replies: text, thinking, an image, an image follow-up turn | identical |
-| ptxas registers and spills, every function | identical |
-| decode at 38k context | 173.0 vs 173.1 tok/s |
-| prefill of a 38k-token prompt | 22.3 vs 22.5 s |
-| decode, chat prompts 2-4 (512 tokens, `-d 7`) | within 1.5% |
-| image encode, 196 / 300 / 1024 tokens | 0.59 / 0.81 / 3.56 s vs 0.50 / 0.80 / 3.95 s |
-
-The first chat prompt after the model load decoded faster on Windows: 220 vs 132-145 tok/s, with the same tokens. The
-likely cause is that the GPU's clocks ramp up faster there. Each Windows build we deploy passes the same
-identity checks (ids, `--kld` report, server replies) against the Linux references; the latest, d8183ad (2026-10-19),
-also replayed the side-request and parked-conversation tests under q8_0 and preset D.
-
-The image encoder's rows used to differ between the two builds at fp32 rounding level (relative 2e-6 to 1.3e-5, below
-either's error against an fp64 forward of the tower): its attention took e^x from the C library, and glibc's and
-Microsoft's `expf` differ in the last bit for some inputs. Since 2026-10-18 the encoder computes it itself, with glibc's
-algorithm, so the Linux rows stayed as they were and the Windows rows now equal them bit for bit (stills and video frame
-pairs, at any thread count).
-
-Requirements:
-- **Driver:** an NVIDIA driver that supports CUDA 13.2.
-- **Compiler:** Visual Studio 2022 Build Tools with the C++ x64 tools (MSVC v143). CUDA 13.2 does not accept VS 2026's
-  compiler.
-- **CUDA 13.2:** the installer, or NVIDIA's redistributable archives (`cuda_nvcc`, `cuda_cudart`, `cuda_cccl`,
-  `cuda_crt`, `libnvvm`; `cuda_cuobjdump` for the checks) unpacked into one folder. The engine links the CUDA runtime
-  statically, so at run time only the driver is needed.
-- **Tools:** CMake and Ninja for llama.cpp, and Python 3.10+.
-- **RAM:** about 27 GB free for the engine compile. Don't run WSL2 jobs at the same time: the Linux VM's memory comes
-  out of the same pool.
-
-Build, in PowerShell, from an "x64 Native Tools" prompt for VS 2022 (or after `vcvars64.bat`), with llama.cpp next to
-this repository:
+Windows 10 / 11 (Visual Studio 2022 Build Tools, CUDA 13.2, CMake + Ninja, Python), in PowerShell from an "x64 Native
+Tools" prompt, then the server from cmd:
 
 ```powershell
 git clone https://github.com/ggml-org/llama.cpp ..\llama.cpp; git -C ..\llama.cpp checkout b10246
 cmake -S ..\llama.cpp -B ..\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=OFF -DLLAMA_CURL=OFF
 cmake --build ..\llama.cpp\build --target llama mtmd
-.\build.ps1 -Cuda "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"   # ~15 min (the default is $env:CUDA_PATH)
+.\build.ps1                       # uses $env:CUDA_PATH, or -Cuda <toolkit folder>
 python -m venv .venv; .venv\Scripts\pip install -r requirements.txt
 ```
-
-- **llama.cpp:** a CPU-only build is enough here. The engine uses only its tokenizer and, for images, libmtmd.
-- **What `build.ps1` builds:** `qwen38mk.dll` (server engine), `qwen38_mk.exe` (CLI), `qwen38vision.dll` and
-  `tools\*.exe`. It uses the Makefile's nvcc flags and `MKFLAGS` (`-MkFlags ""` for the lean engine), writes
-  `ptxas.log`, and copies llama.cpp's DLLs next to the outputs.
-- **Partial builds:** `-Targets engine|vision|tools` builds one part. An engine object that is newer than the sources
-  and was built with the same flags is reused.
-
-Run (cmd):
 
 ```bat
 set MK_MODEL=D:\models\Qwen3.8-27B-UD-Q4_K_XL.gguf
 set MK_PYTHON=%CD%\.venv\Scripts\python.exe
-scripts\serve.bat                 :: http://127.0.0.1:8080, 120k context, q8_0 KV, 7 drafts
+scripts\serve.bat
 ```
 
-`scripts\serve.bat` takes the same settings as `scripts/serve.sh`, for example `MK_KV` / `MK_KV_WIN` for preset D, or
-`MK_HOST=0.0.0.0` for the LAN. Images are on when `mmproj-BF16.gguf` sits next to the model or `MK_MMPROJ` names it;
-`MK_MMPROJ=off` turns them off. From an NVMe disk the server is ready in ~7 s.
+Then ask it something:
 
-## Checking a build
+```sh
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Write quicksort in C."}], "max_tokens": 512}'
+```
 
-- **Server tests:** `python -m pytest -q tests` runs without a GPU, against fake engines.
-- **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed files under AddressSanitizer
-  and UBSan (CPU only, Linux).
-- **Depth independence:** the same prompt at `-d 0`, `-d 4` and `-d 7` must give identical ids:
-  `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_32k.bin --ids`
-- **Accuracy against llama.cpp:** `tools/llama_ref` writes a reference file, and `./qwen38_mk -m <gguf> --kld <ref>
-  --score-path mixed --kv q8` scores the engine against it ([docs/ENGINE.md](docs/ENGINE.md#correctness)).
-- **Images:** `tools/mkv_cli` encodes images and writes their rows. `tools/vision_ref` writes llama.cpp's reference
-  for an image prompt plus the rows it fed, and `qwen38_mk --kld <ref> --kld-images <rows>` scores it.
-- **Speed:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_32k.bin --model <gguf>` (4 chat
-  prompts through the CLI; it uses the default KV cache, so at most 4 drafts). `bench/*.cu` are kernel
-  microbenchmarks.
+The launchers take the port and the context size as arguments (`scripts/serve.sh 8080 64000`) and everything else from
+environment variables (`MK_HOST=0.0.0.0` for the LAN, `MK_KV` / `MK_KV_WIN` for preset D, ...). Building in detail:
+[docs/BUILDING.md](docs/BUILDING.md). Every setting: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
-## Files
+## Requirements
 
-- `qwen38_mk.cu`, `qwen38_mk.h`, `prefill*.cuh`, `wv*.cuh`, `loader.cuh`, `gguf.h`: the engine
-- `capi.cpp`: the C API of `libqwen38mk.so` (and the keep-warm thread)
-- `main.cu`: the `qwen38_mk` CLI
-- `server/mk_server.py`: the HTTP server
-- `scripts/serve.sh`, `scripts/serve.bat`: the launchers (Linux / WSL2, Windows)
-- `build.ps1`, `compat_win32.h` / `.cpp`, `vision/win32.h` / `.cpp`: the Windows build and its POSIX / Win32 shims
-  (compiled only on Windows)
-- `vision/`: the CPU image encoder (`libqwen38vision.so`) and its tests
-- `tools/`: llama.cpp reference tools and the draft-vocabulary builder
-- `bench/`: benchmarks
-- `tests/`: server tests
-- `draft_vocab_32k.bin`: the MTP draft head's token subset
+- **GPU:** NVIDIA Ampere or newer with 24 GB and at least 80 SMs for more than 4 drafts (50 for up to 4). Tuned and
+  tested on an RTX 3090 (sm_86); other architectures build but are untested.
+- **CUDA 13.2** (older 12.x versions are untested), Linux, WSL2 or Windows 10 / 11 x64.
+- **RAM:** ~34 GB free to compile the served configuration; at run time, page-locked host memory for parked
+  conversations up to `MK_PARK_MIB` (8 GiB by default, allocated as needed).
+- **llama.cpp b10246** next to this repository, **Python 3.10+** with jinja2, an x86-64 CPU with AVX2 + FMA for the
+  fast image encoder, and ffmpeg for video (optional).
 
-## Origin and license
+Details: [docs/BUILDING.md](docs/BUILDING.md#requirements).
 
-This repository is the `megakernel/` directory of [open-jet](https://github.com/L-Forster/open-jet) by L-Forster, split
-out with its history. It adds the engine work from our open-jet fork
-([branch `qwen38-perf`](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf)). Parts of it went upstream as
-open-jet PRs #19 and #20, and #23 is open. This repository started from that branch's `megakernel/` directory at 62c8d7a
-(2026-10-16), and development of the engine continues here.
+## Documentation
+
+- [docs/BUILDING.md](docs/BUILDING.md): requirements, the Linux and Windows builds, model files, checking a build.
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md): every launcher setting, server option, environment variable and
+  build flag.
+- [docs/SERVER.md](docs/SERVER.md): the APIs, the conversation cache (exact reuse, checkpoints, parking, side
+  requests), the console, limits and security.
+- [docs/CLIENTS.md](docs/CLIENTS.md): settings for each coding agent and chat UI.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md): every measurement, with its date, commit and method.
+- [docs/ENGINE.md](docs/ENGINE.md): how the engine works inside.
+
+## Credits and license
+
+This engine started as the megakernel of [open-jet](https://github.com/L-Forster/open-jet) by Louis Forster
+(L-Forster). Upstream wrote its design and first version, the first commits of this history (4d92fd2 to 0f40d41,
+2026-10-09 to 10-11): the persistent kernel that runs a whole speculative decode cycle in one launch, MTP drafting with
+on-device verification (greedy and exact speculative sampling), the batched tensor-core prefill, the Q4_K_M weight
+kernels, the draft vocabulary, the C API, CLI and OpenAI-compatible server with prefix reuse, the benchmark scripts, and
+the accuracy method used above (`tools/llama_ref`: KL against llama.cpp's token-by-token distributions, with
+llama.cpp's batched run for scale). Evan Light contributed the load-time tensor-type check and the server warm-up
+(open-jet PRs #14 and #16).
+
+This repository is open-jet's `megakernel/` directory, split out with its history from our fork's
+[`qwen38-perf`](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf) branch at 62c8d7a (2026-10-16), and
+development continues here. Since upstream's version it gained UD-Q4_K_XL support, draft-depth-independent greedy
+output, wide verification on int8 tensor cores with up to 7 drafts, the low-bit KV presets, exact reuse, parked
+conversations, side requests and pinned checkpoints, the CPU vision encoder and video input, the Anthropic and
+Responses APIs, and the native Windows build. Two changes went back upstream and were merged on 2026-10-12: UD-Q4_K_XL
+support (PR #19) and `token_embd` in host memory with a configurable prefill chunk (PR #20); image input (PR #23) is
+open.
+
+It also stands on [llama.cpp](https://github.com/ggml-org/llama.cpp): its tokenizer (libllama), its image library
+(libmtmd: the fallback encoder and the reference tools), its GGUF quantization formats, whose dequantization the
+kernels follow, and its prompt layout for images and video. The model files and the default sampling settings are
+[Unsloth](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)'s; the model, Qwen3.8-27B, is Qwen's.
 
 Licensed under the GNU AGPL v3, like open-jet ([LICENSE](LICENSE)).
