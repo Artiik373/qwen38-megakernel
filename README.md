@@ -69,9 +69,10 @@ rates, preset D's column and earlier runs are in [docs/BENCHMARKS.md](docs/BENCH
 The server keeps more than the conversation in front of it, and with exact reuse everything it restores answers as the
 same request sent fresh would:
 
-- **Follow-ups and edits** resume from DeltaNet checkpoints (one at every message start and every 4,096 tokens).
-  Editing an earlier message in an 11.7k-token chat cost 76 ms of prompt time, editing the end of a 9.1k-token system
-  prompt 89 ms (llama.cpp: 329 and 956 ms).
+- **Follow-ups and edits** resume from DeltaNet checkpoints (one at every message start and every 4,096 tokens). A
+  follow-up turn in an 11.8k-token chat cost 178 ms of prompt time (the previous reply is read again, for exactness),
+  editing an earlier message in an 11.7k-token chat 76 ms, editing the end of a 9.1k-token system prompt 89 ms
+  (llama.cpp: 323, 329 and 956 ms; 2026-10-20).
 - **New sessions** of the same client resume after its system prompt and tools: that checkpoint is pinned, so the
   checkpoint pool never evicts it, and it is parked with its conversation. A new Claude Code session reused 8,288 of
   its 11,850 prompt tokens and a new Codex CLI session 8,672 of 8,847, where the server before reused none
@@ -166,6 +167,7 @@ cmake -S ..\llama.cpp -B ..\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release 
 cmake --build ..\llama.cpp\build --target llama mtmd
 .\build.ps1                       # uses $env:CUDA_PATH, or -Cuda <toolkit folder>
 python -m venv .venv; .venv\Scripts\pip install -r requirements.txt
+hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.gguf --local-dir D:\models
 ```
 
 ```bat
