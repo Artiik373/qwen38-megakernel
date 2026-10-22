@@ -633,5 +633,5 @@ time. Conversation cache: with parking on, a side request with tools must cap it
 that does not cap its reply reserves room for 8192 rows in the host store; a side request's conversation is parked
 with 1 checkpoint, and at most 4 of them are kept; a side request without tools that quotes at least `--park-min`
 tokens and answers with 256 or more is taken for a summary of the conversation beside it; a shared prefix shorter than
-1024 tokens is not pinned. A Responses API stream sends a progress event
-every 10 s during a long prefill; browsers may keep a CORS preflight's answer for 86400 s.
+1024 tokens is not pinned. A Responses API stream sends a progress event every 10 s during a long prefill; browsers
+may keep a CORS preflight's answer for 86400 s.
