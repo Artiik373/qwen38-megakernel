@@ -368,6 +368,10 @@ for parked conversations [8192], 0 = off; env `MK_PARK_MIB`), `--park-min n` [10
   at once, so it is not lost. Prompts without a system message, or with one under 1024 tokens, pin nothing. At most
   two per conversation, inside the pool (no memory of their own; `MK_CK_SLOTS` under 8: one, under 4: none); a parked
   conversation keeps them besides its newest `--park-cks` checkpoints. Libraries without `mk_ck_pin`: off (logged).
+  Measured (2026-10-21, preset D, the clients' captured first requests): a new session after a 52-55k-token
+  conversation, live or parked, reuses 8,288 of Claude Code's 11,850 tokens (9,024 of 11,809 with its cache-friendly
+  settings), 8,672 of Codex's 8,847 and 10,304 of crush's 11,168 (another directory), where it reused none before;
+  replies are those of the same request on a fresh server (greedy and sampled, q8_0 and preset D).
 - **Exact reuse** (`--exact-reuse`, sets `MK_EXACT=1`): the server never appends to rows the decode kernels wrote; it
   restores the last checkpoint at or before the divergence and prefills from there. The prefill computes rows that do
   not depend on where its chunks start (attention over absolute key segments, checkpoints on the absolute 32-token scan
