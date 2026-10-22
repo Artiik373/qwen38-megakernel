@@ -190,6 +190,24 @@ class PinnedCheckpointTests(base._HttpCase):
         a_entry = [o for o in eng.ops if o[0] == "park" and o[2] == out["a_len"]]
         self.assertEqual(len(a_entry), 2, log)  # (parked when the other client came, again when B took its prefix)
 
+    def test_a_low_priority_conversation_parked_again_for_a_new_session_stays_low(self) -> None:
+        eng = _PinEngine(["a", "b"])
+        srv, http_ = self.serve_pin(eng)
+        out = {}
+
+        def run():
+            self.grow(http_, self.session("task one: " + "fix the bug " * 20), turns=3)
+            out["a_len"] = len(eng.seq)
+            self.chat(http_, self.session("something else entirely " * 10, system="another client. " * 80))  # (A parked)
+            for e in srv.parked.values():
+                if len(e.seq) == out["a_len"]:
+                    e.low = True  # (as compaction debris: Server.cache_switch)
+            self.chat(http_, self.session("task two: write the docs"))  # (A's system prompt: restored, parked again)
+            out["low"] = [e.low for e in srv.parked.values() if len(e.seq) == out["a_len"]]
+        log = self.quiet(run)
+        self.assertIn("parked the cached conversation (a new session reuses its system prompt, low priority", log)
+        self.assertEqual(out["low"], [True], log)
+
     def test_without_pins_a_parked_conversation_is_not_restored_for_a_new_session(self) -> None:
         eng = _OldEngine(["a", "b"])
         srv, http_ = self.serve_pin(eng)

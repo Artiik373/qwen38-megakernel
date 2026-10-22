@@ -2478,7 +2478,8 @@ class Server:
                 self.unpark(best[0])
                 e, r = best
                 if r[2] in e.pins and r[0] < e.gen:  # (a new session that shares only its system prompt: it stays parked)
-                    self.park_live(eng.sequence(), "a new session reuses its system prompt")
+                    self.park_live(eng.sequence(), "a new session reuses its system prompt",
+                                   low="it was parked with low priority" if e.low else "")
                 return
         # a first turn, or (parking on) a request without tools that would displace a conversation with tools: an agent
         # session stays live while a chat without tools or a client's summary (the conversation as messages) runs
