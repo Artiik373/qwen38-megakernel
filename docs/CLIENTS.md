@@ -1,10 +1,10 @@
 # Clients
 
 The server speaks the three APIs that coding agents and chat UIs use: OpenAI chat completions, the Anthropic Messages
-API and the OpenAI Responses API ([SERVER.md](SERVER.md#apis-and-endpoints)). On 2026-10-21 we ran ten clients
-against it on native Windows, each through a set of real tasks; OpenCode had been run the same way two days before.
-This page has, for each of them, the settings that worked, what goes wrong without them, and how the server handles the
-small requests the client sends on the side.
+API and the OpenAI Responses API ([SERVER.md](SERVER.md#apis-and-endpoints)). On 2026-10-21 we ran ten clients against
+it on native Windows, each through the same set of real tasks; OpenCode had been run against it in the days before. This
+page has, for each of them, the settings that worked, what goes wrong without them, and how the server handles the small
+requests the client sends on the side.
 
 With the settings below every client completed the tasks. Most need two or three settings that no client can guess for a
 local model: its context window, whether it takes images, and how to turn thinking off. None needs a setting for the
@@ -23,11 +23,11 @@ sent fresh.
   use the launchers' default, 120000). A client that assumes less compacts early; one that assumes more sends prompts
   the server refuses with a 400 ("exceeds the available context size", or Anthropic's "prompt is too long").
 - **Images:** turn the client's vision flag on when the server runs with an mmproj (the launchers do when they find
-  one). Most clients take an unknown model for text-only and drop images without a word.
+  one). Most clients take an unknown model for text-only and leave images out of the request.
 - **Thinking:** the model thinks unless told otherwise, at its highest effort (the chat template's default). Some
-  clients' "off" level sends nothing (Pi, DeepSeek Harness), which means the most thinking: map it to `reasoning_effort:
-  "none"` where the client allows it. The effort text sits at the very start of the rendered system prompt, so changing
-  the level in the middle of a session re-reads the whole prompt once.
+  clients' "off" level sends nothing (Pi, DeepSeek Harness), which means the most thinking: where the client allows it,
+  map "off" to the `reasoning_effort` value `none`. The effort text sits at the very start of the rendered system
+  prompt, so changing the level in the middle of a session re-reads the whole prompt once.
 
 | client | tested | API | needed | recommended |
 |---|---|---|---|---|
@@ -109,9 +109,10 @@ env_key = "MK_API_KEY"             # set MK_API_KEY to any value
 - **Side requests:** none seen; every Codex request carries its tools.
 - **Tasks run:** create a file, find and fix a failing test, a `codex exec resume` follow-up that adds a function and
   its test, a question about a 4,900-line file read in chunks (to 69k tokens of context), an image (`-i` and Codex's
-  `view_image` tool). A new session prefilled ~8.8k tokens (Codex's instructions and tools) once; then each turn a few
+  `view_image` tool). The first session prefilled ~8.8k tokens (Codex's instructions and tools); then each turn a few
   hundred tokens plus its tool output; `codex exec resume` reused the whole earlier conversation (10,016 cached + 174
-  prefilled).
+  prefilled). With pinned checkpoints a later new session reuses 8,672 of its 8,847 prompt tokens
+  ([SERVER.md](SERVER.md#new-sessions-pinned-prefix-checkpoints)).
 - **Quirks:** in these runs `-s workspace-write` refused every command ("blocked by policy"); the tasks ran with
   `--dangerously-bypass-approvals-and-sandbox` in scratch directories. Codex always sends a `web_search` tool, which
   the server does not offer to the model (a console warning).
@@ -186,8 +187,8 @@ and in `settings.json` `"defaultProvider": "mk"`, `"defaultModel": "Qwen3.8-27B-
 - **Side requests:** a compaction summary (no tools; 3.0k tokens for a 49.8k-token conversation) runs beside the
   conversation it summarises while it fits `--side-max`; the summarised conversation, which Pi replaces by the summary,
   is parked with low priority when the next request replaces it.
-- **Quirks:** Pi asks before nothing and has no turn limit: bound unattended runs yourself. Images work with `input`
-  listing `image` (`pi -p @image.png "..."`).
+- **Quirks:** Pi runs tools without asking and has no turn limit: bound unattended runs yourself. Images work with
+  `input` listing `image` (`pi -p @image.png "..."`).
 
 ## DeepSeek Harness (dsh)
 
@@ -287,10 +288,11 @@ For images, a custom provider instead, `custom_providers/mk_local.json` in Goose
   (1-3 s with thinking on); it runs beside the session either way.
 - **Side requests:** session naming (no tools, no `max_tokens`) runs beside the session; compaction summaries (no
   tools, the conversation in the system message) run beside it too while they fit `--side-max`.
-- **Quirks:** Goose's compaction summaries think as long as they like (85 s once): there is no per-request switch for
-  the `openai` provider. Goose reads skills and agents from the real user profile (`~/.claude/skills`, ...) through the
-  Windows Known Folder API, whatever `USERPROFILE` says; they end up in its system prompt. Its `cmd.exe` shell cuts
-  multi-line commands at the first newline (`GOOSE_SHELL=powershell` avoids it).
+- **Quirks:** Goose's compaction summaries think as long as they like (85 s once): the `openai` provider has no
+  per-request thinking switch (`GOOSE_THINKING_EFFORT` was not tried). Goose loads the skills and agents of other tools
+  from the user profile (`~/.claude/skills`, `~/.claude/agents`, ...) into its system prompt (~3k tokens in our runs);
+  on Windows it finds the profile through the Known Folder API, so a redirected `USERPROFILE` does not change that. Its
+  `cmd.exe` shell cuts multi-line commands at the first newline (`GOOSE_SHELL=powershell` avoids it).
 
 ## Hermes Agent
 
@@ -455,4 +457,6 @@ feature the server refuses with a 400 (JSON schema output, forced tool choice, l
   ([SERVER.md](SERVER.md#measured-on-real-client-traffic)) and with requests of each client's shapes against the real
   model.
 - **What the configs above change:** the base URL (port 8080 instead of the test port), the context (120000, the
-  launchers' default, instead of 230000) and the API key are placeholders; everything else is what ran.
+  launchers' default, instead of 230000), the API key and display names are placeholders; the shell lines are written
+  for a POSIX shell (the runs used `set` in `cmd`); settings that only served the test setup (telemetry and update
+  checks off, a logging proxy, Codex's approval and sandbox modes) are left out. The rest is what ran.
