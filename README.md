@@ -12,12 +12,13 @@ Built on the megakernel of [open-jet](https://github.com/L-Forster/open-jet) by 
 ## Exact output
 
 Speculative decoding is lossless in theory, but in practice verifying several tokens in one pass rounds differently from
-verifying one, so greedy output can change with the number of drafts; a reused cache or a different build can drift in
-the same way. This engine is built so that none of them changes the output, and the release checks test it:
+verifying one, so greedy output can change with the number of drafts; a reused cache, or the same source compiled by
+another compiler, can drift in the same way. This engine is built so that none of these changes the output, and the
+release checks test it:
 
 - **Drafting never changes the answer.** Greedy token ids are identical at 0, 4 and 7 drafts. With sampling, the
   output keeps the distribution of sampling without drafts (chi-square and PIT tests). The MTP layer only proposes
-  tokens, so the output is the same with any MTP layer or none.
+  tokens, so greedy output is the same with any MTP layer or none.
 - **A cached conversation answers like a fresh one.** With exact reuse (the launchers' default), a follow-up turn, an
   edited conversation, a new session resumed after its system prompt, a conversation restored from host memory and a
   conversation kept through a client's title request all continue bit for bit as the same request sent fresh (greedy,
@@ -37,6 +38,8 @@ What is not bit-identical, and how close it is:
 - **The low-bit KV presets** ([below](#the-full-262k-context-on-24-gb)): opt-in and near-lossless, not identical to
   q8_0.
 - **`MK_EXACT_REUSE=0`** makes follow-up turns faster by appending to the previous reply instead of reading it again.
+- **The lean build** (`make MKFLAGS=`, up to 4 drafts) reads the weights with other kernels, so it rounds differently
+  from the served build; the checks above run on the served build.
 
 Evidence and the tests behind each line: [docs/BENCHMARKS.md](docs/BENCHMARKS.md#exactness).
 
@@ -69,9 +72,10 @@ same request sent fresh would:
 - **Follow-ups and edits** resume from DeltaNet checkpoints (one at every message start and every 4,096 tokens).
   Editing an earlier message in an 11.7k-token chat cost 76 ms of prompt time, editing the end of a 9.1k-token system
   prompt 89 ms (llama.cpp: 329 and 956 ms).
-- **New sessions** of the same client resume after its system prompt and tools: that checkpoint is pinned and never
-  evicted. A new Claude Code session reused 8,288 of its 11,850 prompt tokens and a new Codex CLI session 8,672 of
-  8,847, where the server before reused none (2026-10-21, preset D).
+- **New sessions** of the same client resume after its system prompt and tools: that checkpoint is pinned, so the
+  checkpoint pool never evicts it, and it is parked with its conversation. A new Claude Code session reused 8,288 of
+  its 11,850 prompt tokens and a new Codex CLI session 8,672 of 8,847, where the server before reused none
+  (2026-10-21, preset D).
 - **Several conversations** share the engine: a request for another conversation parks the current one in host
   memory, and it comes back when its next request arrives. A 12k / 38k / 120k-token conversation took 31 / 62 / 177 ms
   to park and 29 / 65 / 178 ms to restore, against 7.4 / 23.9 / 98.4 s to read it again (q8_0, 2026-10-19).
@@ -87,8 +91,9 @@ instead of 173 s. How it works and how to size it: [docs/SERVER.md](docs/SERVER.
 The server implements OpenAI chat completions (`/v1/chat/completions`), the Anthropic Messages API (`/v1/messages`,
 with token counting), the OpenAI Responses API (`/v1/responses`) and llama-server's endpoints (`/health`, `/props`,
 `/v1/models`, `/slots`, `/metrics`, `/tokenize`, `/detokenize`, `/apply-template`), with streaming, tool calls streamed
-as they are generated, thinking, images and video. These clients ran test tasks against it (the agents: create a file,
-find and fix a failing test, follow-ups, questions about a large file, an image):
+as they are generated, thinking, images and video (encoded on the CPU, so they take no VRAM). These clients ran test
+tasks against it (the agents: create a file, find and fix a failing test, follow-ups, questions about a large file, an
+image):
 
 | client | version tested | client | version tested |
 |---|---|---|---|
@@ -133,6 +138,7 @@ the window, its KL at 32k is 8% above q8_0's (an fp16 cache, more precise than b
 set), it scored the same on the 282 questions, set by set, and it read prompts about 4% slower. Its lower
 long-context decode rates in the full table come mostly from different reply text accepting fewer drafts (2.98 instead
 of 3.53 tokens per cycle at 38k); per cycle it ran within the table's -2% to +4%.
+
 Our recommendation: for long-context work, or to free a gigabyte for something else, turn it on; the cost we can
 measure is small. It stays opt-in because it is not bit-identical to q8_0. Every preset and its numbers:
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md#kv-cache-presets).

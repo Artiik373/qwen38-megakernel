@@ -96,7 +96,7 @@ The same session, a server at 262,144 tokens with preset D (20:21-21:05):
 | | |
 |---|---|
 | prompt | 260,896 tokens, read from scratch in 326 s |
-| decode at that depth | 66 tok/s (512 tokens, no thinking) |
+| decode at that depth | 66 tok/s (a summary of up to 512 tokens, no thinking) |
 | follow-up turn, prompt time | 1.28 s |
 | VRAM, whole card, after the prompt | 23.5 GB |
 | needle in a haystack (4 needles, asks one), at 190k and the longest length that fits | 4 / 4 |
@@ -107,9 +107,10 @@ tokens (prompt read in 275.7 s) with a peak of 24,116 of 24,576 MiB (2026-10-18,
 
 ### How the run was measured
 
-- **Client:** `final_client.py` (the same client as the 2026-10-12 .. 10-15 runs), against `/v1/chat/completions`
-  without streaming; it reads the server's `timings` (prompt and decode time) and `usage` (cached tokens). One warm-up
-  request, then ~3 s of decode so the timed requests start at full clocks.
+- **Client:** a Python script (not part of this repository; the one of the 2026-10-14 and 10-15 runs, which sends the
+  requests of the 2026-10-12 / 13 llama.cpp sessions plus a clock warm-up), against `/v1/chat/completions` without
+  streaming; it reads the server's `timings` (prompt and decode time) and `usage` (cached tokens). One warm-up request,
+  then ~3 s of decode so the timed requests start at full clocks.
 - **Short prompts:** four chat prompts (a Python prime check with doctests, how a hash map works, a 300-word story, a
   Flask-to-FastAPI migration plan): greedy without thinking, 512 tokens each; then sampled with thinking (temperature
   1.0, top_p 0.95, top_k 20) with seeds 11 and 22, up to 768 tokens each. First token: three one-word questions,
@@ -238,7 +239,7 @@ Memory and speed, preset D against q8_0:
 | VRAM, idle server at 120k context | 21.1 GB | 20.0 GB | 2026-10-20, 7322fbd |
 | KV cache at 120k context | | 1,132 MiB less | 2026-10-13 |
 | the full 262,144-token context | | 23.5 GB | 2026-10-20, 7322fbd |
-| reading a 11.6k / 38k / 101.6k-token prompt | 5.98 / 23.2 / 74.5 s | 6.09 / 24.1 / 77.6 s | 2026-10-20, 7322fbd |
+| reading an 11.6k / 38k / 101.6k-token prompt | 5.98 / 23.2 / 74.5 s | 6.09 / 24.1 / 77.6 s | 2026-10-20, 7322fbd |
 | decode time per engine cycle, 11.6k / 38k / 101.6k | | +2.8% / -2.4% / +3.8% | 2026-10-20, 7322fbd (derived, above) |
 | 282 questions | 230 right | 230 right, the same per set | 2026-10-20, 7322fbd |
 
@@ -252,10 +253,11 @@ Other presets (2026-10-13, measured as KV memory saved at 120k context against q
 | E | `MK_KV='K*=6r,V*=4r' MK_KV_WIN=2048` | 1,381 MiB | +2% / +5% / +10% | +2.4% / +4.9% | -2.0% / -4.2% |
 
 Later the same day a decode attention that serves 6-8 verified rows in one pass cut preset D's time per cycle at
-101.6k context by 11.9% (q8_0: 8.2%), and on 2026-10-14 compile-time 6-bit K / 5-bit V prefill kernels cut the prefill
-time of D' by 2.5% / 1.3% at 101.6k / 38k; the 2026-10-20 numbers above include both. D' (the MTP layer at 8 bits,
-70 MB more) decoded 1.2% / 2.9% faster than D at 101.6k / 38k on 2026-10-13. Other formats tried in the emulator (3-bit,
-codebooks, per-row scales, random signs, angle coding) scored worse than the plain per-32-value grid.
+101.6k context from 44.0 to 39.4 ms (q8_0: 41.2 to 38.0 ms), and on 2026-10-14 compile-time 6-bit K / 5-bit V prefill
+kernels cut the prefill time of D' by 2.5% / 1.3% at 101.6k / 38k; the 2026-10-20 numbers above include both. D' (the
+MTP layer at 8 bits, 70 MB more) decoded 1.2% / 2.9% faster than D at 101.6k / 38k on 2026-10-13. Other formats tried
+in the emulator (3-bit, codebooks, per-row scales, random signs, angle coding) scored worse than the plain
+per-32-value grid.
 
 ## The conversation cache
 
@@ -315,10 +317,12 @@ its own replies, so reply lengths differ slightly from the live runs. 2026-10-21
 What it costs: every parked conversation now carries its pinned checkpoint (+288 MiB with preset D), so fewer fit in
 the host store (Claude Code's sequence held 4 instead of 6, and two of its requests cached 4-6k fewer tokens). In the
 Open WebUI sequences, the default title request on a long chat parked the chat with low priority and the next request
-evicted it: one turn read 46.8k tokens again (33.7 s instead of 0.5 s). Clients set up as in [CLIENTS.md](CLIENTS.md)
-(Open WebUI's title template quoting only the end of the chat) do not send that request.
+evicted it: one turn read 46.8k tokens again (33.7 s instead of 0.5 s). With Open WebUI's title and tags templates set
+as in [CLIENTS.md](CLIENTS.md) (quoting only the end of the chat), the title request is short and this does not
+happen.
 
-`--park-min` (the smallest conversation that is parked), both interleaved sequences, ef4a6dd, fixed seeds:
+`--park-min` (among its uses: conversations of fewer tokens are not parked; [SERVER.md](SERVER.md)), both interleaved
+sequences, ef4a6dd, fixed seeds:
 
 | `--park-min` | parks | GiB copied | real conversations evicted | tokens read | time reading prompts |
 |---|---|---|---|---|---|
@@ -382,6 +386,10 @@ The image and video encoder runs on the CPU, so it takes no VRAM: with an image 
 VRAM at 120k context did not grow (2026-10-16).
 
 ## Earlier full runs
+
+The 2026-10-14 run with charts and raw data, and the gates behind each change up to 2026-10-16, are in the open-jet
+fork's [perf docs](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf/perf), where this engine was
+developed until it moved here.
 
 ### 2026-10-15 (7d67c5d)
 
