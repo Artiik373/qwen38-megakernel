@@ -146,7 +146,14 @@ measure is small. It stays opt-in because it is not bit-identical to q8_0. Every
 
 ## Quick start
 
-Linux or WSL2 (CUDA 13.2, llama.cpp next to this repository for its tokenizer and image library):
+**Prebuilt packages** for Windows and Linux are on the
+[releases page](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases), built for RTX 30-series GPUs (sm_86;
+RTX 40-series cards can run that code but are untested): unpack one, `pip install -r requirements.txt`, download the
+model as below and run `scripts/serve.sh` or `scripts\serve.bat`. What they need:
+[docs/BUILDING.md](docs/BUILDING.md#prebuilt-packages).
+
+To build from source on Linux or WSL2 (CUDA 13.2, llama.cpp next to this repository for its tokenizer and image
+library):
 
 ```sh
 git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout b10246

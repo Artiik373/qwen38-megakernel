@@ -33,3 +33,5 @@ build_win/
 *.exp
 *.obj
 *.pdb
+# release packages (scripts/package_release.*)
+dist/

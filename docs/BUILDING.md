@@ -4,8 +4,36 @@ The same sources build on Linux / WSL2 (g++ + nvcc, `make`) and natively on Wind
 two builds give the same output bit for bit ([BENCHMARKS.md](BENCHMARKS.md#windows-and-linux)). Every build setting
 named here is described in [CONFIGURATION.md](CONFIGURATION.md).
 
-Contents: [requirements](#requirements) - [Linux and WSL2](#linux-and-wsl2) - [Windows](#windows) - [model
-files](#model-files) - [checking a build](#checking-a-build) - [files](#files).
+Contents: [prebuilt packages](#prebuilt-packages) - [requirements](#requirements) - [Linux and WSL2](#linux-and-wsl2) -
+[Windows](#windows) - [model files](#model-files) - [checking a build](#checking-a-build) - [files](#files).
+
+## Prebuilt packages
+
+Each [release](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases) has a Windows x64 zip and a Linux
+x86-64 tarball of the served configuration (`MKFLAGS` as below: wide verify, up to 7 drafts), built from the tagged
+commit. Each holds the engine library, the CLI, the vision library, the tools, llama.cpp b10246's libraries (CPU only:
+the engine uses its tokenizer and image library), the server, the launcher, the docs, the licenses
+(`THIRD_PARTY_NOTICES.md`), `BUILD_INFO.txt` (commit, flags, toolchain) and `QUICKSTART.txt`. They need:
+
+- **GPU:** the engine is compiled for sm_86 (RTX 30-series; tested on an RTX 3090) and needs at least 80 SMs for more
+  than 4 drafts. Compute capability 8.9 GPUs (RTX 40-series) can run sm_86 code but are untested; RTX 50-series
+  (sm_120) and other architectures need a source build.
+- **Driver:** one that supports CUDA 13.2 (`nvidia-smi` shows "CUDA Version: 13.2" or higher). The CUDA runtime is
+  linked into the engine; nothing else from CUDA is needed.
+- **CPU:** x86-64 with AVX2 (llama.cpp's libraries in the packages use it).
+- **Python** 3.10+ with `pip install -r requirements.txt`, for the server.
+- **Linux:** x86-64 with glibc 2.38 or newer and GCC 13's libstdc++ (built on Ubuntu 24.04: Ubuntu 24.04, Debian 13,
+  Fedora 39 and newer qualify). Under WSL2 the Windows driver provides CUDA.
+- **Windows:** 10 / 11 x64. The Visual C++ runtime is included.
+
+The model is not included: download it as under [model files](#model-files), then follow `QUICKSTART.txt` (the same
+steps as the README's quick start, without the build).
+
+The packages are made with `scripts/package_release.sh` (after `make`, against a llama.cpp built CPU-only and without
+`-march=native`: `cmake -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON
+-DGGML_F16C=ON -DGGML_OPENMP=OFF -DLLAMA_CURL=OFF`; it needs `patchelf`, which re-points the binaries at their own
+folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Visual C++ runtime from Visual Studio
+2022's redistributable folder).
 
 ## Requirements
 
