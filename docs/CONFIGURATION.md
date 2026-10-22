@@ -565,6 +565,13 @@ These are for measuring and checking, not for serving. Each one's usage text is 
 | `bench/code_bench.py` (code workloads, both engines) | `--ctx-sizes LIST` (default 0,2000,4000,8000,16000,30000), `--reps N` (2), `-n N` (256), `--model FILE` | upstream (4d92fd2) |
 | `bench/think_bench.py` (thinking-mode decode, both engines) | `--seeds N` (2), `-n N` (1024) | upstream (4d92fd2) |
 | `bench/wv_extract.py` | `[qwen38_mk.cu] [out.cuh]`: copies the engine's dp4a GEMV code into `bench/wv_ref.cuh` for `wvgemm_bench` | 52a4383, 2026-10-12 |
+| `bench/suite/fetch.py` (downloads the benchmark items and checks each against `bench/suite/items.json`) | `--data DIR` (default `bench/suite/data`), `--sets NAME ...` (default all, and `pf101k`), `--check` (check the files already there, download nothing) | 6580a5d, 2026-10-22 |
+| `bench/suite/speed_client.py` (decode, prefill, first token, follow-up turns, prompt edits, VRAM; one server) | `--label L`, `--out FILE` (JSON lines, appended), `--url URL` (default `http://127.0.0.1:8080`), `--mode all\|edit` (default all; edit: the warm-up and the edit scenarios only), `--data DIR`, `--gpu N\|none` (nvidia-smi GPU for the VRAM and clock records, default 0) | 6580a5d, 2026-10-22 |
+| `bench/suite/qa_client.py` (the 282 questions) | `--label`, `--out`, `--url`, `--data`, `--limit N` (the first N items of each set only), then set names (default all) | 6580a5d, 2026-10-22 |
+| `bench/suite/scratch_client.py` (the 101.6k-token prompt from scratch; a server with `--side-max 0 --park-mib 0`) | `--label`, `--out`, `--url`, `--data` | 6580a5d, 2026-10-22 |
+| `bench/suite/maxctx_client.py` (speed, needles and LongBench v2 at the full context) | `--ctx N` (the server's context; decides which items fit), `--label`, `--out`, `--url`, `--data`, `--gpu`, `--limit N` | 6580a5d, 2026-10-22 |
+| `bench/suite/score.py` (scores the question runs offline) | the clients' files, `--data DIR`, `--labels L ...`, `--exec-humaneval` (runs the model-written HumanEval code; without it HumanEval is not scored), `--timeout S` (per HumanEval task, default 15), `--out FILE` (default `scores.json` next to the first file) | 6580a5d, 2026-10-22 |
+| `bench/suite/summarize.py` (the published tables from the clients' files) | the clients' files (each one a session; a label in several files gets its best session per row), `--scores FILE ...`, `--col LABEL[=TITLE]` (repeatable), `--sub LABEL:KEY[,KEY]=OTHER` (rows of a column from another label), `--out FILE` | 6580a5d, 2026-10-22 |
 
 The CUDA microbenchmarks in `bench/` are built by hand (`nvcc ...`, the line is at the top of each file) and take
 these switches (`attn_bench.cu` predates the current prefill attention and no longer builds against
