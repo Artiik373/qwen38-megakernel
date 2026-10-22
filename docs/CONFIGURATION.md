@@ -69,7 +69,7 @@ on when the vision projector is found. These are the settings worth knowing:
 | Prefill chunk | `MK_PF_CAP` | (engine) | 2048; the launchers set 1024 above 96k context | 1024 frees ~0.34 GB of VRAM (2026-10-11) |
 | Thinking off by default | `MK_CHAT_TEMPLATE_KWARGS` | `--chat-template-kwargs` | thinking on | `{"enable_thinking": false}` |
 | Python | `MK_PYTHON` | - | `python3` (Windows: `python`) | a virtual environment with jinja2 |
-| Lean build | `make MKFLAGS=` / `build.ps1 -MkFlags ""` | - | the served build | less RAM to compile (~19 GB instead of ~28 GB); at most 4 drafts |
+| Lean build | `make MKFLAGS=` / `build.ps1 -MkFlags ""` | - | the served build | less RAM to compile (~19 GB instead of up to ~34 GB); at most 4 drafts |
 
 Running `server/mk_server.py` directly instead of a launcher: its own defaults are more conservative (port 18080,
 context 32768, 4 drafts, `--kv auto`, exact reuse off, no images unless `--mmproj`). More than 4 drafts needs the q8_0
@@ -407,7 +407,7 @@ time to ready from 30.1 / 59.7 s to 8.5 / 12.2 s (2026-10-14). The next three ar
 
 | Variable | Default | What it does | Output | Status | Since |
 |---|---|---|---|---|---|
-| `MK_KEEP_WARM_S` | `120` | seconds the engine keeps the GPU's clocks up after each server request with a one-thread kernel (`0`: off; the CLI never warms). A short reply after 65 s idle started in ~65 ms instead of 391-397 ms and decoded at 80.2 instead of 61-63 tok/s (2026-10-17, native Windows); an RTX 3090 draws ~165 W while warm instead of 30-35 W idle | same (reply text identical) | served | b2b415a, 2026-10-17 (120 s since 147054b, was 300) |
+| `MK_KEEP_WARM_S` | `120` | seconds the engine keeps the GPU's clocks up after each server request with a one-block, 32-thread polling kernel (`0`: off; the CLI never warms). A short reply after 65 s idle started in ~65 ms instead of 391-397 ms and decoded at 80.2 instead of 61-63 tok/s (2026-10-17, native Windows); an RTX 3090 draws ~165 W while warm instead of 30-35 W idle | same (reply text identical) | served | b2b415a, 2026-10-17 (120 s since 147054b, was 300) |
 | `MK_KEEP_WARM_LOAD` | `1,32,50,0,0` | the warm load as `blocks,threads,on_ms,off_ms,spin` (measurement knob: only a continuous load holds the clocks) | - | debug | b2b415a, 2026-10-17 |
 | `MK_WATCHDOG` | `60` | seconds a decode launch may take before the engine stops with an error and exit code 3 (prefill chunks, checkpoint copies and the weight upload get at least 120 s; `0`: plain blocking waits). It turns a GPU fault the runtime does not report into a message instead of a hang | - | served | e44f800, 2026-10-12 |
 | `MK_WATCHDOG_SPIN` | `0.25` | seconds a device wait spins before it sleeps between polls | - | option | e44f800, 2026-10-12 |
@@ -424,7 +424,8 @@ MKFLAGS = -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1
 
 - **Served build** (the default): wide verify (`MK_WV=1`: the verify pass on int8 tensor cores), up to 7 drafts
   (`MK_MAXT=8`), every Q6_K matrix on the tensor-core path (`MK_WV_Q6F=1`) and the split DeltaNet barrier (`MK_K5=1`).
-  `MK_C1` and `MK_EGRESS` follow `MK_WV`, so they are on too. ptxas needs ~28 GB of RAM for it (Makefile).
+  `MK_C1` and `MK_EGRESS` follow `MK_WV`, so they are on too. ptxas peaked at 28-34 GB of RAM for it
+  ([BUILDING.md](BUILDING.md#requirements)); the Makefile's comment still says ~28 GB.
 - **Lean build** (`make MKFLAGS=`, `.\build.ps1 -MkFlags ""`): every flag at its default, so the dp4a verify path and
   at most 4 drafts (run it with `MK_DRAFT=4` / `-d 4`). ptxas needs ~19 GB.
 

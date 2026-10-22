@@ -157,7 +157,10 @@ the DeltaNet and convolution state, compared with a fresh prefill of the whole p
 What it costs: a follow-up turn re-reads the previous reply (11.6k-token chat, 7 drafts: 167 instead of 78 ms; with a
 thinking reply kept in the history: 469 instead of 86 ms; 2026-10-14). Edits cost the same either way. A fresh
 98k-token prompt took 1.3% longer, and restoring a checkpoint and reading 32 / 128 / 512 tokens after it took 2.6% and
-1.6% less and 0.7% more time (A-B-A, q8_0, 2026-10-14). The accuracy report is the same within noise (2026-10-14).
+1.6% less and 0.7% more time (A-B-A, q8_0, 2026-10-14). The accuracy report is the same within noise: with exact reuse
+98.662% / 0.00118 on the short set and 99.121% / 0.00231 at 32k, without it 98.654% / 0.00116 and 99.023% / 0.00232 on
+the build it was added to (2026-10-14). The llama.cpp comparison below was measured without exact reuse (the CLI's
+default); the launchers' server runs with it.
 
 ### Against llama.cpp
 
