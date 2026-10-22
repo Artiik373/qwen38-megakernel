@@ -118,8 +118,8 @@ python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf --port 8080 -c 120000
 The KV cache is q8_0 (8 bits per value, one fp16 scale per 32) unless asked otherwise. `MK_KV` stores chosen layers'
 K and V at fewer bits, and `MK_KV_WIN` keeps the most recent positions at 8 bits in a ring on top. The presets are
 opt-in and near-lossless: measured by KL divergence against llama.cpp's reference distributions, not bit-identical to
-the q8_0 cache. On prompts that fit in the window every K / V read is a q8_0 row, so the short-prompt KL report is
-byte-identical to q8_0's.
+the q8_0 cache. With C, D and D', a prompt that fits in the window reads only q8_0 rows, and the short-prompt KL report
+is byte-identical to q8_0's; E stores its rows rotated, which changes it slightly.
 
 | Preset | Settings | K / V bits |
 |---|---|---|
