@@ -882,8 +882,8 @@ line that says to rebuild (with `--mmproj`, a library without `mk_prefill_img` s
   preset D, `MK_HOST=0.0.0.0` for the LAN, `MK_MMPROJ=off` for no images); images are on when `mmproj-BF16.gguf` sits
   next to the model or `MK_MMPROJ` names it. Set `MK_PYTHON` to a Python with the server's requirements.
 - The Windows build gives the same replies as the Linux build, bit for bit: text, thinking, images and follow-up turns
-  (first compared 2026-10-16, fdad907), and every release since passes the same identity checks, including the side
-  request and parked-conversation gates under q8_0 and preset D ([BENCHMARKS.md](BENCHMARKS.md)).
+  (first compared 2026-10-16, fdad907), and every release since passes the same identity checks; since 2026-10-19 they
+  include the side-request and parked-conversation gates under q8_0 and preset D ([BENCHMARKS.md](BENCHMARKS.md)).
 - The port is bound exclusively, so a second server cannot share it silently: it fails at startup with a message.
 - A client inside WSL2 with NAT networking does not reach a server running natively on Windows at `127.0.0.1`; run the
   client on Windows, or the server inside WSL2.
