@@ -449,8 +449,12 @@ proposed, so a sampled reply with a fixed seed can differ from the one before it
 
 ## Reproducing
 
-- **Server benchmarks:** the clients behind these tables are not part of this repository; the requests are described
-  under [how the run was measured](#how-the-run-was-measured).
+- **Server benchmarks:** [bench/suite](../bench/suite/README.md) has the clients behind the server tables (speed, the
+  282 questions, the from-scratch prefill, the 262,144-token run), the scorer and the summary script. The datasets are
+  not in this repository: `python -I bench/suite/fetch.py` downloads them and checks every item against the hashes of
+  the items these runs used (`bench/suite/items.json`). HumanEval answers are executed only with `score.py
+  --exec-humaneval`. Re-scoring the saved 2026-10-20 answers with the suite's scorer gives the same 230 right answers
+  for q8_0 and preset D, item for item, and its summary script gives the same table.
 - **Speed, CLI:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_32k.bin --model <gguf>` (the four
   chat prompts through the CLI; it runs the CLI's default KV cache, so at most 4 drafts); `bench/code_bench.py` and
   `bench/think_bench.py` are upstream's scripts; `bench/*.cu` are kernel microbenchmarks.

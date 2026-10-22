@@ -20,6 +20,8 @@ bench/mmq_bench
 bench/mmq_e*
 bench/resid_bench
 bench/*_tmp/
+# benchmark suite downloads (bench/suite/fetch.py)
+bench/suite/data/
 # experimental draft vocabulary (the engine uses draft_vocab_32k.bin)
 draft_vocab_48k.bin
 # python
