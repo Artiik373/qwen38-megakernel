@@ -242,8 +242,15 @@ for reuse until the server exits. When the budget is full, the least recently pa
 prefilled again if it comes back), but two kinds go first, least recently parked first among them:
 - side conversations (below), at most 4 of which are kept;
 - conversations a client is unlikely to continue: one it has just summarised to compact it, and the conversation of the
-  summary request itself (`low priority: <why>` on the park line). One that comes back anyway is a normal conversation
-  again.
+  summary request itself (`low priority: <why>` on the park line). A request without tools that replaces a conversation
+  with tools is taken for such a summary unless it answers in fewer than 256 tokens (thinking aside): after such a short
+  answer (a client's title or tags request that quotes the whole chat), the replaced conversation keeps normal priority
+  (`keeps normal priority` on the console). One that comes back anyway is a normal conversation again.
+
+A conversation parked with low priority would be the first to go, so it only takes the room that side conversations and
+other low-priority ones leave: when that is not enough it is not parked (`not parked: ... have low priority` on the
+console) and nothing is evicted for it. The one exception is the conversation a request without tools has just
+replaced: its low priority waits for that request's answer, so it is parked like any conversation.
 
 What a parked conversation costs: its rows (36,992 bytes per token with the q8_0 cache, 26,112 with preset D), the
 recurrent state (174 MiB) and its checkpoints (174 or 288 MiB each). A 38k-token conversation with the q8_0 cache and
@@ -308,7 +315,9 @@ engine and the next real turn would wait for it to come back. The server runs th
 A side request starts from position 0: it does not reuse the cached conversation's prefix, even when it shares the
 system prompt. A side request without tools that quotes at least `--park-min` tokens and answers in at least 256 (a
 summary; titles, tags, follow-ups and commit messages answer in tens) marks the conversation beside it as summarised: if
-the next request replaces that conversation instead of continuing it, it is parked with low priority.
+the next request replaces that conversation instead of continuing it, it is parked with low priority. A request without
+tools too long to run beside a conversation with tools replaces it: the replaced conversation is parked with low
+priority, and gets normal priority back if that request answers in fewer than 256 tokens.
 
 ### Sizing the host store
 

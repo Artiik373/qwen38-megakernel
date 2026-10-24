@@ -639,7 +639,10 @@ stops after 300 s; the sampling defaults for fields a request leaves out are Uns
 (temperature 1.0, top_p 0.95, top_k 20, min_p 0); top_k is at most 32 (0 or less means 32); one request runs at a
 time. Conversation cache: with parking on, a side request with tools must cap its reply at 1024 tokens; a side request
 that does not cap its reply reserves room for 8192 rows in the host store; a side request's conversation is parked
-with 1 checkpoint, and at most 4 of them are kept; a side request without tools that quotes at least `--park-min`
-tokens and answers with 256 or more is taken for a summary of the conversation beside it; a shared prefix shorter than
-1024 tokens is not pinned. A Responses API stream sends a progress event every 10 s during a long prefill; browsers
-may keep a CORS preflight's answer for 86400 s.
+with 1 checkpoint, and at most 4 of them are kept; a request without tools is taken for a summary by its answer, 256
+tokens or more (thinking aside): a side request that quotes at least `--park-min` tokens, of the conversation beside it;
+a longer one that replaced a conversation with tools, of that conversation (a shorter answer gives it normal priority
+back); a conversation parked with low priority evicts only side conversations and other low-priority ones (it is not
+parked when they do not make room), except the conversation a request without tools has just replaced; a shared prefix
+shorter than 1024 tokens is not pinned. A Responses API stream sends a progress event every 10 s during a long
+prefill; browsers may keep a CORS preflight's answer for 86400 s.

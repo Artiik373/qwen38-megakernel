@@ -319,10 +319,17 @@ its own replies, so reply lengths differ slightly from the live runs. 2026-10-21
 
 What it costs: every parked conversation now carries its pinned checkpoint (+288 MiB with preset D), so fewer fit in
 the host store (Claude Code's sequence held 4 instead of 6, and two of its requests cached 4-6k fewer tokens). In the
-Open WebUI sequences, the default title request on a long chat parked the chat with low priority and the next request
-evicted it: one turn read 46.8k tokens again (33.7 s instead of 0.5 s). With Open WebUI's title and tags templates set
-as in [CLIENTS.md](CLIENTS.md) (quoting only the end of the chat), the title request is short and this does not
-happen.
+Open WebUI sequences on ef4a6dd, the default title request on a long chat (it quotes the whole chat, so it is too long
+to run beside it) parked the chat with low priority and the next request evicted it: one turn read 46.8k tokens again
+(33.7 s instead of 0.5 s). Since 2efba87 that mark waits for the answer and stays only after a summary's (256 tokens
+or more), and the title request's own conversation takes no room from a conversation of normal priority. Replayed on
+2efba87 (native Windows, the same settings, 2026-10-24), the same turn cached 51,936 tokens (0.44 s), and the five
+sequences replayed (Open WebUI, Claude Code + Open WebUI, Goose, DeepSeek Harness + Aider, Crush) spent 698 s reading
+prompts instead of 856 s. The cost: a chat whose title request looks the same but is never continued keeps normal
+priority too, and in the Claude Code + Open WebUI sequence one such chat crowded out the pinned system prompt of two new
+Claude Code sessions (11.9k tokens read instead of 3.5k, each). With Open WebUI's title and tags templates set as in
+[CLIENTS.md](CLIENTS.md) (quoting only the end of the chat), the tasks are short and run beside the chat, and none of
+this happens.
 
 `--park-min` (among its uses: conversations of fewer tokens are not parked; [SERVER.md](SERVER.md)), both interleaved
 sequences, ef4a6dd, fixed seeds:

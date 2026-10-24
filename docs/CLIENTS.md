@@ -145,7 +145,8 @@ Environment: `OPENAI_BASE_URL=http://127.0.0.1:8080/v1`, `OPENAI_API_KEY` (any v
   if you want no outbound traffic.
 - **Side requests:** Qwen Code sends no one-shots; the memory extractor (above) is a conversation of its own, with
   tools, and is parked like one. The compaction summary (no tools, the whole conversation as messages, thinking off) is
-  longer than a side request may be; the conversation it summarises is parked with low priority.
+  longer than a side request may be; the conversation it summarises is parked with low priority (normal again if the
+  answer is shorter than a summary's 256 tokens).
 - **Quirks:** `--resume` / `--continue` do not re-send the conversation byte for byte (the folder listing and a date
   reminder move), so a resumed session re-reads from its first user message; for long work keep one process running.
   After an auto-compaction on a small window, Qwen Code once sent its next request with `max_tokens` 1 (a client bug,
@@ -186,7 +187,8 @@ and in `settings.json` `"defaultProvider": "mk"`, `"defaultModel": "Qwen3.8-27B-
   the template's default then thinks the most.
 - **Side requests:** a compaction summary (no tools; 3.0k tokens for a 49.8k-token conversation) runs beside the
   conversation it summarises while it fits `--side-max`; the summarised conversation, which Pi replaces by the summary,
-  is parked with low priority when the next request replaces it.
+  is parked with low priority when the next request replaces it (a longer summary parks it at once with low priority,
+  normal again if the answer is shorter than 256 tokens).
 - **Quirks:** Pi runs tools without asking and has no turn limit: bound unattended runs yourself. Images work with
   `input` listing `image` (`pi -p @image.png "..."`).
 
@@ -252,7 +254,7 @@ crush model add mk/Qwen3.8-27B-UD-Q4_K_XL.gguf --name "Qwen3.8-27B (megakernel)"
   `<think></think>`, Qwen3's soft switches, which the server applies (Qwen3.8's template ignores them), so titles come
   back short without turning thinking off for the whole provider. Auto-summarize (no tools, the conversation as
   messages) runs beside the session while it fits `--side-max`; a longer one parks the summarised conversation with low
-  priority.
+  priority (normal again if the answer is shorter than 256 tokens).
 - **Quirks:** `--can-reason` is not needed (the model thinks anyway). Crush stores absolute paths in its session
   database: a copied project directory continues editing the original.
 
@@ -382,9 +384,11 @@ Open WebUI's backend, not to the server, so no CORS setting is needed.
   request, and the model used them instead of looking at an attached image. Advanced parameter `reasoning_effort` (low
   / none) to think less.
 - **Side requests:** title, tags and follow-up requests (no tools, one user message) run beside the chat while their
-  prompt fits `--side-max` (8,192 tokens), which the truncated templates ensure. A chat without tools (Builtin Tools
-  off) runs beside an agent's conversation while it fits `--side-max`, and keeps its own conversation cached for the
-  next turn.
+  prompt fits `--side-max` (8,192 tokens), which the truncated templates ensure. With the default templates a long
+  chat's tasks are longer: each is read in full and parks the chat, which its next turn restores (their answers are
+  short, so the chat keeps normal priority); the title task's own conversation is parked only into room that side and
+  low-priority conversations leave. A chat without tools (Builtin Tools off) runs beside an agent's conversation while
+  it fits `--side-max`, and keeps its own conversation cached for the next turn.
 - **Quirks:** the emoji picker sends `max_tokens` 4 without the task parameters, so the model spends them thinking and
   returns an empty reply (cosmetic). Open WebUI does not limit what it sends to the model's context.
 
