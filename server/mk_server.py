@@ -2307,6 +2307,9 @@ class Server:
     # runs, which becomes live_low once its prompt is processed
     live_tools = None
     live_low = next_low = ""
+    # the parked conversation cache_switch marked low because the running request (no tools) replaced it: debris_finish
+    # takes the mark back if the reply's answer is shorter than a summary's (None: no such mark)
+    debris = None
     asst_marker = ()  # the tokens of "<|im_start|>assistant": where a prompt's first reply starts (Server.first_reply)
     # (parked, bytes in use, bytes allocated, their token counts, how many are side requests' own, how many have low
     # priority): /metrics and /props read it
@@ -2447,7 +2450,7 @@ class Server:
         runs beside it too. A new agent session's first turn (tools, a long reply) parks the live conversation like any
         conversation, so its next turns find it cached."""
         eng, a = self.eng, self.args
-        self.cache_pre, self.next_low = "", ""
+        self.cache_pre, self.next_low, self.debris = "", "", None
         seq = eng.sequence()
         live = self.resume_point(seq, eng.committed(), eng.checkpoints(), self.img_spans, toks, spans)
         lost = len(seq) - live[2]  # cached positions the normal path would discard
@@ -2504,9 +2507,12 @@ class Server:
                 return
             # a request without tools that replaces a conversation whose last request had tools is how clients summarise
             # a conversation (compaction); the compacted conversation then replaces the summary's: both copies are
-            # likely dead, parked with low priority (evicted before real parked conversations)
+            # likely dead, parked with low priority (evicted before real parked conversations). Clients' other one-shots
+            # that quote a conversation (titles, tags) look the same until they answer: the replaced conversation's mark
+            # holds only for a summary's answer (debris_finish); the one-shot's own conversation stays low either way
             debris = "" if tools or not self.live_tools else "replaced by a request without tools"
-            self.park_live(seq, "a new conversation", low=self.live_low or debris)
+            e = self.park_live(seq, "a new conversation", low=self.live_low or debris)
+            self.debris = e if debris and not self.live_low else None
             self.next_low = debris and "the conversation of a request without tools that replaced one with tools"
 
     def first_reply(self, toks):
@@ -2556,7 +2562,8 @@ class Server:
 
     def park_live(self, seq, why, keep=None, low=""):
         """a snapshot of the live conversation into the host store (the engine keeps it too); keep: a parked one that must
-        stay (it is restored next); low: why it is parked with low priority ("": it is not)"""
+        stay (it is restored next); low: why it is parked with low priority ("": it is not). Returns its Parked entry
+        (None: not parked)"""
         eng, a = self.eng, self.args
         if len(seq) < a.park_min:
             return
@@ -2573,13 +2580,15 @@ class Server:
         if pid is None:
             log(f"#{self.rid} not parked: no room in the host store for the cached {len(seq):,} tok ({mib(need)})")
             return
-        self.parked[pid] = Parked(pid, seq, cks, eng.committed(), self.img_spans, self.live_gen, need, low=bool(low),
-                                  tools=self.live_tools, pins=pins)
+        e = Parked(pid, seq, cks, eng.committed(), self.img_spans, self.live_gen, need, low=bool(low),
+                   tools=self.live_tools, pins=pins)
+        self.parked[pid] = e
         info = self.store_update()
         self.count(parks=1)
         why += f", low priority: {low}" if low else ""
         log(f"#{self.rid} parked the cached conversation ({why}): {len(seq):,} tok, {mib(info['last_bytes'])} copied in "
             f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} of {a.park_mib:,} MiB")
+        return e
 
     def unpark(self, e):
         """the engine becomes the parked conversation e (its entry is freed)"""
@@ -2680,6 +2689,21 @@ class Server:
             self.count(side_dropped=1)
             log(f"#{self.rid} side request: the cached {n:,} tok were dropped (the host store ran full, or an engine "
                 f"error): the next request prefills its prompt in full")
+
+    def debris_finish(self, replied):
+        """after a request without tools that parked the conversation with tools it replaced with low priority
+        (cache_switch: likely a summary of it, the compacted conversation comes next): a reply whose answer is shorter
+        than a summary's (SUMMARY_ANSWER_MIN tokens, thinking aside, as side_finish counts) gives that conversation, if
+        it is still parked, normal priority again (a client's title or tags task quoting it). The mark stays after a
+        summary's answer and without a reply (replied False: an error, or the client left): clients cut long summaries
+        and move on or retry, and a retry continues the cut request's prompt, which parks nothing and decides nothing"""
+        e, self.debris = self.debris, None
+        if e is None or not replied or self.answer_tokens >= SUMMARY_ANSWER_MIN or self.parked.get(e.id) is not e:
+            return
+        e.low = False
+        self.store_update()
+        log(f"#{self.rid} the parked conversation of {len(e.seq):,} tok keeps normal priority: the request answered in "
+            f"{self.answer_tokens:,} tok (< {SUMMARY_ANSWER_MIN}: not a summary)")
 
     def setup_video(self, args):
         """video input (input_video / video_url parts): needs the vision library's frame pairs (mkv_frames_load) and an
@@ -3230,12 +3254,16 @@ class Server:
         CON.status(f"#{self.rid} preparing the prompt (template, tokens, media)")
         text, thinking, media = self.render(body)
         toks, images = self.tokenize_prompt(text, media)
+        replied = False
         try:
-            return self._generate(body, emit, gone, thinking, toks, images, media)
+            out = self._generate(body, emit, gone, thinking, toks, images, media)
+            replied = True
+            return out
         finally:
             if images:  # (the request's images stay pinned until here)
                 self.vision.release([im for _, im in images])
             self.side_finish()  # (a side request: the cached sequence comes back, also after an error or a disconnect)
+            self.debris_finish(replied)
 
     def _generate(self, body, emit, gone, thinking, toks, images, media=()):
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
