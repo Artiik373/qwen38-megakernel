@@ -66,7 +66,7 @@ on when the vision projector is found. These are the settings worth knowing:
 | Parked conversations | `MK_PARK_MIB` | `--park-mib` | 8192 MiB of host memory | less RAM to spare, or more conversations to keep |
 | Side requests | `MK_SIDE_MAX` | `--side-max` | 8192 tokens | 0 turns them off (benchmarks of from-scratch prefill) |
 | Smallest parked conversation | (not passed) | `--park-min` | 1024 tokens | 4096 halved the real evictions in a replay of recorded client sessions (2026-10-21) |
-| Prefill chunk | `MK_PF_CAP` | (engine) | 2048; the launchers set 1024 above 96k context | 1024 frees ~0.34 GB of VRAM (2026-10-11) |
+| Prefill chunk | `MK_PF_CAP` | (engine) | 2048; the launchers set 1024 above 96k context, `serve.bat` 512 above 240k | 1024 frees ~0.34 GB of VRAM (2026-10-11) |
 | Thinking off by default | `MK_CHAT_TEMPLATE_KWARGS` | `--chat-template-kwargs` | thinking on | `{"enable_thinking": false}` |
 | Python | `MK_PYTHON` | - | `python3` (Windows: `python`) | a virtual environment with jinja2 |
 | Lean build | `make MKFLAGS=` / `build.ps1 -MkFlags ""` | - | the served build | less RAM to compile (~19 GB instead of up to ~34 GB); at most 4 drafts |
@@ -205,7 +205,8 @@ These variables are read by the launchers themselves and turned into options:
 | `MK_VIDEO_MAX_TOKENS` | the image limit | `--video-max-tokens`, with images on | 13377de, 2026-10-18 |
 | `MK_CHAT_TEMPLATE_FILE` | the GGUF's template | `--chat-template-file` | 282cd55, 2026-10-18 |
 | `MK_PYTHON` | `python3`; Windows `python` | the Python that runs the server (needs jinja2) | deb1b62, 2026-10-16 |
-| `MK_PF_CAP` | unset: the launchers set `1024` when the context is above 96,000 | read by the engine ([Prefill](#prefill)) | f598319, 2026-10-11 |
+| `MK_PF_CAP` | unset: the launchers set `1024` when the context is above 96,000; `serve.bat` sets `512` above 240,000 | read by the engine ([Prefill](#prefill)) | f598319, 2026-10-11 |
+| `MK_DRAFT_Q4` | unset (the engine's default, on): `serve.bat` sets `0` above 240,000 | read by the engine ([Speculation](#speculation-drafts)) | 2026-10-24 |
 
 Everything else is read from the environment by the server or the engine, so it works the same with or without a
 launcher: `MK_KV`, `MK_KV_WIN`, `MK_KEEP_WARM_S`, `MK_DRAFT_Q4`, `MK_MTP`, `MK_NO_MTP`, `MK_SIDE_MAX`, `MK_PARK_MIB`,
@@ -350,7 +351,7 @@ The policy before the gates was `depth=0,drop=0,stop=0,chain=0,h1=0`. On the lea
 
 | Variable | Default | What it does | Output | Status | Since |
 |---|---|---|---|---|---|
-| `MK_PF_CAP` | `2048`; the launchers use `1024` above 96k context | tokens per prefill chunk, 128-2048 in steps of 128. The scratch is ~0.33 MB per token: 1024 frees ~0.34 GB, and prefill was 4.5% slower on UD-Q4_K_XL (2026-10-11) | same with exact reuse; not checked without | served | f598319, 2026-10-11 |
+| `MK_PF_CAP` | `2048`; the launchers use `1024` above 96k context, `serve.bat` `512` above 240k | tokens per prefill chunk, 128-2048 in steps of 128. The scratch is ~0.33 MB per token: 1024 frees ~0.34 GB, and prefill was 4.5% slower on UD-Q4_K_XL (2026-10-11) | same with exact reuse; not checked without | served | f598319, 2026-10-11 |
 | `MK_ATTN_S8` | `1` | q8_0 cache, prefill attention: `1` int8 Q K^T with one Q scale per 32 dims (+16.7% prefill at 101.6k, 2026-10-12); `2` one Q scale per row (+5% in the kernel, 1.6 times the Q rounding noise); `0` fp16 tensor cores | changes | served (`1`) | aea6c6f, 2026-10-12 |
 | `MK_ATTN_SPLIT` | `1` | `0`: no tail split of long rows in the prefill attention (exact mode never splits) | changes | earlier path | fb218e3, 2026-10-11 |
 | `MK_ATTN_PV16` | `1` | `0`: the attention's P V accumulated in fp32 instead of fp16 | changes | earlier path | fb218e3, 2026-10-11 |

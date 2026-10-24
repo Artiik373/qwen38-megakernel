@@ -102,6 +102,13 @@ The same session, a server at 262,144 tokens with preset D (20:21-21:05):
 | needle in a haystack (4 needles, asks one), at 190k and the longest length that fits | 4 / 4 |
 | LongBench v2 at that length (6 questions, 1,024 answer tokens) | 4 / 6 |
 
+At the full 262,144 natively on Windows, with the desktop on the same card, the default settings (1,024-token prefill
+chunk, the draft head's Q4_K copy) left the engine just past what the Windows driver keeps resident, and it paged: a
+442-token reply decoded at 16 tok/s against 82.5 under WSL2 (the same tokens and drafts). With a 512-token prefill
+chunk and the draft head on lm_head (0.17 GB less, the same output), which `scripts\serve.bat` sets above 240k, the
+engine's memory stayed flat and resident: that reply at 81.6 tok/s, the 260,896-token prompt in 366 s (712 tok/s),
+decode at that depth 64.3 tok/s, a follow-up turn in 1.6 s, the needle at 190k found, a 137k-token LongBench v2 item
+read at 1,062 tok/s, and a peak of 23,771 of 24,576 MiB (2026-10-24, the 5f535a7 server on the release's engine).
 Natively on Windows, with the desktop on the same card, a 240k-context server with preset D found a needle at 227,170
 tokens (prompt read in 275.7 s) with a peak of 24,116 of 24,576 MiB (2026-10-18, 282cd55).
 
