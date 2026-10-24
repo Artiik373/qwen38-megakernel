@@ -2509,10 +2509,12 @@ class Server:
             # a conversation (compaction); the compacted conversation then replaces the summary's: both copies are
             # likely dead, parked with low priority (evicted before real parked conversations). Clients' other one-shots
             # that quote a conversation (titles, tags) look the same until they answer: the replaced conversation's mark
-            # holds only for a summary's answer (debris_finish); the one-shot's own conversation stays low either way
+            # holds only for a summary's answer (debris_finish); the one-shot's own conversation stays low either
+            # way, and takes no room from a conversation of normal priority when it is parked (park_live)
             debris = "" if tools or not self.live_tools else "replaced by a request without tools"
-            e = self.park_live(seq, "a new conversation", low=self.live_low or debris)
-            self.debris = e if debris and not self.live_low else None
+            mark = bool(debris) and not self.live_low  # (provisional: debris_finish may take it back)
+            e = self.park_live(seq, "a new conversation", low=self.live_low or debris, provisional=mark)
+            self.debris = e if mark else None
             self.next_low = debris and "the conversation of a request without tools that replaced one with tools"
 
     def first_reply(self, toks):
@@ -2560,10 +2562,10 @@ class Server:
         self.store_update()
         log(f"#{self.rid} evicted the parked conversation of {len(e.seq):,} tok ({mib(e.nbytes)}, {why}")
 
-    def park_live(self, seq, why, keep=None, low=""):
+    def park_live(self, seq, why, keep=None, low="", provisional=False):
         """a snapshot of the live conversation into the host store (the engine keeps it too); keep: a parked one that must
-        stay (it is restored next); low: why it is parked with low priority ("": it is not). Returns its Parked entry
-        (None: not parked)"""
+        stay (it is restored next); low: why it is parked with low priority ("": it is not), provisional: that mark may
+        be taken back (Server.debris). Returns its Parked entry (None: not parked)"""
         eng, a = self.eng, self.args
         if len(seq) < a.park_min:
             return
@@ -2572,7 +2574,18 @@ class Server:
             log(f"#{self.rid} not parked: the cached {len(seq):,} tok need {mib(need)} of host memory "
                 f"(--park-mib {a.park_mib:,})")
             return
-        self.make_room(need, budget, keep)
+        if low and not provisional:
+            # a low-priority conversation would be evicted before any normal one: as a side request's own conversation
+            # (side_finish), it only takes room that side and other low-priority ones leave, and evicts nothing when
+            # that is not enough
+            spare = budget - eng.store_info()["used"] + sum(e.nbytes for p, e in self.parked.items()
+                                                             if p != keep and (e.side or e.low))
+            if need > spare or not self.make_room(need, budget, keep, side_only=True):
+                log(f"#{self.rid} not parked: the cached {len(seq):,} tok ({mib(need)}) have low priority ({low}) and "
+                    f"do not fit in the host store without evicting a conversation of normal priority")
+                return
+        else:
+            self.make_room(need, budget, keep)
         # (the engine parks the newest --park-cks checkpoints and the pinned ones: Engine.ck_pin)
         pins = eng.pinned() if a.park_cks > 0 and getattr(eng, "ck_pins", False) else []
         cks = sorted(set(sorted(eng.checkpoints())[-a.park_cks:]) | set(pins)) if a.park_cks > 0 else []

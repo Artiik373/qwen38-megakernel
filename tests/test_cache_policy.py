@@ -279,40 +279,102 @@ class DebrisTests(base._HttpCase):
         log = self.quiet(lambda: self.compaction(http_, eng, "B: ", msgs))
         self.assertEqual([low for _, _, low in self.entries(srv)], [True, True], log)
 
-    def test_a_long_one_shot_with_a_short_answer_leaves_the_conversation_it_replaced_at_normal_priority(self) -> None:
-        # Open WebUI's default title and tags tasks after a turn of a chat with tools: one user message quoting the chat
-        # (no tools, longer than --side-max: not side requests); the title thinks first (293 tok, 15 of them its
-        # answer). Neither is a summary: the chat's next turn finds it parked (2 MiB: two long conversations, so the
-        # tags task's park evicts the older one)
-        eng, srv, http_ = self.setup(park_mib=2)
+    NOT_PARKED = ("have low priority (the conversation of a request without tools that replaced one with tools) and do "
+                  "not fit in the host store without evicting a conversation of normal priority")
+
+    def owui_tasks(self, http_, eng, srv, chat, r):
+        """Open WebUI's default title and tags tasks after a turn of the chat with tools (one user message quoting the
+        chat, no tools, longer than --side-max: not side requests; the title thinks first: 293 tok, 15 of them its
+        answer), then the chat's next turn: ((the parked entries' low flags, the gauge's count) after the title task,
+        the next turn's reply)"""
+        pieces = self.answers(eng, 15, thinking=277)
+        self.chat(http_, [{"role": "user", "content": "### Task: a title for the chat. " + self.LONG}],
+                  max_tokens=1000, chat_template_kwargs={"enable_thinking": True})
+        low = [e.low for e in srv.parked.values()], srv.engine_info()["host_cache"]["parked_low"]
+        self.answers(eng, 32)
+        self.chat(http_, [{"role": "user", "content": "### Task: tags for the chat. " + self.LONG}], max_tokens=1000)
+        eng.pieces = pieces
+        return low, self.chat(http_, self.follow_up(chat, r), tools=TOOLS)
+
+    def run_owui(self, park_mib, older):
+        """(an older conversation with tools first,) the chat's turn, owui_tasks: (log, the chat's prompt tokens, the
+        title task's (low flags, gauge), the next turn's cached tokens, srv)"""
+        eng, srv, http_ = self.setup(park_mib=park_mib)
         srv.template = self.mk.make_template(THINK)
         chat = [{"role": "user", "content": "T: " + self.LONG}]
         out = {}
 
         def run():
-            self.chat(http_, [{"role": "user", "content": "O: " + self.LONG}], tools=TOOLS)  # (an older conversation)
+            if older:
+                self.chat(http_, [{"role": "user", "content": "O: " + self.LONG}], tools=TOOLS)
             r = self.chat(http_, chat, tools=TOOLS)
             out["n"] = len(eng.seq) - 1  # (its prompt)
-            pieces = self.answers(eng, 15, thinking=277)
-            self.chat(http_, [{"role": "user", "content": "### Task: a title for the chat. " + self.LONG}],
-                      max_tokens=1000, chat_template_kwargs={"enable_thinking": True})
-            out["low"] = [e.low for e in srv.parked.values()]
-            out["gauge"] = srv.engine_info()["host_cache"]["parked_low"]
-            self.answers(eng, 32)
-            self.chat(http_, [{"role": "user", "content": "### Task: tags for the chat. " + self.LONG}],
-                      max_tokens=1000)
-            eng.pieces = pieces
-            out["r"] = self.chat(http_, self.follow_up(chat, r), tools=TOOLS)
+            out["low"], r2 = self.owui_tasks(http_, eng, srv, chat, r)
+            out["cached"] = r2["usage"]["prompt_tokens_details"]["cached_tokens"]
         log = self.quiet(run)
-        self.assertGreaterEqual(out["r"]["usage"]["prompt_tokens_details"]["cached_tokens"], out["n"], log)
+        return log, out["n"], out["low"], out["cached"], srv
+
+    def test_a_long_one_shot_with_a_short_answer_leaves_the_conversation_it_replaced_at_normal_priority(self) -> None:
+        # (2 MiB: two long conversations: the title task's own conversation finds no room it may take; the chat's next
+        # turn parks the tags task's own one, of normal priority, in place of the older conversation)
+        log, n, low, cached, _ = self.run_owui(park_mib=2, older=True)
+        self.assertGreaterEqual(cached, n, log)
         self.assertIn("restored the parked conversation", log)
-        self.assertEqual((out["low"], out["gauge"]), ([False, False], 0), log)
+        self.assertEqual(low, ([False, False], 0), log)
         self.assertIn("| thinking 278, answer 15 |", log)
         self.assertIn("(a new conversation, low priority: replaced by a request without tools)", log)
         self.assertIn(f"keeps normal priority: the request answered in 15 tok (< {self.mk.SUMMARY_ANSWER_MIN}", log)
-        # (the title's own conversation is still parked with low priority: the tags task replaces it)
+        self.assertIn(self.NOT_PARKED, log)
+
+    def test_a_one_shot_s_own_conversation_evicts_no_conversation_of_normal_priority(self) -> None:
+        # (1 MiB: room for the chat alone: the title task's own conversation, low priority, is not parked rather than
+        # evict it, and nothing is evicted)
+        log, n, low, cached, srv = self.run_owui(park_mib=1, older=False)
+        self.assertGreaterEqual(cached, n, log)
+        self.assertIn(self.NOT_PARKED, log)
+        self.assertNotIn("evicted the parked conversation", log)
+
+    def test_with_room_a_one_shot_s_own_conversation_is_parked_with_low_priority(self) -> None:
+        log, n, low, cached, srv = self.run_owui(park_mib=4, older=True)
+        self.assertGreaterEqual(cached, n, log)
         self.assertIn("(a new conversation, low priority: the conversation of a request without tools that replaced "
                       "one with tools)", log)
+        self.assertNotIn("not parked", log)
+        self.assertNotIn("evicted the parked conversation", log)
+
+    def test_a_summary_s_own_conversation_takes_the_room_of_low_ones_only(self) -> None:
+        # (2 MiB: Z, the summarised A and the summary's own conversation do not fit together: the summary's takes the
+        # place of A, low after a summary's answer, never Z's)
+        eng, srv, http_ = self.setup(park_mib=2)
+        summary = "Summarize this conversation for a continuation: " + "the user asked to read files. " * 20
+
+        def run():
+            self.chat(http_, [{"role": "user", "content": "Z: " + self.LONG}], tools=TOOLS)  # (a real conversation)
+            self.compaction(http_, eng, "A: ", [{"role": "user", "content": summary}])
+        log = self.quiet(run)
+        z = [o for o in eng.ops if o[0] == "park"][0]
+        self.assertNotIn(("drop", z[1]), eng.ops, log)
+        self.assertIn(", low priority) to make room", log)
+        self.assertEqual([low for _, _, low in self.entries(srv)], [False, True], log)
+
+    def test_a_conversation_summarised_beside_it_takes_no_room_from_a_normal_one(self) -> None:
+        # (a summary beside A, then the compacted conversation replaces A: A, low priority, is not parked when only Z's
+        # eviction could make room for it; 1 MiB)
+        eng, srv, http_ = self.setup(park_mib=1)
+        summary = [{"role": "user", "content": "Summarize: " + "the user asked to read files. " * 3}]  # (beside A)
+
+        def run():
+            self.chat(http_, [{"role": "user", "content": "Z: " + self.LONG}], tools=TOOLS)
+            self.chat(http_, [{"role": "user", "content": "A: " + self.LONG}], tools=TOOLS)  # (parks Z)
+            pieces = self.answers(eng, self.mk.SUMMARY_ANSWER_MIN)
+            self.chat(http_, summary)
+            eng.pieces = pieces
+            self.chat(http_, [{"role": "user", "content": "Summary: done. go on"}], tools=TOOLS)
+        log = self.quiet(run)
+        self.assertEqual(self.entries(srv), [(734, False, False)], log)  # (Z)
+        self.assertNotIn("evicted the parked conversation", log)
+        self.assertIn("side request done", log)
+        self.assertIn("have low priority (replaced right after a summary request beside it) and do not fit", log)
 
     def test_the_mark_holds_for_an_answer_of_a_summary_s_length(self) -> None:
         for n, low in ((self.mk.SUMMARY_ANSWER_MIN - 1, False), (self.mk.SUMMARY_ANSWER_MIN, True)):
