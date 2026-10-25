@@ -234,10 +234,15 @@ engine calls behind each feature under
 fp16, or q8_0 (per 32 values, fp16 scale) when fp16 does not fit the context or `--kv q8` asks for it. On top of the
 q8_0 cache, `MK_KV` can store each attention layer's K and V (and the MTP block's) at 4 to 8 bits, optionally
 Hadamard-rotated, and `MK_KV_WIN=W` keeps the most recent >= W positions of every low-bit side as q8_0 in a ring as
-well, so recent tokens are read at 8 bits. The decode attention expands low-bit tiles to int8 in shared memory and
-runs the same pipelined kernel as the q8_0 cache; the prefill attention reads them too. With exact reuse, each
-checkpoint also holds the window rings as of its position. The `MK_KV` syntax and the presets C, D, D' and E:
-[CONFIGURATION.md](CONFIGURATION.md#kv-cache-presets); their accuracy, VRAM and speed:
+well, so recent tokens are read at 8 bits. The window moves in steps of the attention's 640-position tile partition
+(`ATT_BUCKET`): a tile is read from the ring when it starts at or after `ws = (ceil(L / 640) - 1 - ceil(W / 640)) x
+640`, so every row of a launch and every draft depth sees the same split of tiles between the ring and the main buffer,
+and greedy output stays independent of the draft depth. Each ring holds `(ceil(W / 640) + 1) x 640 + 32` rows per KV
+head; the 32 take the draft rows a launch writes past its partition. Why the presets use W = 2048:
+[CONFIGURATION.md](CONFIGURATION.md#choosing-the-window-and-rotation). The decode attention expands low-bit tiles to
+int8 in shared memory and runs the same pipelined kernel as the q8_0 cache; the prefill attention reads them too. With
+exact reuse, each checkpoint also holds the window rings as of its position. The `MK_KV` syntax and the presets C, D,
+D' and E: [CONFIGURATION.md](CONFIGURATION.md#kv-cache-presets); their accuracy, VRAM and speed:
 [BENCHMARKS.md](BENCHMARKS.md#kv-cache-presets).
 
 Each layer's cache and the RoPE table hold 2 x `MK_MAXT` rows (16 in the served build, ~0.6 MB in all) past the

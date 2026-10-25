@@ -176,6 +176,28 @@ Per-layer scans (2026-10-12) showed K about 2.3 times as sensitive as V, and no 
 stayed within the KL noise of the q8_0 cache, which is why the presets are opt-in. A plain 4-bit cache
 (`MK_KV='*=4'`, no window) scores 0.00547 on the short prompts (2026-10-15, 7d67c5d).
 
+### Choosing the window and rotation
+
+Every preset uses `MK_KV_WIN=2048` because the accuracy a low-bit cache loses comes almost entirely from the most
+recent ~0.5-2k positions, where attention puts most of its weight. Keeping those at 8 bits removes it. Of the windows
+tried (512, 1,024 and 2,048 positions), 2,048 was the smallest at which K at 6 bits and V at 5 bits measured at the
+noise floor of the 32k test set; at 1,024 they were still near-lossless, but measurably worse. The numbers:
+[BENCHMARKS.md](BENCHMARKS.md#the-window-size-and-rotation).
+
+- **The ring is small and does not grow with the context.** With preset D (K and V low-bit in the 16 attention layers
+  and the MTP layer: 34 rings) it takes 46 / 69 / 114 / 182 MiB at `MK_KV_WIN` 512 / 1024 / 2048 / 4096, at 32k context
+  or at 262k; preset C (V only) half of that. The savings in the tables above are net of it. A smaller window saves
+  tens of MiB at a measurable cost in accuracy; a larger one costs memory for no difference we could measure.
+- **The window is rounded up to steps of 640 positions**, the attention kernel's tile partition (which also keeps
+  greedy output independent of the draft depth): `MK_KV_WIN=2048` keeps the last 2,561 to 3,200 positions at 8 bits,
+  and any value from 1,921 to 2,560 gives the same ring. The startup line `[mk] KV recent window: ...` prints the range
+  and the ring's size.
+- **Rotation (`r`)** spreads each block's outliers over the block before rounding, so the one scale per 32 values fits
+  the rest of the block better. Without a window it halved 6-bit K's extra KL, and it helped V on short prompts but not
+  at 32k. Under the 2,048 window it made no measurable difference, so preset D stores K and V unrotated (no rotation of
+  the queries, no rotating back of the attention output). It earns its place when going lower: preset E stores V at 4
+  bits, rotated.
+
 ## Launchers: scripts/serve.sh and scripts/serve.bat
 
 `scripts/serve.sh [port] [ctx]` (Linux / WSL2) and `scripts\serve.bat [port] [ctx]` (native Windows) check that the

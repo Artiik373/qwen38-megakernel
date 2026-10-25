@@ -269,6 +269,40 @@ MTP layer at 8 bits, 70 MB more) decoded 1.2% / 2.9% faster than D at 101.6k / 3
 in the emulator (3-bit, codebooks, per-row scales, random signs, angle coding) scored worse than the plain
 per-32-value grid.
 
+### The window size and rotation
+
+How the presets' 2,048-position window and their (mostly) unrotated rows were chosen. All rows below come from the
+rounding emulator (2026-10-12 / 13), which stores the cache in each format and is scored like the real kernels; it
+keeps exactly W recent positions at 8 bits, where the kernels round the window up to 640-position steps
+([CONFIGURATION.md](CONFIGURATION.md#choosing-the-window-and-rotation)). KL is relative to q8_0's on the same build
+(0.00113 on the short prompts, 0.00219 at 32k); the fp16 cache reads +0% / +3%, and the 32k set's noise is about 4%
+either way.
+
+The window. The short prompts are ~1k-token sequences, so any window of 1k or more holds all of them, and only the 32k
+set can tell 1k from 2k:
+
+| low-bit sides | short prompts: no window / 512 | 32k: no window / 512 / 1,024 / 2,048 |
+|---|---|---|
+| V at 5 bits, rotated | +27% / +6% | +16% / +5.5% / +4.6% / 0% |
+| K at 6 bits, rotated | +12% / +2.7% | +4% / +7% / - / +3% |
+| K at 6 and V at 5 bits, rotated | +42% / - | - / - / +6% / +2.7% |
+| K at 6 and V at 5 bits (preset D) | - / - | - / - / - / +1.4% |
+
+Attention sinks instead of a window (the first 4 positions kept at 8 bits) did nothing: K at 6 bits, rotated, read +11%
+on the short prompts against +12% without. Preset D as the real kernels measure it is in the tables above.
+
+Rotation, without a window:
+
+| side | short prompts: plain / rotated | 32k: plain / rotated |
+|---|---|---|
+| K at 7 bits | +2.7% / +2.7% | - / +4% |
+| K at 6 bits | +23% / +12% | +9% / +4% |
+| V at 6 bits | +12% / +3.5% | - / +8% |
+| V at 5 bits | +40% / +27% | +10% / +16% |
+
+Under the 2,048 window, K at 6 and V at 5 bits read +1.4% plain and +2.7% rotated at 32k, the same within the set's
+noise, so preset D drops the rotation (no rotation of the queries, no rotating back of the attention output).
+
 ## The conversation cache
 
 How it works: [SERVER.md](SERVER.md). Costs (WSL2, q8_0 unless noted, host memory already allocated, 2026-10-19):
