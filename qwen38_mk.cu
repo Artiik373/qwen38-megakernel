@@ -8226,6 +8226,7 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pk_attn8<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         CK(cudaFuncSetAttribute(pk_attn8<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         CK(cudaFuncSetAttribute(pk_attn8<false, true, false, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false, true, false, 5, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         int dev = 0, nsm = 0, occ = 0;
         CK(cudaGetDevice(&dev));
         CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
@@ -8255,6 +8256,7 @@ struct MKEngine::Impl {
             CK(cudaFuncSetAttribute(pk_attn8<false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
             CK(cudaFuncSetAttribute(pk_attn8<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
             CK(cudaFuncSetAttribute(pk_attn8<false, true, true, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+            CK(cudaFuncSetAttribute(pk_attn8<false, true, true, 5, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         }
         if (k8 & 1) { // stock2 K8a: pk_ab's stream (non-blocking: ordered only by pf_e0 / pf_e1)
             CK(cudaStreamCreateWithFlags(&pf_s2, cudaStreamNonBlocking));
@@ -8271,8 +8273,10 @@ struct MKEngine::Impl {
     // causal attention of the chunk's T queries (positions n ..) over the cache of attention slot `slot` -> y2
     int a2_slots = 0;
     size_t y1_floats = 0; // hp.y1 in floats (pf_init: cap x FF, or cap x VD in MK_EXACT mode with every gate / up fused)
-    // the slot's main buffer holds K q6 / V q5 (the D / D-prime presets): pk_attn8's compile-time-format instantiation
+    // the slot's main buffer holds K q6 / V q5 (the D / D-prime presets) or K q5 / V q5 (preset F, K rotated or not):
+    // pk_attn8's compile-time-format instantiations
     bool kv_k6v5(int slot) const { return hb.kvb[0][slot] == 6 && hb.kvb[1][slot] == 5; }
+    bool kv_k5v5(int slot) const { return hb.kvb[0][slot] == 5 && hb.kvb[1][slot] == 5; }
     bool attn_old = false, attn_split = true, attn_pv16 = true;
     int attn_s8 = 1;
     // MK_EXACT: key tiles per absolute attention segment (pk_attn8 EXA). 4096 positions: at 98k (cap 1024) fresh prefill
@@ -8372,6 +8376,8 @@ struct MKEngine::Impl {
             const int grid = p.nfull + (N - p.nfull) * p.S;
             if (kv_k6v5(slot))
                 pk_attn8<false, true, true, 6, 5><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
+            else if (kv_k5v5(slot))
+                pk_attn8<false, true, true, 5, 5><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
             else if (hb.kvb[0][slot] != 8)
                 pk_attn8<false, true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
             else pk_attn8<false, false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
@@ -8394,6 +8400,7 @@ struct MKEngine::Impl {
             const bool kl = hb.kvb[0][slot] != 8; // low-bit K: the expanding instantiation (q8 K: the plain kernel)
             if (s8 && attn_s8 == 1) {
                 if (kv_k6v5(slot)) pk_attn8<false, true, false, 6, 5><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
+                else if (kv_k5v5(slot)) pk_attn8<false, true, false, 5, 5><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
                 else if (kl) pk_attn8<false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
                 else pk_attn8<false, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
             } else if (s8 && attn_s8 == 2) {
