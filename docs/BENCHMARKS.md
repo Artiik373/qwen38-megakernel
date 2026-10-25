@@ -13,7 +13,7 @@ How to read them:
   short-prompt rows are means of the per-request rates, as the client reports them; token-weighted rates (total tokens
   over total time) are given next to them.
 - **Comparisons with other engines** are limited to what we ran ourselves on this machine: llama.cpp b11548 (tuned) and
-  upstream open-jet 2993f47.
+  upstream open-jet (2993f47, and its master 72ba4a7 on 2026-10-25).
 
 Contents: [the current release](#the-current-release) - [full run 2026-10-20](#full-run-2026-10-20) -
 [exactness](#exactness) - [KV cache presets](#kv-cache-presets) - [the conversation cache](#the-conversation-cache) -
@@ -373,17 +373,26 @@ The two files disagreed on 15 of the 282 answers and had the same perplexity. Ac
 98.887% / 0.00127 (a wide-verify build with up to 4 drafts, 2026-10-13; llama.cpp batched on that file: 98.489% /
 0.00184).
 
-Upstream open-jet's own benchmark scripts (`bench/code_bench.py`, `bench/think_bench.py`, best of 2, greedy code runs,
-the thinking runs at temperature 1.0 with seeds 1000 / 1001), on Q4_K_M: this engine at b3be928 with 7 drafts and the
-q8_0 cache (2026-10-14) against upstream's engine at open-jet 2993f47 with its 4 drafts on the same card (2026-10-13):
+Upstream open-jet's own benchmark scripts at its current master 72ba4a7 (`bench/code_bench.py`, `bench/think_bench.py`:
+their megakernel halves, best of 2, greedy code runs, the thinking runs at temperature 1.0 with seeds 1000 / 1001, the
+inputs of the 2026-10-13 run), on Q4_K_M, one session on 2026-10-25 (WSL2, fans at 100%): upstream's engine at 72ba4a7
+(`make qwen38_mk` with its default flags, 4 drafts, the CLI's default KV cache) between two passes of this engine
+(7322fbd, the release's GPU code, q8_0 cache). The table gives the lower of this engine's two passes, which agreed
+within 0.7%:
 
-| test | open-jet 2993f47 | this engine |
-|---|---|---|
-| writing code (no context) | 133.8 tok/s | 173.3 tok/s |
-| 30k tokens of code in context | 87.4 | 117.5 |
-| short prompts (mean of 4) | 118.0 | 149.2 |
-| reasoning mode (4 prompts x 2 seeds, 1,024 tokens) | 89.1 | 125.4 |
-| prefill, 29.6k-token prompt | 1,527 tok/s | 1,811 tok/s |
+| test | open-jet 72ba4a7, 4 drafts | this engine, 4 drafts | this engine, 7 drafts |
+|---|---|---|---|
+| writing code (no context) | 132.6 tok/s | 163.8 tok/s | 184.9 tok/s |
+| 30k tokens of code in context | 86.9 | 118.1 | 126.9 |
+| short prompts (mean of 4) | 117.1 | 140.2 | 157.2 |
+| reasoning mode (4 prompts x 2 seeds, 1,024 tokens) | 102.5 | 119.4 | 130.1 |
+| prefill, 29.6k-token prompt | 1,528 tok/s | 1,878 tok/s | 1,877 tok/s |
+
+Draft acceptance in reasoning mode: open-jet 55.6%, this engine 61.1% with 4 drafts and 51.8% with 7. The earlier
+comparison, against open-jet 2993f47 (2026-10-13) with this engine at b3be928 and 7 drafts (2026-10-14): 133.8 against
+173.3 tok/s writing code, 87.4 / 117.5 at 30k, 118.0 / 149.2 on short prompts, 89.1 / 125.4 in reasoning mode and
+1,527 / 1,811 tok/s prefill. Upstream's numbers in the two sessions are within 1% of each other except in reasoning
+mode, where its sampled drafts (open-jet #21) raised its acceptance.
 
 ## Images and video
 
