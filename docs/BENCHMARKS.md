@@ -105,10 +105,11 @@ The same session, a server at 262,144 tokens with preset D (20:21-21:05):
 At the full 262,144 natively on Windows, with the desktop on the same card, the default settings (1,024-token prefill
 chunk, the draft head's Q4_K copy) left the engine just past what the Windows driver keeps resident, and it paged: a
 442-token reply decoded at 16 tok/s against 82.5 under WSL2 (the same tokens and drafts). With a 512-token prefill
-chunk and the draft head on lm_head (0.17 GB less, the same output), which `scripts\serve.bat` sets above 240k, the
-engine's memory stayed flat and resident: that reply at 81.6 tok/s, the 260,896-token prompt in 366 s (712 tok/s),
-decode at that depth 64.3 tok/s, a follow-up turn in 1.6 s, the needle at 190k found, a 137k-token LongBench v2 item
-read at 1,062 tok/s, and a peak of 23,771 of 24,576 MiB (2026-10-24, the 5f535a7 server on the release's engine).
+chunk and the draft head on lm_head (0.17 GB less, the same output), which `scripts\serve.bat` set above 240k until it
+moved to [preset F](#preset-f) there on 2026-10-25, the engine's memory stayed flat and resident: that reply at 81.6
+tok/s, the 260,896-token prompt in 366 s (712 tok/s), decode at that depth 64.3 tok/s, a follow-up turn in 1.6 s, the
+needle at 190k found, a 137k-token LongBench v2 item read at 1,062 tok/s, and a peak of 23,771 of 24,576 MiB
+(2026-10-24, the 5f535a7 server on the release's engine).
 Natively on Windows, with the desktop on the same card, a 240k-context server with preset D found a needle at 227,170
 tokens (prompt read in 275.7 s) with a peak of 24,116 of 24,576 MiB (2026-10-18, 282cd55).
 
@@ -234,6 +235,7 @@ than q8_0, marks the floor of the measurement:
 | q8_0 | 98.737% / 0.00119 (2026-10-17, 7322fbd 10-20) | 99.121% / 0.00219 (10-17) | 99.267% / 0.00163 (10-15) |
 | D: `K*=6,V*=5` + window | = q8_0 (2026-10-20, 7322fbd) | 98.950% / 0.00236 (10-20, 7322fbd) | 99.243% / 0.00160 (10-13) |
 | D': D + 8-bit MTP layer | = q8_0 (10-15, 7d67c5d) | 0.00236 (10-15) | 0.00161 (10-15) |
+| F: `K*=5r,V*=5` + window | 98.714% / 0.00113 (2026-10-25, 7322fbd) | 98.974% / 0.00242 (10-25, 7322fbd) | 99.341% / 0.00163 (10-25, 7322fbd) |
 | C: `V*=5` + window | = q8_0 (10-13) | 99.072% / 0.00228 (10-13) | 99.316% / 0.00159 (10-13) |
 | 4-bit everywhere: `*=4`, no window | 0.00547 (10-15) | | |
 
@@ -268,6 +270,38 @@ kernels cut the prefill time of D' by 2.5% / 1.3% at 101.6k / 38k; the 2026-10-2
 MTP layer at 8 bits, 70 MB more) decoded 1.2% / 2.9% faster than D at 101.6k / 38k on 2026-10-13. Other formats tried
 in the emulator (3-bit, codebooks, per-row scales, random signs, angle coding) scored worse than the plain
 per-32-value grid.
+
+### Preset F
+
+K at 5 bits, stored Hadamard-rotated, and V at 5 bits, with the 2,048 window (`MK_KV='K*=5r,V*=5' MK_KV_WIN=2048`). In
+the emulator, rotated 5-bit K under the window read at the fp16 cache's floor (+4% at 32k, -2% at 64k); the real
+kernels, 2026-10-25 (7322fbd, and fad007f for the prompt times):
+
+| | preset D | preset F |
+|---|---|---|
+| KV cache at 120k / 262,144 context | 3.25 / 6.97 GB | 2.99 / 6.39 GB |
+| KL, short prompts / 32k / 64k (q8_0: 0.00119 / 0.00219 / 0.00163) | 0.00119 / 0.00236 / 0.00161 | 0.00113 / 0.00242 / 0.00163 |
+| reading a 38k / 101.6k-token prompt (one session, exact reuse on) | 22.14 / 77.40 s | 22.11 / 76.97 s |
+| WSL2 server at 262,144: whole card after the prompt | 24,080 MiB (10-20) | 23,650 MiB |
+| the 260,896-token prompt; decode at that depth | 326 s; 66 tok/s (10-20) | 340 s; 66.6 tok/s |
+| needles (190k and the longest length) / LongBench v2 at that length | 4 / 4, 4 / 6 | 4 / 4, 3 / 6 |
+
+- **Short prompts** fit in the window, but F's rotated K changes the ring's rows too, so its short-set KL is not
+  q8_0's (0.00113, within the 0.00006 the set moves between builds).
+- **Prompt times:** F's own compile-time 5-bit prefill kernels (fad007f) against the generic low-bit kernel F ran on
+  before: 79.70 to 76.97 s at 101.6k (-3.4%), 22.46 to 22.11 s at 38k (-1.5%), with the same KL reports to the byte
+  (default and exact-reuse paths). The 262,144 rows ran in different sessions, F on the generic kernel.
+- **LongBench:** the item F missed was still reasoning toward the right choice when it reached the 1,024-token answer
+  cap; D answered it in 658 tokens.
+- **A larger window did not help:** at 32k, F read 0.00242 / 0.00239 / 0.00245 / 0.00240 with `MK_KV_WIN` 2048 / 2688 /
+  3328 / 4608 (rings of 114 / 137 / 159 / 204 MiB), all within the set's noise. Its excess over q8_0 sits in the older
+  5-bit rows.
+- **Natively on Windows** at 262,144, with the desktop on the same card (the deployed engine, the 1,024-token chunk and
+  the draft head's Q4_K copy): the server's memory stayed flat at 22,956 MiB with a peak of 23,622 of 24,576 MiB, the
+  260,896-token prompt took 340 s (768 tok/s), decode at that depth ran at 66.5 tok/s, a follow-up turn took 1.3 s and
+  the needle at 190k was found. Preset D there needed a 512-token chunk and the draft head on lm_head to stay resident,
+  and read that prompt in 366 s with decode at 64.3 tok/s (2026-10-24), which is why `scripts\serve.bat` uses F above
+  240k.
 
 ### The window size and rotation
 

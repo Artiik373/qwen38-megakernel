@@ -55,8 +55,8 @@ on when the vision projector is found. These are the settings worth knowing:
 | What | Launcher variable (`serve.sh` / `serve.bat`) | Server option | Default | When to change it |
 |---|---|---|---|---|
 | Model file | `MK_MODEL` | `-m` | `$HOME/models/Qwen3.8-27B-UD-Q4_K_XL.gguf` (Windows: `%USERPROFILE%\models\...`) | another GGUF or another folder |
-| Port, context | 1st and 2nd argument | `--port`, `-c` | 8080, 120000 | context up to 262,144 tokens with preset D |
-| KV cache preset | `MK_KV`, `MK_KV_WIN` | (engine) | q8_0 | [preset D](#kv-cache-presets) frees ~1.1 GB at 120k and fits the full 262,144-token context; near-lossless, not bit-identical |
+| Port, context | 1st and 2nd argument | `--port`, `-c` | 8080, 120000 | context up to 262,144 tokens with preset D or F (`serve.bat` picks F above 240k) |
+| KV cache preset | `MK_KV`, `MK_KV_WIN` | (engine) | q8_0 | [preset D](#kv-cache-presets) frees ~1.1 GB at 120k and fits the full 262,144-token context; near-lossless, not bit-identical. Above 240k `serve.bat` uses preset F unless `MK_KV` is set |
 | Drafts per cycle | `MK_DRAFT` | `-d` | 7 | 4 for a lean build; 0 turns speculation off |
 | Listen address | `MK_HOST` | `--host` | 127.0.0.1 | `0.0.0.0` for other machines on the LAN (then also `MK_ALLOW_HOSTS`) |
 | Host names, web pages | `MK_ALLOW_HOSTS`, `MK_CORS_ORIGINS` | `--allow-host`, `--cors-origin` | none | a LAN name or a reverse proxy; a browser UI on another origin |
@@ -66,7 +66,7 @@ on when the vision projector is found. These are the settings worth knowing:
 | Parked conversations | `MK_PARK_MIB` | `--park-mib` | 8192 MiB of host memory | less RAM to spare, or more conversations to keep |
 | Side requests | `MK_SIDE_MAX` | `--side-max` | 8192 tokens | 0 turns them off (benchmarks of from-scratch prefill) |
 | Smallest parked conversation | (not passed) | `--park-min` | 1024 tokens | 4096 halved the real evictions in a replay of recorded client sessions (2026-10-21) |
-| Prefill chunk | `MK_PF_CAP` | (engine) | 2048; the launchers set 1024 above 96k context, `serve.bat` 512 above 240k | 1024 frees ~0.34 GB of VRAM (2026-10-11) |
+| Prefill chunk | `MK_PF_CAP` | (engine) | 2048; the launchers set 1024 above 96k context, `serve.bat` 512 above 240k with your own `MK_KV` | 1024 frees ~0.34 GB of VRAM (2026-10-11) |
 | Thinking off by default | `MK_CHAT_TEMPLATE_KWARGS` | `--chat-template-kwargs` | thinking on | `{"enable_thinking": false}` |
 | Python | `MK_PYTHON` | - | `python3` (Windows: `python`) | a virtual environment with jinja2 |
 | Lean build | `make MKFLAGS=` / `build.ps1 -MkFlags ""` | - | the served build | less RAM to compile (~19 GB instead of up to ~34 GB); at most 4 drafts |
@@ -97,9 +97,7 @@ set MK_MODEL=D:\models\Qwen3.8-27B-UD-Q4_K_XL.gguf
 set MK_PYTHON=%CD%\.venv\Scripts\python.exe
 scripts\serve.bat
 
-REM preset D, the model's full context
-set MK_KV=K*=6,V*=5
-set MK_KV_WIN=2048
+REM the model's full context: above 240k serve.bat uses preset F unless MK_KV is set
 scripts\serve.bat 8080 262144
 
 REM thinking off unless a request asks (the quotes around the whole assignment keep the inner ones)
@@ -119,7 +117,7 @@ The KV cache is q8_0 (8 bits per value, one fp16 scale per 32) unless asked othe
 K and V at fewer bits, and `MK_KV_WIN` keeps the most recent positions at 8 bits in a ring on top. The presets are
 opt-in and near-lossless: measured by KL divergence against llama.cpp's reference distributions, not bit-identical to
 the q8_0 cache. With C, D and D', a prompt that fits in the window reads only q8_0 rows, and the short-prompt KL report
-is byte-identical to q8_0's; E stores its rows rotated, which changes it slightly.
+is byte-identical to q8_0's; E and F store rotated rows (F only K), which changes it slightly.
 
 | Preset | Settings | K / V bits |
 |---|---|---|
@@ -127,6 +125,7 @@ is byte-identical to q8_0's; E stores its rows rotated, which changes it slightl
 | **D** | `MK_KV='K*=6,V*=5' MK_KV_WIN=2048` | 6 / 5 |
 | D' | `MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048` | 6 / 5, the MTP layer at 8 / 8 |
 | E | `MK_KV='K*=6r,V*=4r' MK_KV_WIN=2048` | 6 / 4, both stored Hadamard-rotated |
+| F | `MK_KV='K*=5r,V*=5' MK_KV_WIN=2048` | 5 / 5, K stored Hadamard-rotated; `serve.bat` above 240k |
 
 The three presets side by side, measured in one session on 2026-10-13 (1ed60cd, 4 drafts, A-B-A against q8_0; KL
 against llama.cpp's reference, relative to q8_0's own):
@@ -156,6 +155,14 @@ the model's full 262,144-token context fits on 24 GB: a 260,896-token prompt was
 ran at 66 tok/s, a follow-up turn took 1.28 s, the card held 23.5 GB, and 4 of 4 needle-in-a-haystack and 4 of 6
 LongBench v2 questions at that length were right (same run). More measurements, with the fp16 cache's own KL floor:
 [BENCHMARKS.md](BENCHMARKS.md#kv-cache-presets).
+
+**Preset F** stores K at 5 bits, Hadamard-rotated, and V at 5 bits, with the same window: 0.26 GB less KV cache than D
+at 120k context (2.99 against 3.25 GB) and 0.58 GB less at 262,144 (6.39 against 6.97 GB). Its KL equals q8_0's at 64k
+(0.00163) and is 10% above it at 32k (0.00242; D 0.00236; the set's noise is about 0.00008 either way), and a larger
+window did not change the 32k number. It reads prompts as fast as D (101.6k tokens in 76.97 s against 77.40 s,
+2026-10-25, fad007f, one session). `scripts\serve.bat` uses it above 240k unless `MK_KV` is set: natively on Windows,
+with the desktop on the same card, preset D at the full context passes what the driver keeps resident, and F stays
+inside it with the default prefill chunk and draft head. Numbers: [BENCHMARKS.md](BENCHMARKS.md#preset-f).
 
 ### MK_KV syntax
 
@@ -187,7 +194,8 @@ noise floor of the 32k test set; at 1,024 they were still near-lossless, but mea
 - **The ring is small and does not grow with the context.** With preset D (K and V low-bit in the 16 attention layers
   and the MTP layer: 34 rings) it takes 46 / 69 / 114 / 182 MiB at `MK_KV_WIN` 512 / 1024 / 2048 / 4096, at 32k context
   or at 262k; preset C (V only) half of that. The savings in the tables above are net of it. A smaller window saves
-  tens of MiB at a measurable cost in accuracy; a larger one costs memory for no difference we could measure.
+  tens of MiB at a measurable cost in accuracy. Larger windows were not measured: at 2,048 preset D already read at
+  the noise floor of the 32k set in the emulator.
 - **The window is rounded up to steps of 640 positions**, the attention kernel's tile partition (which also keeps
   greedy output independent of the draft depth): `MK_KV_WIN=2048` keeps the last 2,561 to 3,200 positions at 8 bits,
   and any value from 1,921 to 2,560 gives the same ring. The startup line `[mk] KV recent window: ...` prints the range
@@ -227,8 +235,9 @@ These variables are read by the launchers themselves and turned into options:
 | `MK_VIDEO_MAX_TOKENS` | the image limit | `--video-max-tokens`, with images on | 13377de, 2026-10-18 |
 | `MK_CHAT_TEMPLATE_FILE` | the GGUF's template | `--chat-template-file` | 282cd55, 2026-10-18 |
 | `MK_PYTHON` | `python3`; Windows `python` | the Python that runs the server (needs jinja2) | deb1b62, 2026-10-16 |
-| `MK_PF_CAP` | unset: the launchers set `1024` when the context is above 96,000; `serve.bat` sets `512` above 240,000 | read by the engine ([Prefill](#prefill)) | f598319, 2026-10-11 |
-| `MK_DRAFT_Q4` | unset (the engine's default, on): `serve.bat` sets `0` above 240,000 | read by the engine ([Speculation](#speculation-drafts)) | 2026-10-24 |
+| `MK_KV`, `MK_KV_WIN` | unset (q8_0): `serve.bat` sets preset F (`K*=5r,V*=5`, window `2048`) above 240,000 | read by the engine ([KV cache presets](#kv-cache-presets)) | 2026-10-25 |
+| `MK_PF_CAP` | unset: the launchers set `1024` when the context is above 96,000; `serve.bat` sets `512` above 240,000 when `MK_KV` was set by you | read by the engine ([Prefill](#prefill)) | f598319, 2026-10-11 |
+| `MK_DRAFT_Q4` | unset (the engine's default, on): `serve.bat` sets `0` above 240,000 when `MK_KV` was set by you | read by the engine ([Speculation](#speculation-drafts)) | 2026-10-24 |
 
 Everything else is read from the environment by the server or the engine, so it works the same with or without a
 launcher: `MK_KV`, `MK_KV_WIN`, `MK_KEEP_WARM_S`, `MK_DRAFT_Q4`, `MK_MTP`, `MK_NO_MTP`, `MK_SIDE_MAX`, `MK_PARK_MIB`,
@@ -373,7 +382,7 @@ The policy before the gates was `depth=0,drop=0,stop=0,chain=0,h1=0`. On the lea
 
 | Variable | Default | What it does | Output | Status | Since |
 |---|---|---|---|---|---|
-| `MK_PF_CAP` | `2048`; the launchers use `1024` above 96k context, `serve.bat` `512` above 240k | tokens per prefill chunk, 128-2048 in steps of 128. The scratch is ~0.33 MB per token: 1024 frees ~0.34 GB, and prefill was 4.5% slower on UD-Q4_K_XL (2026-10-11) | same with exact reuse; not checked without | served | f598319, 2026-10-11 |
+| `MK_PF_CAP` | `2048`; the launchers use `1024` above 96k context, `serve.bat` `512` above 240k with your own `MK_KV` | tokens per prefill chunk, 128-2048 in steps of 128. The scratch is ~0.33 MB per token: 1024 frees ~0.34 GB, and prefill was 4.5% slower on UD-Q4_K_XL (2026-10-11) | same with exact reuse; not checked without | served | f598319, 2026-10-11 |
 | `MK_ATTN_S8` | `1` | q8_0 cache, prefill attention: `1` int8 Q K^T with one Q scale per 32 dims (+16.7% prefill at 101.6k, 2026-10-12); `2` one Q scale per row (+5% in the kernel, 1.6 times the Q rounding noise); `0` fp16 tensor cores | changes | served (`1`) | aea6c6f, 2026-10-12 |
 | `MK_ATTN_SPLIT` | `1` | `0`: no tail split of long rows in the prefill attention (exact mode never splits) | changes | earlier path | fb218e3, 2026-10-11 |
 | `MK_ATTN_PV16` | `1` | `0`: the attention's P V accumulated in fp32 instead of fp16 | changes | earlier path | fb218e3, 2026-10-11 |

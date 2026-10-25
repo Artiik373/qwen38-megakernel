@@ -16,11 +16,12 @@ REM   MK_DRAFT            MTP drafts per cycle (default 7; a build.ps1 -MkFlags 
 REM   MK_EXACT_REUSE=0    turn exact reuse off (see scripts/serve.sh)
 REM   MK_SIDE_MAX         side requests up to this many prompt tokens (default 8192; 0 = off; see scripts/serve.sh)
 REM   MK_PARK_MIB         host memory for parked conversations (default 8192 MiB; 0 = off; see scripts/serve.sh)
-REM   MK_PF_CAP           prefill chunk tokens (default 2048; 1024 above 96k context; 512 above 240k)
-REM   MK_KV, MK_KV_WIN    low-bit KV cache, preset D': set MK_KV=K*=6,V*=5,*16=8 and MK_KV_WIN=2048
+REM   MK_PF_CAP           prefill chunk tokens (default 2048; 1024 above 96k context; 512 above 240k with your own MK_KV)
+REM   MK_KV, MK_KV_WIN    low-bit KV cache, preset D': set MK_KV=K*=6,V*=5,*16=8 and MK_KV_WIN=2048; above 240k
+REM                       context, unless set: preset F (MK_KV=K*=5r,V*=5, MK_KV_WIN=2048)
 REM   MK_KEEP_WARM_S      seconds the engine keeps the GPU's clocks up after each request (default 120, 0 = off)
 REM   MK_DRAFT_Q4=0       the draft head reads lm_head instead of its Q4_K copy (saves 90 MiB; the copy is on
-REM                       by default, off above 240k context)
+REM                       by default, off above 240k context with your own MK_KV)
 REM   MK_MTP              the MTP draft layer from a separate GGUF of the same model (e.g. an mtp-*.gguf)
 REM   MK_NO_MTP=1         no MTP layer: plain decoding, depth 0 (also automatic for a model file without one)
 REM   MK_CHAT_TEMPLATE_FILE  a Jinja chat template file used instead of the GGUF's (--chat-template-file, as llama-server)
@@ -49,10 +50,19 @@ if not exist "%MK_MODEL%" (
     echo missing model %MK_MODEL% ^(set MK_MODEL^)
     exit /b 1
 )
-REM above 240k the KV cache plus Windows' own share of the card (the desktop) passes what the driver keeps resident and
-REM the engine pages (decode ~5x slower); these two free ~0.17 GB and do not change the output
-if %CTX% GTR 240000 if not defined MK_PF_CAP set "MK_PF_CAP=512"
-if %CTX% GTR 240000 if not defined MK_DRAFT_Q4 set "MK_DRAFT_Q4=0"
+REM above 240k, preset D's KV cache plus Windows' own share of the card (the desktop) passes what the driver keeps
+REM resident and the engine pages (decode ~5x slower). Unless MK_KV is set: preset F (0.58 GB less at 262k). With your
+REM own MK_KV: a 512-token chunk and the draft head on lm_head (~0.17 GB less, the same output)
+set "KVF="
+set "KVS="
+if %CTX% GTR 240000 if not defined MK_KV (
+    set "MK_KV=K*=5r,V*=5"
+    if not defined MK_KV_WIN set "MK_KV_WIN=2048"
+    set "KVF=1"
+    set "KVS= (preset F)"
+)
+if %CTX% GTR 240000 if not defined KVF if not defined MK_PF_CAP set "MK_PF_CAP=512"
+if %CTX% GTR 240000 if not defined KVF if not defined MK_DRAFT_Q4 set "MK_DRAFT_Q4=0"
 if %CTX% GTR 96000 if not defined MK_PF_CAP set "MK_PF_CAP=1024"
 set "XR=--exact-reuse"
 set "XS=on"
@@ -77,5 +87,5 @@ if defined MK_CHAT_TEMPLATE_FILE set CT=--chat-template-file "%MK_CHAT_TEMPLATE_
 if defined MK_CHAT_TEMPLATE_FILE set "CTS=, chat template %MK_CHAT_TEMPLATE_FILE%"
 set "DQ="
 if "%MK_DRAFT_Q4%"=="0" set "DQ=, draft head on lm_head"
-echo megakernel: %MK_MODEL%, ctx %CTX%, KV q8_0 %MK_KV%, %MK_DRAFT% MTP drafts%DQ%, prefill chunk %PFC%, exact reuse %XS%, images %VS%%CTS%, http://%MK_HOST%:%PORT%
+echo megakernel: %MK_MODEL%, ctx %CTX%, KV q8_0 %MK_KV%%KVS%, %MK_DRAFT% MTP drafts%DQ%, prefill chunk %PFC%, exact reuse %XS%, images %VS%%CTS%, http://%MK_HOST%:%PORT%
 "%MK_PYTHON%" "%HERE%\server\mk_server.py" -m "%MK_MODEL%" --host %MK_HOST% --port %PORT% -c %CTX% --kv q8 -d %MK_DRAFT% %XR% %VA% %CT%

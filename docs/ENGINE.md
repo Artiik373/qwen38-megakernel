@@ -242,7 +242,7 @@ head; the 32 take the draft rows a launch writes past its partition. Why the pre
 [CONFIGURATION.md](CONFIGURATION.md#choosing-the-window-and-rotation). The decode attention expands low-bit tiles to
 int8 in shared memory and runs the same pipelined kernel as the q8_0 cache; the prefill attention reads them too. With
 exact reuse, each checkpoint also holds the window rings as of its position. The `MK_KV` syntax and the presets C, D,
-D' and E: [CONFIGURATION.md](CONFIGURATION.md#kv-cache-presets); their accuracy, VRAM and speed:
+D', E and F: [CONFIGURATION.md](CONFIGURATION.md#kv-cache-presets); their accuracy, VRAM and speed:
 [BENCHMARKS.md](BENCHMARKS.md#kv-cache-presets).
 
 Each layer's cache and the RoPE table hold 2 x `MK_MAXT` rows (16 in the served build, ~0.6 MB in all) past the
