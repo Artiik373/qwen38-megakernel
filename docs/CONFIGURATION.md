@@ -128,9 +128,12 @@ is byte-identical to q8_0's; E and F store rotated rows (F only K), which change
 | F | `MK_KV='K*=5r,V*=5' MK_KV_WIN=2048` | 5 / 5, K stored Hadamard-rotated; `serve.bat` above 240k |
 
 The three presets side by side, measured in one session on 2026-10-13 (1ed60cd, 4 drafts, A-B-A against q8_0; KL
-against llama.cpp's reference, relative to q8_0's own):
+against llama.cpp's reference, relative to q8_0's own). 120k is the benchmark anchor (the launchers' default context),
+so memory is compared at that size: the third column is how much context fits in the VRAM q8_0 uses at 120k, not how
+far a preset was tested. D and F run the model's full 262,144 tokens (below, and
+[BENCHMARKS.md](BENCHMARKS.md#preset-d-at-the-full-context)).
 
-| Preset | Frees at 120k | Context in q8_0's 120k VRAM | KL: short / 32k / 64k | Decode, ms per cycle at 38k / 101.6k | Prefill speed at 38k / 101.6k |
+| Preset | Frees at 120k | Context that fits in q8_0's 120k VRAM | KL: short / 32k / 64k | Decode, ms per cycle at 38k / 101.6k | Prefill speed at 38k / 101.6k |
 |---|---|---|---|---|---|
 | C | 691 MiB | 144k | same / +4% / +2% | +1.2% / +3.7% | -1.3% / -2.7% |
 | D | 1,132 MiB | 165k | same / +1% / +5% | +2.9% / +5.0% | -3.3% / -6.7% |
