@@ -285,6 +285,7 @@ kernels, 2026-10-25 (7322fbd, and fad007f for the prompt times):
 | WSL2 server at 262,144: whole card after the prompt | 24,080 MiB (10-20) | 23,650 MiB |
 | the 260,896-token prompt; decode at that depth | 326 s; 66 tok/s (10-20) | 340 s; 66.6 tok/s |
 | needles (190k and the longest length) / LongBench v2 at that length | 4 / 4, 4 / 6 | 4 / 4, 3 / 6 |
+| the 282 questions (120k server, the 2026-10-20 client and settings) | 230 right (10-20) | 229 right |
 
 - **Short prompts** fit in the window, but F's rotated K changes the ring's rows too, so its short-set KL is not
   q8_0's (0.00113, within the 0.00006 the set moves between builds).
@@ -293,6 +294,11 @@ kernels, 2026-10-25 (7322fbd, and fad007f for the prompt times):
   (default and exact-reuse paths). The 262,144 rows ran in different sessions, F on the generic kernel.
 - **LongBench:** the item F missed was still reasoning toward the right choice when it reached the 1,024-token answer
   cap; D answered it in 658 tokens.
+- **The 282 questions** (greedy, the same client and server settings as q8_0's and D's run of 2026-10-20): 229 right
+  against their 230, the same per set except three items: one more MATH-500 problem right, one MMLU-Pro answer cut by
+  its 1,024-token cap before it named a choice, and one HumanEval task wrong. F's answers match D's word for word on 167
+  of the 282 (all of ARC-C and the needles, 36 of 41 HumanEval tasks): with rotated K even a short prompt's rows differ
+  from q8_0's, so longer answers take other words on the way.
 - **A larger window did not help:** at 32k, F read 0.00242 / 0.00239 / 0.00245 / 0.00240 with `MK_KV_WIN` 2048 / 2688 /
   3328 / 4608 (rings of 114 / 137 / 159 / 204 MiB), all within the set's noise. Its excess over q8_0 sits in the older
   5-bit rows.
