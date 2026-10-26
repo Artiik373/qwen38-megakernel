@@ -133,9 +133,11 @@ At 262,144 tokens of context the card held 23.5 GB; a 260,896-token prompt was r
 ran at 66 tok/s, a follow-up turn took 1.3 s, and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2 questions at that
 length were right. Natively on Windows, with the desktop on the same card, D at the full context leaves the engine just
 past what the driver keeps resident, so above 240k `scripts\serve.bat` uses preset F instead: K at 5 bits, rotated,
-0.58 GB smaller than D at 262k, KL equal to q8_0's at 64k and 10% above it at 32k (D: 8%). There the prompt took 340 s
-and decode at that depth ran at 66 tok/s (2026-10-25). At 64k context the measured KL of D with an 8-bit MTP layer
-(preset D') was 0.00161, against q8_0's 0.00163 and the fp16 cache's 0.00161 (2026-10-13 / 10-15).
+0.58 GB smaller than D at 262k, KL equal to q8_0's at 64k and 100k and 10% above it at 32k (D: 8%). There the prompt
+took 340 s and decode at that depth ran at 66 tok/s (2026-10-25). At 64k context the measured KL of D with an 8-bit MTP
+layer (preset D') was 0.00161, against q8_0's 0.00163 and the fp16 cache's 0.00161 (2026-10-13 / 10-15); at 100k, q8_0,
+D and F read 0.00217, 0.00226 and 0.00218, and on 160k tokens of prose D and F read the same (0.00468 / 0.00472,
+2026-10-25; [100k and 160k context](docs/BENCHMARKS.md#100k-and-160k-context)).
 
 While a conversation is shorter than the window, preset D keeps all of it at 8 bits and its output is q8_0's. Past
 the window, its KL at 32k is 8% above q8_0's (an fp16 cache, more precise than both, scores 3% above q8_0 on the same

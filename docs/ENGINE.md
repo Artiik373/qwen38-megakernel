@@ -72,7 +72,7 @@ next-token distributions (same GGUF; reference: llama.cpp b10246 generating toke
 13 sequences of this repo's code and docs, 13,299 positions scored after a 1024-token prompt each), UD-Q4_K_XL with
 the q8_0 KV cache agrees on 98.737% of the top tokens with a mean KL divergence of 0.00119 nats (2026-10-17, the same
 on 2026-10-20), closer than llama.cpp's own batched run (98.489% / 0.00166); most disagreements are near-ties. The
-tables (the prefill-only and `mixed` paths, 32k and 64k context, Q4_K_M, image prompts) and the commands that
+tables (the prefill-only and `mixed` paths, 32k to 160k context, Q4_K_M, image prompts) and the commands that
 reproduce them are in [BENCHMARKS.md](BENCHMARKS.md#against-llamacpp).
 
 `llama_ref` teacher-forces 2048-token chunks of the text (`--chunk`) and stores, per scored position, the 256 most

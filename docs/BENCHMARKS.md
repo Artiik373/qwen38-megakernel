@@ -186,8 +186,9 @@ a 1024-token prompt each), with the 256 most likely tokens stored per position (
 The `mixed` report has been the same since 2026-10-15, still at 7322fbd on 2026-10-20, and the native Windows builds
 give it byte for byte. Most disagreements are near-ties: the median lead of llama.cpp's token over the engine's is 0.043
 nats (llama.cpp batched: 0.051), and 1 of 168 exceeds 0.5 nats. At long context (same reference setup, q8_0 KV):
-99.121% / 0.00219 over 4,094 positions of 2 sequences at ~32k (2026-10-17), and 99.267% / 0.00163 over 4,095 positions
-of one 64k sequence (2026-10-15, 7d67c5d).
+99.121% / 0.00219 over 4,094 positions of 2 sequences at ~32k (2026-10-17), 99.267% / 0.00163 over 4,095 positions
+of one 64k sequence (2026-10-15, 7d67c5d), and 99.121% / 0.00217 over 4,095 positions of one 100k sequence (2026-10-25,
+0278d09; more in [100k and 160k context](#100k-and-160k-context)).
 
 ### Windows and Linux
 
@@ -229,15 +230,15 @@ drafts under both caches.
 Accuracy against llama.cpp (the reference above), top-token agreement / mean KL in nats. An fp16 cache, more precise
 than q8_0, marks the floor of the measurement:
 
-| KV cache | short prompts (13,299 positions) | ~32k (4,094) | 64k (4,095) |
-|---|---|---|---|
-| fp16 (2026-10-12 / 10-13) | 98.774% / 0.00113 | 99.096% / 0.00226 | 0.00161 |
-| q8_0 | 98.737% / 0.00119 (2026-10-17, 7322fbd 10-20) | 99.121% / 0.00219 (10-17) | 99.267% / 0.00163 (10-15) |
-| D: `K*=6,V*=5` + window | = q8_0 (2026-10-20, 7322fbd) | 98.950% / 0.00236 (10-20, 7322fbd) | 99.243% / 0.00160 (10-13) |
-| D': D + 8-bit MTP layer | = q8_0 (10-15, 7d67c5d) | 0.00236 (10-15) | 0.00161 (10-15) |
-| F: `K*=5r,V*=5` + window | 98.714% / 0.00113 (2026-10-25, 7322fbd) | 98.974% / 0.00242 (10-25, 7322fbd) | 99.341% / 0.00163 (10-25, 7322fbd) |
-| C: `V*=5` + window | = q8_0 (10-13) | 99.072% / 0.00228 (10-13) | 99.316% / 0.00159 (10-13) |
-| 4-bit everywhere: `*=4`, no window | 0.00547 (10-15) | | |
+| KV cache | short prompts (13,299 positions) | ~32k (4,094) | 64k (4,095) | 100k (4,095) |
+|---|---|---|---|---|
+| fp16 (2026-10-12 / 10-13) | 98.774% / 0.00113 | 99.096% / 0.00226 | 0.00161 | |
+| q8_0 | 98.737% / 0.00119 (2026-10-17, 7322fbd 10-20) | 99.121% / 0.00219 (10-17) | 99.267% / 0.00163 (10-15) | 99.121% / 0.00217 (10-25, 0278d09) |
+| D: `K*=6,V*=5` + window | = q8_0 (2026-10-20, 7322fbd) | 98.950% / 0.00236 (10-20, 7322fbd) | 99.243% / 0.00160 (10-13) | 99.121% / 0.00226 (10-25, 0278d09) |
+| D': D + 8-bit MTP layer | = q8_0 (10-15, 7d67c5d) | 0.00236 (10-15) | 0.00161 (10-15) | |
+| F: `K*=5r,V*=5` + window | 98.714% / 0.00113 (2026-10-25, 7322fbd) | 98.974% / 0.00242 (10-25, 7322fbd) | 99.341% / 0.00163 (10-25, 7322fbd) | 99.170% / 0.00218 (10-25, 0278d09) |
+| C: `V*=5` + window | = q8_0 (10-13) | 99.072% / 0.00228 (10-13) | 99.316% / 0.00159 (10-13) | |
+| 4-bit everywhere: `*=4`, no window | 0.00547 (10-15) | | | |
 
 The MTP layer's cache only feeds the drafts, so D and D' score the same wherever both were measured. On the 2026-10-12
 / 13 builds of the fp16 row, q8_0 read 0.00113 on the short set and 0.00219 at 32k: fp16 was no better than q8_0 (the
@@ -280,7 +281,7 @@ kernels, 2026-10-25 (7322fbd, and fad007f for the prompt times):
 | | preset D | preset F |
 |---|---|---|
 | KV cache at 120k / 262,144 context | 3.25 / 6.97 GB | 2.99 / 6.39 GB |
-| KL, short prompts / 32k / 64k (q8_0: 0.00119 / 0.00219 / 0.00163) | 0.00119 / 0.00236 / 0.00161 | 0.00113 / 0.00242 / 0.00163 |
+| KL, short prompts / 32k / 64k / 100k (q8_0: 0.00119 / 0.00219 / 0.00163 / 0.00217) | 0.00119 / 0.00236 / 0.00161 / 0.00226 | 0.00113 / 0.00242 / 0.00163 / 0.00218 |
 | reading a 38k / 101.6k-token prompt (one session, exact reuse on) | 22.14 / 77.40 s | 22.11 / 76.97 s |
 | WSL2 server at 262,144: whole card after the prompt | 24,080 MiB (10-20) | 23,650 MiB |
 | the 260,896-token prompt; decode at that depth | 326 s; 66 tok/s (10-20) | 340 s; 66.6 tok/s |
@@ -308,6 +309,33 @@ kernels, 2026-10-25 (7322fbd, and fad007f for the prompt times):
   the needle at 190k was found. Preset D there needed a 512-token chunk and the draft head on lm_head to stay resident,
   and read that prompt in 366 s with decode at 64.3 tok/s (2026-10-24), which is why `scripts\serve.bat` uses F above
   240k.
+
+### 100k and 160k context
+
+The 32k / 64k measurement, further out (2026-10-25, the v2026.10.25 Linux package, 0278d09): llama.cpp b10246 with
+its q8_0 cache reads one sequence and stores its last 4,096 positions (`tools/llama_ref --chunk N --max-chunks 1
+--score-from N-4096 -b 512`), and the engine scores its `mixed` path against that. Two texts: `pf101k.txt` (code, the
+text of the 32k / 64k sets) and War and Peace (`pg2600.txt` from `bench/suite/fetch.py`, line ends converted to LF,
+from its first byte). Prose has flatter next-token distributions than code, so it reads higher KL at any cache
+precision, q8_0 included: compare within a row. Top-token agreement / mean KL / perplexity:
+
+| text, tokens (scored positions) | q8_0 | D | F |
+|---|---|---|---|
+| code, 100,352 (96,256-100,351); reference perplexity 1.6250 | 99.121% / 0.00217 / 1.6226 | 99.121% / 0.00226 / 1.6210 | 99.170% / 0.00218 / 1.6230 |
+| War and Peace, 100,352 (96,256-100,351); 9.4888 | 96.996% / 0.00311 / 9.4830 | 96.874% / 0.00317 / 9.4884 | 96.825% / 0.00317 / 9.4898 |
+| War and Peace, 163,840 (159,744-163,839); 7.7330 | | 96.581% / 0.00468 / 7.7282 | 96.459% / 0.00472 / 7.7329 |
+
+- **At 100k** both presets read q8_0's KL within about the 32k set's noise (4%): +4% (D) and +0.5% (F) on code, +2%
+  and +2% on prose.
+- **160k** is about as far as llama.cpp's q8_0 cache fits on a 24 GB card to make the reference (34 KB per token; the
+  card peaked at 23.5 GB, all of it allocated when the context is created), and this engine's q8_0 cache stops at
+  120k, so that row has no q8_0. D and F agree with each other and with the reference's perplexity, and the
+  disagreements are near-ties: the median lead of llama.cpp's token over the engine's is 0.09 nats, and 1 of D's 140
+  (F: 1 of 145) exceeds 0.5 nats.
+- **Both presets read higher at 160k than at 100k**, although the 160k passage is the easier text (perplexity 7.73
+  against 9.49). Without q8_0 at that depth this set cannot say whether the depth or the passage causes it; scoring the
+  same 4,096 tokens behind ~100k of context, where q8_0 runs, would.
+- Before these runs the package reproduced F's 64k report of 2026-10-25 (7322fbd's kernels) byte for byte.
 
 ### The window size and rotation
 
@@ -562,6 +590,9 @@ proposed, so a sampled reply with a fixed seed can differ from the one before it
   tools/llama_ref -m model.gguf -f code.txt -f prose.txt --score-from 1024 -b 1 --ref-out llama.ref
   tools/llama_ref -m model.gguf --kld llama.ref                            # llama.cpp batched, for scale
   ./qwen38_mk -m model.gguf --kld llama.ref --score-path mixed --kv q8     # this engine
+  # long context: one sequence of N tokens, its last 4,096 positions scored (here N = 100,352)
+  tools/llama_ref -m model.gguf -f pf101k.txt --chunk 100352 --max-chunks 1 --score-from 96256 -b 512 --ref-out long.ref
+  MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 ./qwen38_mk -m model.gguf --kld long.ref --score-path mixed --kv q8   # preset F
   ```
 
 - **Draft-depth independence:** `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_32k.bin
