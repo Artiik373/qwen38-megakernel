@@ -49,7 +49,8 @@ int mkv_n_threads(const mkv_ctx * ctx);
 // the backend in use (MKV_BACKEND_CPU or MKV_BACKEND_MTMD)
 int mkv_backend(const mkv_ctx * ctx);
 
-// Decodes (stb_image: PNG, JPEG, BMP, GIF, ...) and preprocesses an image; NULL on error. The grid is final here.
+// Decodes (stb_image: PNG, JPEG, GIF (first frame) or BMP; other formats are refused) and preprocesses an image; NULL
+// on error. The grid is final here.
 // An image of more than MK_IMAGE_MAX_PIXELS pixels (environment, read by mkv_new; default 100,000,000) is refused from
 // its header, before decoding.
 mkv_image * mkv_image_load(mkv_ctx * ctx, const unsigned char * data, size_t len);

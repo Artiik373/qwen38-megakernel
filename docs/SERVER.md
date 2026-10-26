@@ -623,6 +623,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   preprocessing (stb_image; smart resize to multiples of 32 px within 8 .. 4,096 tokens, the padded bilinear resize,
   normalisation) are llama.cpp's bit for bit: the same token counts and pixels as `llama-server --mmproj`.
   `--image-min-tokens` / `--image-max-tokens` set the limits (fewer tokens encode faster).
+- **Image formats:** PNG, JPEG, GIF (its first frame) and BMP. The other formats stb_image reads (TGA, PSD, HDR, PIC,
+  PNM) are refused with a 400: their loaders have unfixed memory bugs a crafted file reaches (GHSL-2023-147, -149).
 - **One exception**, where llama.cpp's smart resize breaks its own limit: past an aspect ratio of the token limit
   (4096:1 by default) it clamps the short side up to 32 px after scaling, so a 1,000,000 x 1 PNG of a few KB became
   64,000 tokens (hours of CPU encoding, ~16 GB). Here the long side is cut so that the image gets at most the limit

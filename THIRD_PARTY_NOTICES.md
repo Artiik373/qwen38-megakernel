@@ -7,7 +7,7 @@ the full license texts.
 | Component | Where it is in a package | License |
 |---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) b10246: libllama (tokenizer), libmtmd (image library), ggml | `llama` / `ggml*` / `mtmd` libraries | MIT (`licenses/llama.cpp-LICENSE`, plus the files of its `licenses/` folder) |
-| stb_image (Sean Barrett), compiled into libmtmd | `mtmd` library | MIT or public domain (`licenses/stb_image-LICENSE`) |
+| stb_image (Sean Barrett), compiled into libmtmd and the vision library | `mtmd` and `qwen38vision` libraries | MIT or public domain (`licenses/stb_image-LICENSE`) |
 | miniaudio (David Reid), compiled into libmtmd | `mtmd` library | public domain or MIT No Attribution (`licenses/miniaudio-LICENSE`) |
 | NVIDIA CUDA runtime (`cudart_static`), linked into the engine | `qwen38mk.dll` / `libqwen38mk.so`, `qwen38_mk(.exe)` | NVIDIA CUDA Toolkit End User License Agreement, https://docs.nvidia.com/cuda/eula/ |
 | Microsoft Visual C++ runtime (`msvcp140`, `vcruntime140`, `vcruntime140_1`, `vcomp140`), Windows package only | next to the executables | Microsoft Visual Studio license terms (redistributable code) |

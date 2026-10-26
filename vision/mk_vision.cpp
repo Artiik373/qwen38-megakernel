@@ -30,10 +30,14 @@
 #include "win32.h"
 #endif
 
-// image decoding: the stb_image that llama.cpp vendors and libmtmd decodes with (mtmd_helper_bitmap_init_from_buf:
-// stbi_load_from_memory, 3 channels), compiled here as private static functions
+// image decoding for both backends: llama.cpp's vendored stb_image (llama-server's decode: stbi_load_from_memory, 3
+// channels) with PNG, JPEG, GIF and BMP only; its TGA / HDR / PIC loaders have unfixed bugs (GHSL-2023-147 / -149)
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_GIF
+#define STBI_ONLY_BMP
 #include "stb/stb_image.h"
 
 namespace {
@@ -113,11 +117,14 @@ bool cpu_has_avx2_fma() {
 #endif
 }
 
-// only the Qwen3.x projector reaches libmtmd (others trust file sizes: llama.cpp #27166); keys as clip.cpp resolves them
-void check_mtmd_projector(const char * mmproj) {
-    gguf_init_params gp = {true, nullptr};
+// only the Qwen3.x projector reaches libmtmd (others trust file sizes: llama.cpp #27166), read as clip.cpp reads it;
+// returns libmtmd's row width for it (clip_n_mmproj_embd: mm.2.bias times 1 + deepstack layers, which are refused)
+int check_mtmd_projector(const char * mmproj) {
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = {true, &meta};
     std::unique_ptr<gguf_context, void (*)(gguf_context *)> g(gguf_init_from_file(mmproj, gp), gguf_free);
-    if (!g) throw std::runtime_error(std::string("cannot read the mmproj's metadata: ") + mmproj);
+    std::unique_ptr<ggml_context, void (*)(ggml_context *)> m(meta, ggml_free);
+    if (!g || !m) throw std::runtime_error(std::string("cannot read the mmproj's metadata: ") + mmproj);
     auto find = [&](const char * k, gguf_type t) {
         const int64_t i = gguf_find_key(g.get(), k);
         if (i >= 0 && gguf_get_kv_type(g.get(), i) != t) throw std::runtime_error(std::string("mmproj: ") + k + " has an unexpected type");
@@ -133,6 +140,13 @@ void check_mtmd_projector(const char * mmproj) {
         if (!type.empty()) break;
     }
     if (type != "qwen3vl_merger") throw std::runtime_error("mmproj projector \"" + type + "\": only qwen3vl_merger (Qwen3.x vision) is supported");
+    for (ggml_tensor * t = ggml_get_first_tensor(m.get()); t; t = ggml_get_next_tensor(m.get(), t))
+        if (strncmp(ggml_get_name(t), "v.deepstack.", 12) == 0) throw std::runtime_error("the mmproj has deepstack layers (not supported)");
+    const ggml_tensor * b = ggml_get_tensor(m.get(), "mm.2.bias");
+    const int64_t pd = find("clip.vision.projection_dim", GGUF_TYPE_UINT32);
+    if (!b || ggml_n_dims(b) != 1 || b->ne[0] < 1 || b->ne[0] > (1 << 16) || pd < 0 || b->ne[0] != (int64_t) gguf_get_val_u32(g.get(), pd))
+        throw std::runtime_error("mmproj: mm.2.bias does not match clip.vision.projection_dim");
+    return (int) b->ne[0];
 }
 } // namespace
 
@@ -209,7 +223,7 @@ mkv_ctx * mkv_new(const char * mmproj, const char * text_model, struct mkv_param
         if (params.backend == MKV_BACKEND_CPU) throw std::runtime_error("built without the cpu backend (MKV_NO_VIT)");
 #endif
         c->backend = MKV_BACKEND_MTMD;
-        check_mtmd_projector(mmproj);
+        c->n_embd = check_mtmd_projector(mmproj);
         mtmd_helper_log_set(log_filtered, nullptr);
         llama_log_set(log_filtered, nullptr);
         llama_backend_init();
@@ -235,15 +249,6 @@ mkv_ctx * mkv_new(const char * mmproj, const char * text_model, struct mkv_param
         if (!c->mt) throw std::runtime_error(std::string("cannot load the mmproj: ") + mmproj);
         if (!mtmd_support_vision(c->mt)) throw std::runtime_error("the mmproj has no vision encoder");
         if (!mtmd_decode_use_mrope(c->mt)) throw std::runtime_error("the text model does not use M-RoPE positions (not a Qwen3.x model)");
-        // the row width: the mmproj's projection size (mtmd sizes its output by it; a vocabulary-only text model carries
-        // no hyperparameters to check it against)
-        gguf_init_params gp = {true, nullptr};
-        gguf_context * g = gguf_init_from_file(mmproj, gp);
-        if (!g) throw std::runtime_error(std::string("cannot read the mmproj's metadata: ") + mmproj);
-        const int64_t k = gguf_find_key(g, "clip.vision.projection_dim");
-        c->n_embd = k >= 0 ? (int) gguf_get_val_u32(g, k) : 0;
-        gguf_free(g);
-        if (c->n_embd <= 0) throw std::runtime_error("the mmproj has no clip.vision.projection_dim");
         return c;
     } catch (const std::exception & e) {
         g_err = e.what();
@@ -268,7 +273,7 @@ mkv_image * mkv_image_load(mkv_ctx * c, const unsigned char * data, size_t len) 
     // the header first (both backends decode with stb_image): an image over MK_IMAGE_MAX_PIXELS is refused undecoded
     int w = 0, h = 0, comp = 0;
     if (!data || len == 0 || len > (size_t) INT_MAX || !stbi_info_from_memory(data, (int) len, &w, &h, &comp)) {
-        g_err = len > (size_t) INT_MAX ? "cannot decode the image (over 2 GB)" : "cannot decode the image";
+        g_err = len > (size_t) INT_MAX ? "cannot decode the image (over 2 GB)" : "cannot decode the image (PNG, JPEG, GIF or BMP)";
         return nullptr;
     }
     if (w <= 0 || h <= 0 || (long long) w * h > c->max_pixels) {
@@ -303,17 +308,22 @@ mkv_image * mkv_image_load(mkv_ctx * c, const unsigned char * data, size_t len) 
 #endif
     g_err = mtmd_size_error("image", w, h, c->min_tokens, c->max_tokens);
     if (!g_err.empty()) return nullptr;
-    mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_buf(c->mt, data, len, false);
-    if (!bw.bitmap) {
+    // (not mtmd_helper_bitmap_init_from_buf: its stb has every loader, and a failed decode goes to an ffmpeg on PATH)
+    int nx = 0, ny = 0, nc = 0;
+    unsigned char * rgb = stbi_load_from_memory(data, (int) len, &nx, &ny, &nc, 3);
+    if (!rgb || nx <= 0 || ny <= 0 || (long long) nx * ny > c->max_pixels) {
+        if (rgb) stbi_image_free(rgb);
         g_err = "cannot decode the image";
         return nullptr;
     }
+    mtmd_bitmap * bm = mtmd_bitmap_init((uint32_t) nx, (uint32_t) ny, rgb);
+    stbi_image_free(rgb);
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
     const char * marker = mtmd_default_marker();
     mtmd_input_text txt = {marker, strlen(marker), false, true};
-    const mtmd_bitmap * bms[1] = {bw.bitmap};
+    const mtmd_bitmap * bms[1] = {bm};
     const int32_t r = mtmd_tokenize(c->mt, chunks, &txt, bms, 1);
-    mtmd_bitmap_free(bw.bitmap);
+    mtmd_bitmap_free(bm);
     mkv_image * im = nullptr;
     if (r != 0) {
         g_err = "image preprocessing failed (mtmd_tokenize " + std::to_string(r) + ")";
