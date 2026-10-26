@@ -161,9 +161,9 @@ LongBench v2 questions at that length were right (same run). More measurements, 
 
 **Preset F** stores K at 5 bits, Hadamard-rotated, and V at 5 bits, with the same window: 0.26 GB less KV cache than D
 at 120k context (2.99 against 3.25 GB) and 0.58 GB less at 262,144 (6.39 against 6.97 GB). Its KL equals q8_0's at 64k
-(0.00163) and at 100k (0.00218 against 0.00217; D 0.00226), equals D's on 160k tokens of prose, and is 10% above q8_0's
-at 32k (0.00242; D 0.00236; the set's noise is about 0.00008 either way), and a larger window did not change the 32k
-number. On the 282 questions it answered 229 right (D and q8_0: 230; three items
+(0.00163), at 100k (0.00218 against 0.00217; D 0.00226) and on 160k tokens of prose (0.00472 against 0.00467), and is
+10% above q8_0's at 32k (0.00242; D 0.00236; the set's noise is about 0.00008 either way), and a larger window did not
+change the 32k number. On the 282 questions it answered 229 right (D and q8_0: 230; three items
 differ, one of them an answer cut by its token cap). It reads prompts as fast as D (101.6k tokens in 76.97 s against
 77.40 s, 2026-10-25, fad007f, one session). `scripts\serve.bat` uses it above 240k unless `MK_KV` is set: natively on
 Windows, with the desktop on the same card, preset D at the full context passes what the driver keeps resident, and F

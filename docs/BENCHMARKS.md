@@ -323,19 +323,23 @@ precision, q8_0 included: compare within a row. Top-token agreement / mean KL / 
 |---|---|---|---|
 | code, 100,352 (96,256-100,351); reference perplexity 1.6250 | 99.121% / 0.00217 / 1.6226 | 99.121% / 0.00226 / 1.6210 | 99.170% / 0.00218 / 1.6230 |
 | War and Peace, 100,352 (96,256-100,351); 9.4888 | 96.996% / 0.00311 / 9.4830 | 96.874% / 0.00317 / 9.4884 | 96.825% / 0.00317 / 9.4898 |
-| War and Peace, 163,840 (159,744-163,839); 7.7330 | | 96.581% / 0.00468 / 7.7282 | 96.459% / 0.00472 / 7.7329 |
+| War and Peace, 163,840 (159,744-163,839); 7.7330 | 96.361% / 0.00467 / 7.7244 | 96.581% / 0.00468 / 7.7282 | 96.459% / 0.00472 / 7.7329 |
+| the same 4,096 tokens behind 96,256 (the novel from token 63,488); 7.7474 | 96.606% / 0.00336 / 7.7318 | 96.825% / 0.00335 / 7.7339 | 96.850% / 0.00344 / 7.7296 |
 
-- **At 100k** both presets read q8_0's KL within about the 32k set's noise (4%): +4% (D) and +0.5% (F) on code, +2%
-  and +2% on prose.
+- **D and F read q8_0's KL at every depth here**, within about the 32k set's noise (4%): at 100k +4% (D) and +0.5% (F)
+  on code, +2% and +2% on prose; at 160k +0.2% and +1%; on the 160k set's tokens behind ~100k of context -0.3% and
+  +2%.
+- **The KL against llama.cpp grows with depth for every cache, q8_0 included:** the 160k set's last 4,096 tokens read
+  0.0034 behind ~100k of context and 0.0047 behind ~160k, for q8_0, D and F alike, so the growth is between this
+  engine's and llama.cpp's arithmetic, not the cache formats. For scale, llama.cpp's own distributions for those tokens
+  differ by 0.00864 (95.238% top-token agreement) between the two depths. The disagreements stay near-ties: at 160k the
+  median lead of llama.cpp's token over the engine's is 0.09 nats, and 1 of 140-149 exceeds 0.5 nats for each cache.
 - **160k** is about as far as llama.cpp's q8_0 cache fits on a 24 GB card to make the reference (34 KB per token; the
-  card peaked at 23.5 GB, all of it allocated when the context is created), and this engine's q8_0 cache stops at
-  120k, so that row has no q8_0. D and F agree with each other and with the reference's perplexity, and the
-  disagreements are near-ties: the median lead of llama.cpp's token over the engine's is 0.09 nats, and 1 of D's 140
-  (F: 1 of 145) exceeds 0.5 nats.
-- **Both presets read higher at 160k than at 100k**, although the 160k passage is the easier text (perplexity 7.73
-  against 9.49). Without q8_0 at that depth this set cannot say whether the depth or the passage causes it; scoring the
-  same 4,096 tokens behind ~100k of context, where q8_0 runs, would.
-- Before these runs the package reproduced F's 64k report of 2026-10-25 (7322fbd's kernels) byte for byte.
+  card peaked at 23.5 GB, all of it allocated when the context is created). This engine's q8_0 cache ran it with 6.06
+  GB for 163,904 positions, the card at 24.1 of 24.6 GB under WSL2 (the `--kld` CLI: no server, no draft head).
+- The last row is the 163,840-token sequence without its first 63,488 tokens (`llama_ref --kld` on the cut file with
+  `--ref-out`), so its scored tokens are the same ids. Before these runs the package reproduced F's 64k
+  report of 2026-10-25 (7322fbd's kernels) byte for byte.
 
 ### The window size and rotation
 
