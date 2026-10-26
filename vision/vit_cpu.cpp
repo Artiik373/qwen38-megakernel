@@ -640,7 +640,7 @@ Vit::Vit(const std::string & mmproj, const Params & prm) {
     if (I.D <= 0 || I.nH <= 0 || I.FF <= 0 || I.nL <= 0 || I.nL > 1024 || I.n_embd <= 0 || I.D > (1 << 16) || I.FF > (1 << 18) ||
         I.n_embd > (1 << 16))
         throw std::runtime_error("vit: bad vision hyperparameters in the mmproj");
-    if (I.D / I.nH != HD || I.merge != 2 || I.patch != 16) throw std::runtime_error("vit: unexpected vision tower shape");
+    if ((long long) I.nH * HD != I.D || I.merge != 2 || I.patch != 16) throw std::runtime_error("vit: unexpected vision tower shape");
     // llama.cpp's limits for this projector (clip.cpp: set_limit_image_tokens(8, 4096)), per merged token 32 x 32 pixels
     const int area = I.patch * I.patch * I.merge * I.merge;
     I.min_pixels = (prm.min_tokens > 0 ? prm.min_tokens : 8) * area;
@@ -676,7 +676,7 @@ Vit::Vit(const std::string & mmproj, const Params & prm) {
     {
         std::vector<float> pe = gg.get("v.position_embd.weight");
         I.pside = (int) std::lround(std::sqrt((double) (pe.size() / D)));
-        if ((size_t) I.pside * I.pside * D != pe.size()) throw std::runtime_error("vit: position embedding is not square");
+        if (I.pside < 1 || (size_t) I.pside * I.pside * D != pe.size()) throw std::runtime_error("vit: position embedding is empty or not square");
         I.pos_embd = std::move(pe);
     }
     I.L.resize(I.nL);

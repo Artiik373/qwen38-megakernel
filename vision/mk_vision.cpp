@@ -112,6 +112,28 @@ bool cpu_has_avx2_fma() {
     return false;
 #endif
 }
+
+// only the Qwen3.x projector reaches libmtmd (others trust file sizes: llama.cpp #27166); keys as clip.cpp resolves them
+void check_mtmd_projector(const char * mmproj) {
+    gguf_init_params gp = {true, nullptr};
+    std::unique_ptr<gguf_context, void (*)(gguf_context *)> g(gguf_init_from_file(mmproj, gp), gguf_free);
+    if (!g) throw std::runtime_error(std::string("cannot read the mmproj's metadata: ") + mmproj);
+    auto find = [&](const char * k, gguf_type t) {
+        const int64_t i = gguf_find_key(g.get(), k);
+        if (i >= 0 && gguf_get_kv_type(g.get(), i) != t) throw std::runtime_error(std::string("mmproj: ") + k + " has an unexpected type");
+        return i;
+    };
+    const int64_t hv = find("clip.has_vision_encoder", GGUF_TYPE_BOOL), ha = find("clip.has_audio_encoder", GGUF_TYPE_BOOL);
+    if (hv < 0 || !gguf_get_val_bool(g.get(), hv)) throw std::runtime_error("the mmproj has no vision encoder");
+    if (ha >= 0 && gguf_get_val_bool(g.get(), ha)) throw std::runtime_error("the mmproj has an audio encoder (only a vision-only qwen3vl_merger mmproj is supported)");
+    std::string type;
+    for (const char * k : {"clip.projector_type", "clip.vision.projector_type"}) {
+        const int64_t i = find(k, GGUF_TYPE_STRING);
+        if (i >= 0) type = gguf_get_val_str(g.get(), i);
+        if (!type.empty()) break;
+    }
+    if (type != "qwen3vl_merger") throw std::runtime_error("mmproj projector \"" + type + "\": only qwen3vl_merger (Qwen3.x vision) is supported");
+}
 } // namespace
 
 struct mkv_ctx {
@@ -187,6 +209,7 @@ mkv_ctx * mkv_new(const char * mmproj, const char * text_model, struct mkv_param
         if (params.backend == MKV_BACKEND_CPU) throw std::runtime_error("built without the cpu backend (MKV_NO_VIT)");
 #endif
         c->backend = MKV_BACKEND_MTMD;
+        check_mtmd_projector(mmproj);
         mtmd_helper_log_set(log_filtered, nullptr);
         llama_log_set(log_filtered, nullptr);
         llama_backend_init();
@@ -211,7 +234,7 @@ mkv_ctx * mkv_new(const char * mmproj, const char * text_model, struct mkv_param
         c->mt = mtmd_init_from_file(mmproj, c->vocab, cp);
         if (!c->mt) throw std::runtime_error(std::string("cannot load the mmproj: ") + mmproj);
         if (!mtmd_support_vision(c->mt)) throw std::runtime_error("the mmproj has no vision encoder");
-        if (!mtmd_decode_use_mrope(c->mt)) throw std::runtime_error("the mmproj does not use M-RoPE positions (not a Qwen-VL projector)");
+        if (!mtmd_decode_use_mrope(c->mt)) throw std::runtime_error("the text model does not use M-RoPE positions (not a Qwen3.x model)");
         // the row width: the mmproj's projection size (mtmd sizes its output by it; a vocabulary-only text model carries
         // no hyperparameters to check it against)
         gguf_init_params gp = {true, nullptr};
