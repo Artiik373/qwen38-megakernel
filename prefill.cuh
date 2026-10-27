@@ -147,8 +147,8 @@ __global__ void __launch_bounds__(256) pk_norm_quant1(const float * src, const f
 constexpr int AB_SPLITS = 8, AB_KS = D / AB_SPLITS;
 // Q8_0 alpha / beta (abq != nullptr): weights (q * d) * attn_norm formed while filling sw, the folded fp32 values
 __global__ void __launch_bounds__(256) pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T) {
-    __shared__ float sx[32][64 + 4];
-    __shared__ float sw[32][96 + 4];
+    __shared__ __align__(16) float sx[32][64 + 4]; // read as float4
+    __shared__ __align__(16) float sw[32][96 + 4];
     const int tid = threadIdx.x, tg = tid & 15, rg = tid >> 4; // tokens 4 tg .. , rows 6 rg ..
     const int t0 = blockIdx.x * 64, k00 = blockIdx.y * AB_KS;
     float acc[4][6];
