@@ -168,6 +168,12 @@ static std::vector<int> read_ids(const std::string & path) {
     std::quick_exit(code);
 }
 
+// MK_PROFILE's tables print in the engine's destructor, which quick_exit skips: profile runs run it first.
+[[noreturn]] static void leave(MKEngine & eng, int code) {
+    if (getenv("MK_PROFILE")) eng.~MKEngine();
+    leave(code);
+}
+
 static int run(int argc, char ** argv);
 
 // engine errors (bad arguments, a prompt over the context, non-sticky CUDA errors) end the run with a message and
@@ -388,7 +394,7 @@ static int run(int argc, char ** argv) {
             ses.report(piece);
             fflush(stdout);
         }
-        leave(0);
+        leave(eng, 0);
     }
 
     int nd_engine = job0.n_draft; // batch: the engine's depth is the deepest job's (each job sets its own)
@@ -401,7 +407,7 @@ static int run(int argc, char ** argv) {
     eng.set_penalty(job0.pres, job0.freq);
     if (bench_phases) {
         eng.bench_phases();
-        leave(0);
+        leave(eng, 0);
     }
 
     // chat template of the model (llama.cpp renders the same): with thinking, an optional reasoning-effort
@@ -441,7 +447,7 @@ static int run(int argc, char ** argv) {
         }
         printf("SCORE agree %d / %d (%.2f%%), first disagreement at continuation index %d\n", agree, total,
                100.0 * agree / total, first_bad);
-        leave(0);
+        leave(eng, 0);
     }
 
     // one job: prompt (+ an optional second turn), output to stdout, stats to stderr
@@ -560,5 +566,5 @@ static int run(int argc, char ** argv) {
         fprintf(stderr, "[mk] batch: %zu jobs in %.2f s after the load\n", jobs.size(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count());
     }
-    leave(0); // (no llama_model_free: as the engine, freed by the exit)
+    leave(eng, 0); // (no llama_model_free: as the engine, freed by the exit)
 }
