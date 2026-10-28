@@ -112,6 +112,12 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #if MK_WV_Q6F && MK_MAXT <= 5
 #error "MK_WV_Q6F needs MK_WV=1 and MK_MAXT > 5"
 #endif
+// MK_MAXT > 5 builds: every main-layer matrix of Q4_K, Q5_K, Q8_0, IQ4_NL, IQ4_XS (and Q6_K with MK_WV_Q6F) is in the wv
+// layout, so the T <= 5 dp4a GEMVs (gemv_pairs_any, resid_any, rows16_any) read the hybrid types and the MTP block only.
+// The MTP block is always re-quantised to Q4_K from Q5_K / Q6_K / Q8_0 / Q4_0 / IQ4_NL (MK_MTP_Q4=1), so their dispatch
+// drops Q5_K, Q8_0, IQ4_NL (and Q6_K with MK_WV_Q6F): ~185 k SASS instructions of mk_cycle's tree (ptxas time and
+// memory). The loader refuses any matrix these kernels would not read.
+#define DP4A_NARROW (MK_WV && MK_MAXT > 5)
 // MK_GSYNC (stockfix K4): the grid barrier's form. 0 (default): upstream's (every block's thread 0 red.release-adds one word
 // and ld.acquire-polls that same word). 1: flag broadcast with relaxed polling (arrivals atom.acq_rel-add the count word;
 // the last arriver st.release-writes the generation to a separate "go" line; the others poll go with ld.relaxed and re-read
@@ -1334,7 +1340,7 @@ __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
     }
 }
 
-// Runtime dispatch on a matrix's type (uniform across the grid). Plain switches: a capturing
+// Runtime dispatch on a matrix's type (uniform across the grid; fewer types with DP4A_NARROW). Plain switches: a capturing
 // lambda would take the address of the caller's locals and push them to local memory.
 // (mk_cycle's stack frame is the deepest call chain incl. the callees' spills: a spilling GEMV instantiation of any
 // type raises the local memory of the whole kernel, ~0.12 MiB per byte. A second out-of-line switch for the newer types
@@ -1343,10 +1349,16 @@ template <int T, int IT, class Out>
 __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Out out) {
     switch (m.type) {
         case T_Q4K: gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out); break;
+#if !DP4A_NARROW
         case T_Q5K: gemv_pairs<T, IT, T_Q5K>(m, lo, hi, out); break;
+#endif
+#if !MK_WV_Q6F
         case T_Q6K: gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out); break;
+#endif
+#if !DP4A_NARROW
         case T_Q8_0: gemv_pairs<T, IT, T_Q8_0>(m, lo, hi, out); break;
         case T_IQ4NL: gemv_pairs<T, IT, T_IQ4NL>(m, lo, hi, out); break;
+#endif
         case T_Q3K: gemv_pairs<T, IT, T_Q3K>(m, lo, hi, out); break;
         case T_IQ3S: gemv_pairs<T, IT, T_IQ3S>(m, lo, hi, out); break;
         default: gemv_pairs<T, IT, T_IQ4X>(m, lo, hi, out); break;
@@ -1659,10 +1671,16 @@ template <int T, int IT>
 __device__ __forceinline__ void resid_any(const Mat & W, const QBuf & in, float * x, bool add, const float * wnext, uint8_t * sm) {
     switch (W.type) {
         case T_Q4K: resid32<T, IT, T_Q4K>(W, in, x, add, wnext, sm); break;
+#if !DP4A_NARROW
         case T_Q5K: resid32<T, IT, T_Q5K>(W, in, x, add, wnext, sm); break;
+#endif
+#if !MK_WV_Q6F
         case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm); break;
+#endif
+#if !DP4A_NARROW
         case T_Q8_0: resid32<T, IT, T_Q8_0>(W, in, x, add, wnext, sm); break;
         case T_IQ4NL: resid32<T, IT, T_IQ4NL>(W, in, x, add, wnext, sm); break;
+#endif
         case T_Q3K: resid32<T, IT, T_Q3K>(W, in, x, add, wnext, sm); break;
         case T_IQ3S: resid32<T, IT, T_IQ3S>(W, in, x, add, wnext, sm); break;
         default: resid32<T, IT, T_IQ4X>(W, in, x, add, wnext, sm); break;
@@ -1754,10 +1772,16 @@ template <int T>
 __device__ __forceinline__ LaneT<T> rows16_any(const Mat & m, int j) {
     switch (m.type) {
         case T_Q4K: return rows16<T, T_Q4K>(m, j);
+#if !DP4A_NARROW
         case T_Q5K: return rows16<T, T_Q5K>(m, j);
+#endif
+#if !MK_WV_Q6F
         case T_Q6K: return rows16<T, T_Q6K>(m, j);
+#endif
+#if !DP4A_NARROW
         case T_Q8_0: return rows16<T, T_Q8_0>(m, j);
         case T_IQ4NL: return rows16<T, T_IQ4NL>(m, j);
+#endif
         case T_Q3K: return rows16<T, T_Q3K>(m, j);
         case T_IQ3S: return rows16<T, T_IQ3S>(m, j);
         default: return rows16<T, T_IQ4X>(m, j);
@@ -7155,6 +7179,7 @@ struct MKEngine::Impl {
     // imatrix). Lossy, but only the drafts can change: they are verified by the exact main model, so the output (greedy
     // ids, the sampled distribution) is unchanged and only acceptance moves. Each MTP pass streams ~0.1 GB less.
     // 0 off, 1 on (default), ab: both copies on the device and the policy key mtpq=0|1 picks one (A/B tests).
+    // DP4A_NARROW builds: always on, IQ4_NL too (their dp4a kernels read none of these types; 0 / ab are refused).
     int mtp_q4 = 1;
     bool req_q4 = false; // want(): re-quantise the current tensor to Q4_K (set while the MTP block loads)
     int n_req = 0;
@@ -7223,7 +7248,9 @@ struct MKEngine::Impl {
             ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), out + (size_t) r * rs_to, 0, 1, K, nullptr); // lossy by design (mtp_q4)
         });
     }
-    static bool requant_type(uint32_t t) { return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0; }
+    static bool requant_type(uint32_t t) {
+        return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0 || (DP4A_NARROW && t == gguf::IQ4_NL);
+    }
     // The MTP block's re-quantisation (~2.5 s of CPU on UD-Q4_K_XL) runs on a background thread from early in the load
     // (rq_start; MK_LOAD_RQBG=0: inline as before); want() takes its results. Same rows, same calls, same bytes.
     std::map<std::string, std::vector<uint8_t>> rq_res;
@@ -7857,9 +7884,15 @@ struct MKEngine::Impl {
             need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL, T_Q3K, T_IQ3S});
         };
         if (const char * e = getenv("MK_MTP_Q4")) {
+#if DP4A_NARROW
+            if (strcmp(e, "1"))
+                throw std::runtime_error(std::string("MK_MTP_Q4=") + e + " was removed from this build: the MTP block is always re-quantised to "
+                                         "Q4_K (MK_MTP_Q4=0 / ab and the policy key mtpq: builds with MK_MAXT 5 only)");
+#else
             if (!strcmp(e, "ab")) mtp_q4 = 2;
             else if (!strcmp(e, "0") || !strcmp(e, "1")) mtp_q4 = e[0] - '0';
             else throw std::runtime_error("MK_MTP_Q4: 0, 1 or ab");
+#endif
         }
         if (const char * e = getenv("MK_DRAFT_Q4")) {
             if (strcmp(e, "0") && strcmp(e, "1")) throw std::runtime_error("MK_DRAFT_Q4: 0 or 1");
@@ -8005,18 +8038,21 @@ struct MKEngine::Impl {
             hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
             hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
         }
-#if MK_WV && MK_MAXT > 5
-        // every main-layer matrix outside the wv layout is a hybrid type (Q3_K / IQ3_S; Q6_K without MK_WV_Q6F): the dp4a
-        // dispatch of the main layers has no other case (wv.cuh gemv_pairs_dp). Refused rather than mis-read.
+#if DP4A_NARROW
+        // Every matrix outside the wv layout must be of a type this build's dp4a dispatch keeps: main layers a hybrid type
+        // (Q3_K / IQ3_S; Q6_K without MK_WV_Q6F: wv.cuh gemv_pairs_dp), the MTP block (solo and batched passes: gemv_pairs_any,
+        // resid_any, rows16_any) after its re-quantisation also Q4_K / IQ4_XS. The loader above guarantees it for every file
+        // it accepts; anything else is refused here rather than mis-read.
         {
-            auto dp4a_need = [&](const std::string & name, const Mat & m) {
+            auto dp4a_need = [&](const std::string & name, const Mat & m, bool mtp) {
                 const int t = m.type;
-                if (!m.fm && t != T_Q3K && t != T_IQ3S && (MK_WV_Q6F || t != T_Q6K))
-                    throw std::runtime_error(name + " is " + tname(t) + " outside the wv layout: this build's dp4a kernels do not read it");
+                if (m.fm || t == T_Q3K || t == T_IQ3S || (!MK_WV_Q6F && t == T_Q6K) || (mtp && (t == T_Q4K || t == T_IQ4X))) return;
+                throw std::runtime_error(name + " is " + tname(t) + (mtp ? " in the MTP block" : " outside the wv layout") +
+                                         ": this build's dp4a kernels do not read it");
             };
-            for (int i = 0; i < NL; i++) {
+            for (int i = 0; i < (has_mtp ? NLA : NL); i++) {
                 const LayerW & L = hw.L[i];
-                auto chk = [&](const char * r, const Mat & m) { dp4a_need(blk(i, r), m); };
+                auto chk = [&](const char * r, const Mat & m) { dp4a_need(blk(i, r), m, i == NL); };
                 if (L.attn) {
                     chk("attn_q.weight", L.q);
                     chk("attn_k.weight", L.k);
@@ -8031,6 +8067,7 @@ struct MKEngine::Impl {
                 chk("ffn_up.weight", L.fu);
                 chk("ffn_down.weight", L.fd);
             }
+            if (has_mtp) dp4a_need(blk(NL, "nextn.eh_proj.weight"), hw.eh, true);
         }
 #endif
         hw.onorm = up_f32("output_norm.weight", D);
@@ -8143,8 +8180,8 @@ struct MKEngine::Impl {
         if (n_nat)
             fprintf(stderr, "[mk] %d Q3_K / IQ3_S tensors repacked to their native layouts in %.1f s (exact, checked per row)\n", n_nat, nat_s);
         if (n_req)
-            fprintf(stderr, "[mk] MTP block: %d matrices re-quantised to Q4_K in %.1f s (drafts only; MK_MTP_Q4=0: as stored%s)\n",
-                    n_req, req_s, mtp_q4 == 2 ? "; ab: both copies, policy mtpq=0|1" : "");
+            fprintf(stderr, "[mk] MTP block: %d matrices re-quantised to Q4_K in %.1f s (drafts only%s)\n", n_req, req_s,
+                    DP4A_NARROW ? "" : mtp_q4 == 2 ? "; MK_MTP_Q4=0: as stored; ab: both copies, policy mtpq=0|1" : "; MK_MTP_Q4=0: as stored");
 
         hb.x = dalloc<float>(RMAX * D);
         hb.xm = dalloc<float>(RMAX * D);
@@ -10921,7 +10958,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 
 // "key=value,...": depth=0|1|2 (see Impl::Policy), dmin=N; on-device early stop (Launch::gate_*): drop=F,
 // stop=F (every draft), dropK=F / stopK=F (draft K = 1..4 only), chain=0|1; h1=0|1 (sampled drafts when
-// sampling); mtpq=0|1 (MK_MTP_Q4=ab only: the MTP block as stored / re-quantised to Q4_K; kept until changed);
+// sampling); mtpq=0|1 (MK_MTP_Q4=ab only, MK_MAXT 5 builds: the MTP block as stored / re-quantised to Q4_K; kept until changed);
 // dq4=0|1 (MK_DRAFT_Q4=1 only: the draft head reads lm_head / its Q4_K copy; kept until changed);
 // MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
 // chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);
@@ -10962,7 +10999,11 @@ void MKEngine::set_policy(const std::string & spec) {
 #if MK_MAXT > 5
         else if (k == "blk") pol.blk = std::stoi(v);
 #endif
+#if DP4A_NARROW
+        else if (k == "mtpq") throw std::runtime_error("policy mtpq was removed from this build: the MTP block is always re-quantised to Q4_K");
+#else
         else if (k == "mtpq") p_->set_mtp_q4(std::stoi(v)); // MK_MTP_Q4=ab only; takes effect from the next prefill
+#endif
         else if (k == "dq4") p_->set_draft_q4(std::stoi(v)); // MK_DRAFT_Q4=1 only; from the next launch
         else throw std::runtime_error("policy: unknown key " + k);
     }
