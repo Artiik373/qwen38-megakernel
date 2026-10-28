@@ -289,6 +289,10 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--chat-template TEMPLATE` | - | the GGUF's template | the template itself (`chatml`: llama.cpp's ChatML); the last of the two options wins | changes (prompt) | 282cd55, 2026-10-18 |
 | `--reasoning-format` | `MK_REASONING_FORMAT` | `auto` | llama-server's: `auto` / `deepseek` (thinking as `reasoning_content`), `deepseek-legacy`, `none` (left in the content); a request's `reasoning_format` wins | - (formatting) | 99d4dd9, 2026-10-19 |
 | `--chat-template-kwargs JSON` | `MK_CHAT_TEMPLATE_KWARGS` | none | defaults under every request's `chat_template_kwargs` (keys `enable_thinking`, `preserve_thinking`, `reasoning_effort`); the request's own win | changes (prompt) | 99d4dd9, 2026-10-19 |
+| `--temp` | - | `1.0` | sampling temperature of a request that sends none (0: greedy) | - (sampling) | uncommitted, 2026-10-28 |
+| `--top-p` | - | `0.95` | top_p of a request that sends none; (0, 1] | - (sampling) | uncommitted, 2026-10-28 |
+| `--top-k` | - | `20` | top_k of a request that sends none; <= 0: off (32, the engine's maximum); above 32 refused | - (sampling) | uncommitted, 2026-10-28 |
+| `--min-p` | - | `0` | min_p of a request that sends none; [0, 1] | - (sampling) | uncommitted, 2026-10-28 |
 | `--mmproj` | `MK_MMPROJ` (launchers) | none: no images | the vision projector GGUF: image and video input, encoded on the CPU (no VRAM) | - | 04662b5, 2026-10-16 |
 | `--vision-lib` | - | `libqwen38vision.so` / `qwen38vision.dll` in the repo root | the vision library | - | 04662b5, 2026-10-16 |
 | `--vision-threads` | - | `0`: every logical CPU but two | CPU threads of the image encoder | same | 04662b5, 2026-10-16 |
@@ -673,7 +677,8 @@ no keys.
 
 Fixed in the server: at most 64 stop strings per request of at most 1024 characters each; a video's ffmpeg decode
 stops after 300 s; the sampling defaults for fields a request leaves out are Unsloth's thinking-mode preset for Qwen3.8
-(temperature 1.0, top_p 0.95, top_k 20, min_p 0); top_k is at most 32 (0 or less means 32); one request runs at a
+(temperature 1.0, top_p 0.95, top_k 20, min_p 0; `--temp` / `--top-p` / `--top-k` / `--min-p` change them); top_k is
+at most 32 (0 or less means 32); one request runs at a
 time. Conversation cache: with parking on, a side request with tools must cap its reply at 1024 tokens; a side request
 that does not cap its reply reserves room for 8192 rows in the host store; a side request's conversation is parked
 with 1 checkpoint, and at most 4 of them are kept; a request without tools is taken for a summary by its answer, 256

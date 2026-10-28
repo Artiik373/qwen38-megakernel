@@ -64,7 +64,8 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOPK_MAX = 32
-# sampling defaults (a request's absent / null fields): Unsloth's thinking-mode preset for Qwen3.8
+# sampling defaults (a request's absent / null fields; --temp / --top-p / --top-k / --min-p): Unsloth's thinking-mode
+# preset for Qwen3.8
 DEF_TEMP, DEF_TOP_P, DEF_TOP_K, DEF_MIN_P = 1.0, 0.95, 20, 0.0
 # request limits; main() reads them from the environment
 MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64 data: URLs fit)
@@ -4472,6 +4473,7 @@ def gguf_text_limits(path):
 
 def main():
     global MAX_BODY_MB, MAX_IMAGES, MAX_VIDEO_FRAMES, IMAGE_MAX_PIXELS, REASONING_MAX_BYTES
+    global DEF_TEMP, DEF_TOP_P, DEF_TOP_K, DEF_MIN_P
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
@@ -4542,6 +4544,15 @@ def main():
                     help="defaults for every request's chat_template_kwargs (a JSON object of "
                          + ", ".join(TEMPLATE_KWARGS) + "; the request's own win), e.g. '{\"enable_thinking\": false}' "
                          "(env MK_CHAT_TEMPLATE_KWARGS)")
+    ap.add_argument("--temp", type=float, default=DEF_TEMP, metavar="T",
+                    help=f"sampling temperature of a request without one (0: greedy; default {DEF_TEMP:g})")
+    ap.add_argument("--top-p", type=float, default=DEF_TOP_P, metavar="P",
+                    help=f"top-p of a request without one (default {DEF_TOP_P:g})")
+    ap.add_argument("--top-k", type=int, default=DEF_TOP_K, metavar="K",
+                    help=f"top-k of a request without one (<= 0: off, the engine's maximum {TOPK_MAX}; "
+                         f"default {DEF_TOP_K})")
+    ap.add_argument("--min-p", type=float, default=DEF_MIN_P, metavar="P",
+                    help=f"min-p of a request without one (default {DEF_MIN_P:g})")
     ap.add_argument("--mmproj", default=None,
                     help="vision projector GGUF (e.g. mmproj-*.gguf): image_url inputs, encoded on the CPU (no VRAM)")
     ap.add_argument("--vision-lib", default=os.path.join(os.path.dirname(HERE), LIB_VISION))
@@ -4589,6 +4600,19 @@ def main():
         log(f"chat template kwargs: {json.dumps(kw)} (under each request's)")
     if args.reasoning_format != "auto":
         log(f"reasoning format: {args.reasoning_format}")
+    if args.temp < 0:
+        ap.error("--temp: expected a temperature >= 0")
+    if not 0 < args.top_p <= 1:
+        ap.error("--top-p: expected a value in (0, 1]")
+    if args.top_k > TOPK_MAX:
+        ap.error(f"--top-k: the engine samples from at most {TOPK_MAX} candidates (<= 0: off)")
+    if not 0 <= args.min_p <= 1:
+        ap.error("--min-p: expected a value in [0, 1]")
+    sampling = (args.temp, args.top_p, args.top_k, args.min_p)
+    if sampling != (DEF_TEMP, DEF_TOP_P, DEF_TOP_K, DEF_MIN_P):
+        DEF_TEMP, DEF_TOP_P, DEF_TOP_K, DEF_MIN_P = sampling
+        log(f"sampling defaults: temp {DEF_TEMP:g} top_p {DEF_TOP_P:g} top_k {DEF_TOP_K} min_p {DEF_MIN_P:g} "
+            "(under each request's)")
     args.chat_template_src = None  # (before the port opens: a bad template fails at once, not after the model load)
     if args.chat_template:
         try:
