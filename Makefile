@@ -47,7 +47,7 @@ tools/vision_ref: tools/vision_ref.cpp logit_stats.h
 	g++ -O2 -std=c++17 -pthread $(VISION_INC) $< $(VISION_LIBS) -o $@
 
 # ptxas register / spill report for every phase function goes to ptxas.log
-qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh
+qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh loader.cuh wv.cuh wv_host.cuh
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
 qwen38_mk: qwen38_mk.o main.cu logit_stats.h
