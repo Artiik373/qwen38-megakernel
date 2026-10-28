@@ -158,6 +158,31 @@ def plural(n, word):
     return f"{n:,} {word}{'' if n == 1 else 's'}"
 
 
+def under_wsl():
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def drop_file_cache(path):
+    """releases the page cache holding a file (the GGUF once its weights are on the GPU; the engine unmaps it after
+    loading). Only under WSL, where cached pages stay counted against Windows: a whole model's worth of RAM held for
+    nothing. Elsewhere the cache is free and makes the next start fast. Best effort: a file that cannot be opened is
+    left alone. (open-jet 09cf51d)"""
+    if not under_wsl():
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
 class Engine:
     """ctypes binding of capi.cpp"""
 
@@ -2361,6 +2386,8 @@ class Server:
         vis = (f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.backend}, {self.vision.n_threads} threads)"
                if self.vision else "")
         self.t_start = time.time()
+        for path in {args.model, args.mtp or os.environ.get("MK_MTP") or args.model}:
+            drop_file_cache(path)
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts{vis}")
         self.warm_s = self.eng.keep_warm()  # (MK_KEEP_WARM_S: the first reply starts at full clocks too)
 

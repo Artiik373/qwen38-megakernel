@@ -6468,7 +6468,7 @@ struct MKEngine::Impl {
 
     // A tensor of the file in a type the kernels read. Q3_K and IQ3_S are re-encoded as Q6_K and
     // IQ4_NL as Q8_0, exactly: every weight is a small integer times an fp16 scale in both (checked
-    // bit for bit against ggml's dequantization of the source row). `to == T_F32` dequantizes
+    // bit for bit against ggml's dequantization of the source row; signed zeros compare equal). `to == T_F32` dequantizes
     // (ssm_alpha / ssm_beta, which are folded into fp32 rows).
     struct Src {
         uint32_t type = 0;
@@ -6641,7 +6641,9 @@ struct MKEngine::Impl {
             else reencode_iq4nl_q80(src, out, K);
             g.resize((size_t) K);
             tr_dst->to_float(out, g.data(), K);
-            if (memcmp(f.data(), g.data(), (size_t) K * 4) != 0) exact = false;
+            // a zero-scale IQ3_S block can decode to -0 where Q6_K stores +0: the same weight (open-jet 72fb430).
+            // Every nonzero mismatch is still refused.
+            if (memcmp(f.data(), g.data(), (size_t) K * 4) != 0 && !std::equal(f.begin(), f.end(), g.begin())) exact = false;
         });
         if (!exact) throw std::runtime_error(name + ": re-encoding is not exact");
         }
@@ -7718,8 +7720,17 @@ struct MKEngine::Impl {
         const double pf_wait = pfx ? pfx->wait_s : 0.0;
         const size_t pf_bytes = pfx ? pfx->bytes() : 0;
         pfx.reset();
+        pfx_mtp.reset();
         load_report(pf_wait, pf_bytes);
         if (getenv("MK_WDIGEST")) weights_digest();
+        { // the weights are on the device (or copied out): unmap the GGUF files, keeping their metadata (gguf::File::release)
+            const size_t edge = std::min<size_t>(file.size, (size_t) 4 << 20); // (st_name's model identity)
+            model_mh = wd_hash(file.base, edge);
+            model_mh = wd_hash(file.base + file.size - edge, edge, model_mh);
+            if (rq_th.t.joinable()) rq_th.t.join(); // (an unconsumed MTP requant still reads the mapping)
+            file.release();
+            if (mtpf) mtpf->release();
+        }
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
     }
 
@@ -9169,6 +9180,7 @@ struct MKEngine::Impl {
     // the key text (stored in the file and compared on load): the binary's bytes, the model file, ctx, the KV format, the
     // prefill chunk cap and every MK_* variable not known to be decode-only or diagnostic.
     std::string st_dir, model_path;
+    unsigned long long model_mh = 0; // hash of the model file's first and last 4 MiB (read before the file is unmapped)
     int st_how = 0;
     double st_s = 0;
     static unsigned long long file_hash(const std::string & path) {
@@ -9221,9 +9233,7 @@ struct MKEngine::Impl {
         char rp[PATH_MAX];
         if (!realpath(model_path.c_str(), rp)) snprintf(rp, sizeof rp, "%s", model_path.c_str());
         stat(rp, &st);
-        const size_t edge = std::min<size_t>(file.size, (size_t) 4 << 20);
-        unsigned long long mh = wd_hash(file.base, edge);
-        mh = wd_hash(file.base + file.size - edge, edge, mh);
+        const unsigned long long mh = model_mh;
 #ifdef _WIN32
         k << " model " << rp << " " << (long long) st.st_size << " " << (long long) st.st_mtime << ".0"
 #else

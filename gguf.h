@@ -118,7 +118,16 @@ struct File {
             throw std::runtime_error(path + ": " + e.what());
         }
     }
-    ~File() { if (base) munmap((void *) base, size); }
+    ~File() { release(); }
+
+    // unmaps the file once its tensors are copied out. The metadata stays (each tensor's type, shape and size; its
+    // data pointer is cleared): a mapping held for the engine's life keeps the whole model in the page cache, which
+    // under WSL stays counted against Windows.
+    void release() {
+        if (base) munmap((void *) base, size);
+        base = nullptr;
+        for (auto & t : tensors) t.second.data = nullptr;
+    }
 
     const Tensor & get(const std::string & name) const {
         auto it = tensors.find(name);

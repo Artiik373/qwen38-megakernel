@@ -161,6 +161,11 @@ shape-checked reads; UD-Q4_K_XL, UD-Q4_K_M and Q4_K_M parse to the same tensors 
 encoder then checks every tensor's size against the projector's hyperparameters, and the hyperparameters and the types
 of the keys it reads (a crafted file is refused with an error rather than ending the process).
 
+Once the weights are on the device (and `token_embd` is copied into pinned host memory), the loader unmaps the model
+file and an `--mtp` file (`File::release`: the metadata stays), and under WSL the server then drops them from the page
+cache (`posix_fadvise` DONTNEED), which WSL otherwise keeps counted against Windows: a whole model's worth of RAM held
+for nothing (from open-jet 09cf51d, 2026-10-28). The next start reads the file from disk again.
+
 The MTP draft block (`blk.64.*`, `nextn.eh_proj`) is the one lossy exception: its matrices stored wider than Q4_K
 (Q5_K, Q6_K, Q8_0: all of them in UD-Q4_K_XL, `eh_proj` / `attn_v` / `ffn_down` in Q4_K_M) are re-quantized to Q4_K at
 load (`ggml_quantize_chunk`, ~2.5 s of CPU for UD-Q4_K_XL, on a background thread during the load), so every MTP pass

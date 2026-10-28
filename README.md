@@ -242,6 +242,13 @@ Responses APIs, and the native Windows build. Two changes went back upstream and
 support (PR #19) and `token_embd` in host memory with a configurable prefill chunk (PR #20); image input (PR #23) is
 open.
 
+Upstream's later history (to 09cf51d, 2026-10-27) was merged here on 2026-10-28. Taken: the GGUF unmapped after loading
+and dropped from the page cache under WSL, re-encoding checks that accept signed zeros, and `bench/think_bench.py`'s
+GPU pinning and JSON output. Left out: parallel serving (`--agents` / `--parallel`, built on upstream's Q4_K_M-only
+engine and its paged q8_0 KV cache), sm75 (Turing) kernels, the separate mixed-quant engine (an early copy of this
+one), the pip packaging, and the benchmarks for those. Sampled drafts verified by rejection (open-jet #21) were
+already here (policy `h1`).
+
 It also stands on [llama.cpp](https://github.com/ggml-org/llama.cpp): its tokenizer (libllama), its image library
 (libmtmd: the fallback encoder and the reference tools), its GGUF quantization formats, whose dequantization the
 kernels follow, and its prompt layout for images and video. The model files and the default sampling settings are
