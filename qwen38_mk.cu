@@ -185,11 +185,6 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_K6_LD
 #define MK_K6_LD 1
 #endif
-// MK_K6_S (stock2 K6): K-split ways of the Q8_0 k / v tiles in attn_proj_wv when MK_K6 has bit 1 (not bitwise vs the
-// unsplit tile: the parts are summed in order 0 .. S - 1 by the last arrival; the same for every T)
-#ifndef MK_K6_S
-#define MK_K6_S 2
-#endif
 #ifndef MK_K6_DEF // MK_K6's default (env overrides)
 #define MK_K6_DEF 4
 #endif
@@ -442,9 +437,9 @@ struct Bufs {
     // stockfix runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
     int k1;          // K1, MK_K1 (default 1): dn_proj_wv deals the alpha / beta items to the warps without a qkv / z tile
     int k2;          // K2, MK_K2 (default 1): resid_wv's last-arrival combine issues MK_K2_TB tokens' partial loads together
-    // stock2: K6 (MK_K6, bits; attn_proj_wv's dealing, uniform per launch): 1 K-split the Q8_0 k / v tiles MK_K6_S ways
-    // (NOT bitwise), 2 deal the phase's items across the blocks (item i -> block i % G) instead of in contiguous runs, 4 split
-    // each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT; takes precedence over 1)
+    // stock2: K6 (MK_K6, bits; attn_proj_wv's dealing, uniform per launch): 2 deal the phase's items across the blocks (item
+    // i -> block i % G) instead of in contiguous runs, 4 split each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT).
+    // (Bit 1, a K-split of those tiles, is gone: no gain, not bitwise; the host refuses it.)
     int k6;
     int * err; // mapped host words, set only on failure: [0] no finite main logit / invalid token, [1] MTP catch-up out of range
 #if MK_EGRESS
@@ -8203,15 +8198,15 @@ struct MKEngine::Impl {
         hb.k1 = !(getenv("MK_K1") && atoi(getenv("MK_K1")) == 0);
         hb.k2 = !(getenv("MK_K2") && atoi(getenv("MK_K2")) == 0);
         fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), gsync form %d\n", hb.k1, hb.k2, MK_K2_TB, MK_GSYNC);
-        // stock2 switches (notes/agent_stock2.md): K6 MK_K6 (bits: 1 K-split of the Q8_0 k / v tiles, NOT bitwise; 2 dealing
-        // across blocks, exact; 4 8-row halves of the Q8_0 k / v tiles, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second
-        // stream, 2 pk_norm_quant reads x once,
+        // stock2 switches (notes/agent_stock2.md): K6 MK_K6 (bits: 2 dealing across blocks, exact; 4 8-row halves of the Q8_0
+        // k / v tiles, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second stream, 2 pk_norm_quant reads x once,
         // 4 pk_dn_prep MK_K8_NT tokens per block); compile-time K7 (state layout), K6_LD (Q8_0 tile loads)
         hb.k6 = getenv("MK_K6") ? atoi(getenv("MK_K6")) : MK_K6_DEF;
+        if (hb.k6 & 1)
+            throw std::runtime_error("MK_K6=" + std::to_string(hb.k6) + ": bit 1 (the K-split of the Q8_0 k / v tiles) was removed; bits 2 and 4 remain (default 4)");
         k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
         if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
-        fprintf(stderr, "[mk] stock2: K6 %d (split %d, ld %d), K7 state layout %d, K8 %d (nt %d)\n", hb.k6, MK_K6_S, MK_K6_LD, MK_K7, k8,
-                k8_nt);
+        fprintf(stderr, "[mk] stock2: K6 %d (ld %d), K7 state layout %d, K8 %d (nt %d)\n", hb.k6, MK_K6_LD, MK_K7, k8, k8_nt);
 #if MK_K5
         fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order (MK_K5=1)\n");
 #endif
@@ -10634,7 +10629,7 @@ struct MKEngine::Impl {
 #if MK_PAR_WIDE
         {
             // the RMAX-row pass (wv.cuh "batched passes wider than MAXT rows") runs every main matrix but ffn_gate / ffn_up in
-            // the wv layout, K6 without its K parts (bit 1 alone), and one item per warp in every weight phase
+            // the wv layout, and one item per warp in every weight phase
             std::string why;
             for (int L = 0; L < NL && why.empty(); L++) {
                 const LayerW & W = hw.L[L];
@@ -10642,7 +10637,6 @@ struct MKEngine::Impl {
                 if (!W.attn && !W.sout.fm) why = "a delta-net ssm_out matrix of a type outside the wv layout";
                 if (!W.fd.fm) why = "an ffn_down matrix outside the wv layout";
             }
-            if (why.empty() && (hb.k6 & 1) && !(hb.k6 & 4)) why = "MK_K6 K parts (bit 1 without bit 4)";
             const int G = nsm / WV_S;
             if (why.empty() && ((D / 16 + G - 1) / std::max(G, 1) > NW || (FF / 16 / WV_S + G - 1) / std::max(G, 1) > NW ||
                                 (QKV / 16 + VD / 16 + nsm - 1) / nsm > NW || QG / 16 + 4 * (KVD / 16) > nsm * NW))
