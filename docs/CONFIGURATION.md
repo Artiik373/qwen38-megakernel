@@ -66,6 +66,7 @@ on when the vision projector is found. These are the settings worth knowing:
 | Parked conversations | `MK_PARK_MIB` | `--park-mib` | 8192 MiB of host memory | less RAM to spare, or more conversations to keep |
 | Side requests | `MK_SIDE_MAX` | `--side-max` | 8192 tokens | 0 turns them off (benchmarks of from-scratch prefill) |
 | Smallest parked conversation | (not passed) | `--park-min` | 1024 tokens | 4096 halved the real evictions in a replay of recorded client sessions (2026-10-21) |
+| Several agents at once | `MK_AGENTS` (with context `0`) | `--agents N` | off | serve up to 4 requests at once, each in a slot of its own context ([SERVER.md](SERVER.md#several-agents-at-once---agents)) |
 | Prefill chunk | `MK_PF_CAP` | (engine) | 2048; the launchers set 1024 above 96k context, `serve.bat` 512 above 240k with your own `MK_KV` | 1024 frees ~0.34 GB of VRAM (2026-10-11) |
 | Thinking off by default | `MK_CHAT_TEMPLATE_KWARGS` | `--chat-template-kwargs` | thinking on | `{"enable_thinking": false}` |
 | Python | `MK_PYTHON` | - | `python3` (Windows: `python`) | a virtual environment with jinja2 |
@@ -269,13 +270,15 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--port` | - | `18080` (launchers 8080) | listen port; a port in use ends the server before the model loads | - | upstream (4d92fd2) |
 | `--allow-host NAME` | `MK_ALLOW_HOSTS` | none | host names clients may use besides localhost, IP addresses and `--host`'s (repeatable or comma-separated; `*` = any name, which turns the DNS-rebinding check off); other names get a 403 | - | 5aab531, 2026-10-19 |
 | `--cors-origin`, `--cors-origins ORIGIN` | `MK_CORS_ORIGINS` | none | web origins (`scheme://host[:port]`) whose pages may call the server (CORS headers, preflights; `*` is refused); pages of other origins get a 403. Clients that are not web pages send no Origin and are not affected | - | 5aab531, 2026-10-19 |
-| `-c`, `--ctx` | - | `32768` (launchers 120000) | context in tokens (the model's full context is 262,144) | - | upstream (4d92fd2) |
+| `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens (the model's full context is 262,144); with `--agents` each slot's, 0 = the most that fits | - | upstream (4d92fd2) |
 | `-d`, `--draft` | - | `4` (launchers 7) | MTP drafts per cycle: 0-7 with the served build, 0-4 with the lean build; more than 4 needs the q8_0 cache | drafts only | upstream (4d92fd2) |
 | `--draft-vocab` | - | `draft_vocab_32k.bin` in the repo | the draft head's vocabulary (the 32k most frequent tokens; tokens of the current conversation are added) | drafts only | upstream (4d92fd2) |
 | `--mtp FILE` | `MK_MTP` (engine) | the model file's MTP layer | the MTP draft layer from another GGUF of the same model (checked against it) | drafts only | f334fd0, 2026-10-18 |
 | `--no-mtp` | `MK_NO_MTP=1` (engine) | off | no MTP layer: plain decoding at depth 0, no MTP weights or KV slot | drafts only | f334fd0, 2026-10-18 |
 | `--lib` | - | `libqwen38mk.so` / `qwen38mk.dll` in the repo root | the engine library | - | upstream (4d92fd2) |
-| `--kv` | - | `auto` (launchers `q8`) | KV cache format: `f16`, `q8` (q8_0), `auto` (q8_0 when fp16 does not fit next to ~1.5 GB of working memory, or when `MK_KV` is set) | changes (f16 vs q8_0) | upstream (4d92fd2) |
+| `--kv` | - | `auto` (launchers `q8`) | KV cache format: `f16`, `q8` (q8_0), `auto` (q8_0 when fp16 does not fit next to ~1.5 GB of working memory, or when `MK_KV` is set; with `--agents` q8_0, which the slots need) | changes (f16 vs q8_0) | upstream (4d92fd2) |
+| `--agents N` | `MK_AGENTS` | `0`: one request at a time | up to N requests (1-4) at once, each in a parallel slot of the engine with its own context (`-c`), decoded together in one batched launch per cycle; images, video and the presence / frequency penalties get a 400, side requests, parking and pinned checkpoints are off ([SERVER.md](SERVER.md#several-agents-at-once---agents)) | greedy: the reply alone, bit for bit (a prompt fed in chunks beside other slots: see `MK_PF_MIX`); sampled: the same distribution, not the same tokens beside other requests | 1afc37c, 2026-10-28 |
+| `--parallel N`, `-np N` | - | `0` | `--agents N` with `-c` defaulting to 32,768 per slot (llama-server's and open-jet's option) | as `--agents` | ea282eb, 2026-10-28 |
 | `--ck-every N` | - | `4096` | a DeltaNet checkpoint every N prompt tokens (0: off); the pool has `MK_CK_SLOTS` slots | same with exact reuse | 045e47b, 2026-10-12 |
 | `--ck-msgs` | - | `1` | a checkpoint at each message start (1 / 0) | same with exact reuse | 045e47b, 2026-10-12 |
 | `--ck-pin` | - | `1` | pin the checkpoint at the end of the system message (and where new sessions left the cached one) against eviction, and park it with the conversation: a client's new session resumes after its system prompt and tools | same with exact reuse | 4eb7b51, 2026-10-21 |
@@ -317,11 +320,16 @@ Read by the server only (there is no option for them):
 | `MK_MAX_BODY_MB` | `128` | largest request body in MB, Content-Length or chunked; larger ones get a 413 | 5a61fb6, 2026-10-17 |
 | `MK_MAX_IMAGES` | `32` | images per request; more get a 400 | 87ab132, 2026-10-17 |
 | `MK_MAX_VIDEO_FRAMES` | `256` | video frames per request, all of its videos (64 s at 4 fps) | 1ffaa76, 2026-10-18 |
+| `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed in each decode cycle's pass beside the decoding slots (`mk_slots_step_mixed`), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. Until the engine feeds a prefill call's rows all as batched rows, a prompt fed in chunks can get another reply than alone | 1afc37c, 2026-10-28 |
+| `MK_PF_CHUNK` | `512` | `--agents` with `MK_PF_MIX=0`: prompt tokens fed between two decode cycles (`0`: the whole prompt, the other slots wait) | 1afc37c, 2026-10-28 |
+| `MK_PF_SOLO` | `0` | `--agents`: prompt tokens fed per call while no slot decodes (`0`: the whole prompt; equal to `MK_PF_MIX`: a prompt is fed in the same chunks alone as beside other slots) | 1afc37c, 2026-10-28 |
 | `MK_IMAGE_MAX_PIXELS` | `100000000` | largest image or video frame in pixels, checked from the file header before decoding; also read by the vision library. The server reads it only with `--mmproj` | 8f24df3, 2026-10-17 |
 
-These four must be positive integers: `0` or text ends the server at startup with a message. `MK_SIDE_MAX` and
-`MK_PARK_MIB` accept `0` (off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and reports
-`MK_CK_SLOTS` in `/props`. llama-server's `LLAMA_ARG_*` variables are not read.
+`MK_MAX_BODY_MB`, `MK_MAX_IMAGES`, `MK_MAX_VIDEO_FRAMES` and `MK_IMAGE_MAX_PIXELS` must be positive integers, the three
+`MK_PF_*` integers >= 0: anything else ends the server at startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB` and
+`MK_AGENTS` accept `0` (off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and with
+`--agents` sets `MK_EXACT=1` and `MK_PF_CAP=1024` unless they are set; it reports `MK_CK_SLOTS` in `/props`.
+llama-server's `LLAMA_ARG_*` variables are not read.
 
 ## Engine environment variables
 
@@ -341,7 +349,7 @@ on (even `0`). The measurement and test switches are in [their own section](#mea
 
 | Variable | Default | What it does | Output | Status | Since |
 |---|---|---|---|---|---|
-| `MK_EXACT` | `0`; the server sets `1` with `--exact-reuse` | exact reuse: every prefill row comes out the same however the sequence was cut into prefill calls and chunks (prefill attention over absolute key segments, checkpoints on the absolute 32-token grid, window rings saved with each checkpoint). The server then restores the last checkpoint at or before the point where a prompt diverges and prefills from there instead of appending to the reply's decoded rows. Cost (2026-10-14, 026ee53): a 98k prefill from scratch +1.3%; a follow-up turn re-reads the previous reply (11.6k chat: 167 instead of 78 ms); edits cost the same | reuse = fresh, bit for bit; the prefill arithmetic differs from `0` (KL within noise: 98.662% / 0.00118 vs 98.654% / 0.00116, 2026-10-14) | served | 0f08767, 2026-10-13 |
+| `MK_EXACT` | `0`; the server sets `1` with `--exact-reuse`, and with `--agents` unless set | exact reuse: every prefill row comes out the same however the sequence was cut into prefill calls and chunks (prefill attention over absolute key segments, checkpoints on the absolute 32-token grid, window rings saved with each checkpoint). The server then restores the last checkpoint at or before the point where a prompt diverges and prefills from there instead of appending to the reply's decoded rows. Cost (2026-10-14, 026ee53): a 98k prefill from scratch +1.3%; a follow-up turn re-reads the previous reply (11.6k chat: 167 instead of 78 ms); edits cost the same | reuse = fresh, bit for bit; the prefill arithmetic differs from `0` (KL within noise: 98.662% / 0.00118 vs 98.654% / 0.00116, 2026-10-14) | served | 0f08767, 2026-10-13 |
 | `MK_EXACT_SEG` | `4096` | exact mode: positions per absolute key segment of the prefill attention (rounded down to a multiple of 32). Against 8192 on a 98k prompt: the same time from scratch, faster for a restore plus 32 tokens (2026-10-14) | changes (another fold order); reuse stays exact at any value | option | 767228f, 2026-10-14 |
 | `MK_EXACT_SPLIT` | `1` | exact mode: the last wave of attention work is split into segment units to balance the GPU; `0`: whole items only | same (every split gives the same rows) | option | 1673842, 2026-10-14 |
 | `MK_CK_SLOTS` | `8`; the CLI keeps 1 unless set | DeltaNet checkpoint slots in pinned host memory (1-64; ~0.17 GB each, 2026-10-12). Pinned checkpoints (`--ck-pin`) take slots from this pool | same with exact reuse | served | 5918f4e, 2026-10-12 |
@@ -410,6 +418,13 @@ These switch single decode kernels back to an earlier form, for A/B measurements
 | `MK_K1` | `1` | `0`: DeltaNet input projection deals its alpha / beta work the earlier way | same | earlier path | e374f27, 2026-10-15 |
 | `MK_K2` | `1` | `0`: the split-K residual combine loads its partial sums token by token (K1 + K2 together: decode +0.98..+1.58%, 2026-10-15) | same | earlier path | e374f27, 2026-10-15 |
 | `MK_K6` | `4` | Q8_0 k / v tiles of the attention projection, bits: `4` each tile as two 8-row items (88.5 to 78.0 us per call); `2` items spread over blocks (projection faster, attention slower); `1` K-split of the tiles (no gain; KL 0.00115 vs 0.00119) (2026-10-15) | same; bit 1 changes | served (`4`) | 38d0c26, 2026-10-15 |
+
+### Parallel slots (`--agents`)
+
+| Variable | Default | What it does | Output | Status | Since |
+|---|---|---|---|---|---|
+| `MK_SLOT_RESERVE_MIB` | `1536` | device memory left free when the slots take the most context that fits (`-c 0`), for the prefill and the runtime | - | option | 3c2dc48, 2026-10-28 |
+| `MK_SLOT_CK` | `2` | DeltaNet checkpoints per slot (where a slot's next prompt resumes when it diverges inside the slot's sequence) | same with exact reuse | option | 3c2dc48, 2026-10-28 |
 
 ### Memory and host store
 

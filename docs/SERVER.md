@@ -3,8 +3,9 @@
 `server/mk_server.py` puts the engine behind an HTTP server that speaks three APIs: OpenAI chat completions, the
 Anthropic Messages API and the OpenAI Responses API, plus llama-server's own endpoints. Coding agents, chat UIs and the
 official SDKs talk to it as they would to llama-server or a hosted model; [CLIENTS.md](CLIENTS.md) has tested settings
-for 11 of them. It serves one model, runs one request at a time, and keeps whole conversations cached between requests:
-on the GPU, and in host memory when several conversations take turns.
+for 11 of them. It serves one model, runs one request at a time (or up to four at once with
+[`--agents`](#several-agents-at-once---agents)), and keeps whole conversations cached between requests: on the GPU, and
+in host memory when several conversations take turns.
 
 **The cache never changes an answer.** With exact reuse on (the launchers' default), a reply served from the cache is,
 bit for bit, the reply the same request gets on a freshly started server. That holds for a follow-up turn, an edited
@@ -16,6 +17,7 @@ Every option is listed with its default in [CONFIGURATION.md](CONFIGURATION.md);
 
 - [Running it](#running-it)
 - [The conversation cache](#the-conversation-cache)
+- [Several agents at once: `--agents`](#several-agents-at-once---agents)
 - [APIs and endpoints](#apis-and-endpoints)
 - [Request features](#request-features): streaming, tools, thinking, stop strings, sampling, templates, images, video
 - [Keep-warm](#keep-warm)
@@ -82,6 +84,7 @@ what they do.
 
 | topic | options (environment twin) |
 |---|---|
+| several agents at once | `--agents N` [0] (`MK_AGENTS`), `--parallel N` / `-np N`: [several agents at once](#several-agents-at-once---agents) |
 | model and engine | `-m` / `--model` (required), `-c` / `--ctx` [32768], `-d` / `--draft` [4], `--kv auto\|f16\|q8` [auto], `--draft-vocab` [draft_vocab_32k.bin], `--mtp FILE` (`MK_MTP`), `--no-mtp` (`MK_NO_MTP=1`), `--lib` |
 | network | `--host` [127.0.0.1], `--port` [18080], `--allow-host NAME` (`MK_ALLOW_HOSTS`), `--cors-origin ORIGIN` (`MK_CORS_ORIGINS`): [Security](#security) |
 | conversation cache | `--exact-reuse` (`MK_EXACT=1`), `--ck-every` [4096], `--ck-msgs` [1], `--ck-pin` [1], `--side-max` [8192] (`MK_SIDE_MAX`), `--park-mib` [8192] (`MK_PARK_MIB`), `--park-min` [1024], `--park-cks` [2]: [the conversation cache](#the-conversation-cache) |
@@ -397,6 +400,92 @@ fewer of them (Claude Code's sequence: 4 conversations instead of 6, and two req
 
 An engine library built before a feature existed turns it off by itself, with a console line that says to rebuild.
 
+## Several agents at once: `--agents`
+
+`--agents N` (env `MK_AGENTS`) serves up to N requests at once: several coding agents, or one agent's subagents, on one
+GPU. Each request runs in a parallel slot of the engine, a conversation with its own KV cache and recurrent state, and
+every slot that is decoding runs in the same engine cycle: one batched launch for all of them. Each agent gets fewer
+tokens per second than it would alone, all of them together far more. The engine has 4 slots (N = 1..4).
+
+```sh
+python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf -d 7 --agents 4   # 4 slots, the most context that fits
+python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf -d 7 -np 4 -c 16384   # 4 slots of 16,384 positions
+MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the launcher: context 0, the most that fits
+```
+
+`--parallel N` (`-np N`, llama-server's and open-jet's option) is `--agents N` with `-c` defaulting to 32,768 per slot.
+
+- **Context:** with `--agents`, `-c` is each slot's context, and its default is 0: the most that fits next to
+  `MK_SLOT_RESERVE_MIB` [1536] of working memory. On an RTX 3090 (24 GB), 2026-10-28:
+
+  | model | KV cache | `--agents 2` | `--agents 4` |
+  |---|---|---|---|
+  | Q4_K_M | q8_0 | 2 x 70,400 | 4 x 32,000 |
+  | Q4_K_M | preset D' | 2 x 91,520 | 4 x 39,680 |
+  | UD-Q4_K_XL | q8_0 | 2 x 65,280 | 4 x 29,440 |
+  | UD-Q4_K_XL | preset D' | 2 x 83,840 | 4 x 35,840 |
+
+  A prompt that does not fit its slot gets the usual 400. The KV cache is q8_0 (`--kv f16` is refused at startup); the
+  presets (`MK_KV`, `MK_KV_WIN`) apply to every slot.
+- **The same replies:** a greedy reply is the one the request gets when it runs alone on the server, bit for bit,
+  whatever runs beside it, its follow-up turns included, with one exception below. Each slot decodes as it decodes
+  alone, and `--agents` turns on `MK_EXACT` (unless it is set), so a prompt never reuses the rows a slot decoded (their
+  bits depend on how many drafts each cycle verified, which depends on the slots beside it): a follow-up that reaches
+  into its last reply resumes at a checkpoint inside its last prompt, as with
+  [exact reuse](#exact-and-how-it-is-checked). The exception: a prompt that arrives while other slots decode is fed in
+  chunks beside their cycles, and the engine computes the last row of every prefill call with the decode kernels, so its
+  rows differ from the same prompt fed in one go, and its reply can too (`MK_PF_SOLO=256` feeds a prompt that runs alone
+  in the same chunks). Sampled replies (temperature above 0 with a `seed`) are reproducible alone, and beside other
+  requests keep their distribution but not their tokens: speculative sampling's tokens depend on the draft schedule,
+  and a slot's drafts depend on how many slots share the cycle (an engine limitation). Measured on 2026-10-28 (Q4_K_M;
+  OpenAI chat and Anthropic Messages, streamed or not, with and without tools, 2 to 4 at once, an 8k-token prompt
+  arriving while three others decode, follow-up turns, a client that disconnects mid-stream, stop strings,
+  `max_tokens`): every greedy comparison was identical (45 of 45, also with UD-Q4_K_XL) and every sampled reply alone,
+  while 13 of the 15 sampled replies decoded beside others differed. A 1.6k-token prompt decoded to the end of a
+  2,048-position slot, beside three others: identical to alone when the alone run was fed in the same chunks
+  (`MK_PF_SOLO=256`), different when it was fed whole (the exception).
+- **Scheduling:** requests wait for a free slot in arrival order. A request takes the free slot whose cached sequence
+  shares the most with its prompt, less what that discards of the slot's last prompt: a conversation's next turn goes
+  back to its own slot, and a new conversation takes an empty slot before it evicts another one for the few template
+  tokens they share. While slots decode, a waiting prompt is fed 256 rows per cycle in the same pass as their step
+  (`MK_PF_MIX`; 0: `MK_PF_CHUNK` [512] tokens between the cycles, 0 = the whole prompt), so they keep decoding, slower,
+  while a long prompt is read; with no slot decoding, a prompt is fed whole (`MK_PF_SOLO`: tokens per call). A stop
+  string, `max_tokens`, `t_max_predict_ms` or a client that disconnects takes a request out of the next cycle; a client
+  that leaves while its request waits is dropped from the queue, and one that leaves while its prompt is fed in chunks
+  stops it at the next chunk.
+- **Refused or off:** image and video input and the presence / frequency penalties get a 400 that names `--agents`
+  (slot prompts are token ids; slots sample with temperature, top_p, top_k, min_p and seed), and `--mmproj` is ignored.
+  The single-conversation cache features are off: side requests, parked conversations, pinned checkpoints and the
+  `--ck-*` checkpoints (each slot keeps `MK_SLOT_CK` [2] checkpoints of its own). The keep-warm window starts when every
+  slot is idle. Prefill chunks are 1,024 tokens (`MK_PF_CAP`, unless set): more context for the slots.
+- **Monitoring:** each request's prompt line names its slot (`slot 2 (after 1.30 s in the queue)`); there is no status
+  line. `GET /slots` lists every slot with its state (`idle`, `prefill`, `decode`), its request, prompt, cached and
+  decoded tokens and the prompt tokens left (`?fail_on_no_slot=1`: 503 when a new request would wait). `/props` has
+  `total_slots` N and an `agents` block in `engine`; in `/metrics`, `requests_processing` counts the requests in slots,
+  `requests_deferred` those waiting for one, and `decode_cycles` the engine cycles of all slots together (drafts are not
+  counted per slot).
+
+### Speed with several agents
+
+Open-jet's `bench/parallel_bench.py` (unchanged) against this server and against open-jet's own server (f246ff0) running
+the same engine library: Q4_K_M, `--agents 4 -d 7`, one session on an RTX 3090 with open-jet's server first and last,
+2026-10-28. A total adds the four requests' decode rates (512 tokens each, temperature 0.6).
+
+| | open-jet's server | this server | this server, `MK_EXACT=0` | open-jet's server again |
+|---|---|---|---|---|
+| 4 short requests at once, total tok/s (2 runs) | 288 / 350 | 328 / 354 | 341 / 357 | 291 / 344 |
+| 4 requests with ~23k-token contexts, total tok/s | 286 | 305 | 302 | 304 |
+| a 20k-token prompt sent while another request decodes: its first token after | 15.7 s | 15.8 s | 15.8 s | 15.7 s |
+| the other request meanwhile | 11.5 tok/s | 12.9 tok/s | 12.8 tok/s | 10.6 tok/s |
+| 1 short request alone, tok/s (2 runs) | 193 / 184 | 190 / 201 | 185 / 205 | 163 / 187 |
+| 1 request with a ~23k-token context alone, tok/s | 161 | 203 | 158 | 173 |
+
+The decoding is the engine's either way, so the totals differ by run-to-run noise (one request alone with a long
+context varies most). Exact mode (`MK_EXACT=1`, the `--agents` default) costs nothing measurable here. Feeding a
+waiting prompt whole instead (`MK_PF_MIX=0 MK_PF_CHUNK=0`; another session that day, open-jet's server 15.7 s and
+11.5 / 10.7 tok/s there) got the 20k-token prompt's first token after 11.0 s, while the other request made 0.6 tok/s
+meanwhile.
+
 ## APIs and endpoints
 
 | route | what |
@@ -409,7 +498,7 @@ An engine library built before a feature existed turns it off by itself, with a 
 | `GET /health` (also `/v1/health`) | 503 `Loading model` until the model is loaded, then 200 `{"status": "ok"}` |
 | `GET /v1/models` (also `/models`) | the one model, with llama-server's `meta` (`n_ctx`, file size, `n_embd`) |
 | `GET /props` | llama-server's fields plus an `engine` block ([Monitoring](#monitoring)) |
-| `GET /slots` | one slot, `is_processing` (`?fail_on_no_slot=1`: 503 while busy) |
+| `GET /slots` | one slot, `is_processing` (`?fail_on_no_slot=1`: 503 while busy); with `--agents`, every slot and its state |
 | `GET /metrics` | Prometheus text, always on |
 
 The model is the GGUF the server loaded; its id in `/v1/models` is the file name. The `model` field of a request is
@@ -735,7 +824,8 @@ not logged.
 
 ### `/props`, `/slots`, `/v1/models`
 
-`GET /props` has llama-server's fields: `default_generation_settings` (`n_ctx`, the sampling defaults), `total_slots` 1,
+`GET /props` has llama-server's fields: `default_generation_settings` (`n_ctx`, the sampling defaults), `total_slots` 1
+(`--agents`: N),
 `model_alias`, `model_path`, `modalities` (vision, video, audio), `chat_template`, `build_info` (the commit and engine
 flags of the engine library, written by the Makefile and `build.ps1`; "unknown" for libraries built otherwise). Its
 `engine` block holds what the server knows for sure: context, the KV format asked for (`auto` is resolved inside the
@@ -880,6 +970,7 @@ C API (`capi.cpp`). Where each feature lives, for reading the code:
 | stopping a prefill | `mk_cancel` (a host flag read between prefill chunks, no device sync) | `MKEngine::cancel` |
 | the console's prefill progress | `mk_prefill_progress` (host counters per chunk, no device sync) | `MKEngine::prefill_progress` |
 | keep-warm | `mk_keep_warm` | `capi.cpp` |
+| `--agents` | `mk_slots_open2`, `mk_slot_begin2`, `mk_slot_prefill`, `mk_slots_step`, `mk_slots_step_mixed` (open-jet's slot API) | `MKEngine::slots_open`, the lanes and their batched launch |
 | `/props` `build_info` | `mk_build_info` (from `mk_build_info.h`, which the Makefile and `build.ps1` write) | - |
 | special-token text as text | `mk_tokenize2`, `mk_token_attr` | - |
 | the reuse probe | `mk_state_digest` | - |
