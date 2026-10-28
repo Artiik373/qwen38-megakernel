@@ -10450,7 +10450,9 @@ struct MKEngine::Impl {
     int live_view = 0;      // cView: view_full(live), or 0
     bool dv_frozen = false; // lanes open: the draft vocabulary stays the base list (shared by every sequence)
     bool par_wide = false;  // batched passes up to RMAX rows (MK_PAR_WIDE build, the model's matrices and the GPU allow them)
-    bool pf_no_end_save = false; // (slot_prefill's chunks before the last: no checkpoint at their end)
+    // slot_prefill's chunks before the prompt's last: every row in the batched prefill (no megakernel row, no output
+    // token, no checkpoint at the chunk's end), so in MK_EXACT mode the rows are those of the whole prompt's prefill
+    bool pf_mid = false;
     void lane_swap(Lane & l) {
         std::swap(ctx, l.ctx);
         std::swap(hb, l.hb);
@@ -11029,6 +11031,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
     const int s0 = (int) seq.size(), end = s0 + (int) tokens.size(); // this prompt's positions: s0 .. end - 1
     const char * mode = getenv("MK_PREFILL");
     const bool batched = !(mode && std::string(mode) == "mk");
+    const bool rows_only = p_->pf_mid && batched; // (returns -1: no output token)
     // Images, checked before anything changes. The spans after this prompt: the earlier ones before n0, then these.
     // An earlier span cut by n0 (a rewind to a checkpoint inside it) must come again (same position and grid): its rows
     // from n0 on are fed from it.
@@ -11140,16 +11143,16 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
     size_t i = 0;
     bool end_save = !p_->exact; // a checkpoint at the end of the prompt, unless ck_exact is inside the batched part
     { // prefill_progress: this call's batched part (an empty range while it is set: total 0)
-        const int to = batched && feed.size() >= 2 ? n0 + (int) feed.size() - 1 : n0;
+        const int to = rows_only ? n0 + (int) feed.size() : batched && feed.size() >= 2 ? n0 + (int) feed.size() - 1 : n0;
         p_->pf_to.store(n0);
         p_->pf_from.store(n0);
         p_->pf_pos.store(n0);
         p_->pf_to.store(to);
     }
-    if (batched && feed.size() >= 2) {
+    if (batched && (feed.size() >= 2 || rows_only)) {
         // all but the last token in batched kernels; the last one goes through the megakernel,
-        // which produces the first output token and the MTP drafts
-        const std::vector<int> head(feed.begin(), feed.end() - 1);
+        // which produces the first output token and the MTP drafts (rows_only: every token in batched kernels)
+        const std::vector<int> head(feed.begin(), feed.end() - (rows_only ? 0 : 1));
         const int hend = n0 + (int) head.size(); // the batched part: positions n0 .. hend - 1
         end_save = !p_->exact && !(ck_exact > n0 && ck_exact < hend); // (MK_EXACT: no megakernel state in checkpoints)
         // post-prefill state file (prefill_state): the batched part's result restored from the file, or computed and saved
@@ -11212,6 +11215,12 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         c.dn_c = hend;
         c.mtp_valid = c.dn_c;
     }
+    if (rows_only) { // (the next chunk continues from here: its prefill reads the control block back)
+        c.n = c.dn_c;
+        CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
+        CK(cudaGetLastError());
+        return -1;
+    }
     while (i < feed.size()) {
         const int T = att_cap_T(c.dn_c, (int) std::min<size_t>(MAXT_PF, feed.size() - i));
         const bool last = i + T == feed.size();
@@ -11230,7 +11239,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
 #if MK_SPEC_LOG
     p_->slog_drafts();
 #endif
-    if (end_save && !p_->pf_no_end_save && p_->ck_find(c.dn_c) < 0) {
+    if (end_save && !p_->pf_mid && p_->ck_find(c.dn_c) < 0) {
         const int si = p_->ck_assign({c.dn_c}, c.dn_c, c.dn_c)[0];
         if (si >= 0) p_->ck_save_end(si);
     }
@@ -11688,14 +11697,13 @@ int MKEngine::slot_prefill(int slot, int budget) {
     if (L.pend.empty()) { // the prompt's last chunk: its first token, a checkpoint before the prompt's last token
         const int end = (int) I.seq.size() + (int) chunk.size();
         L.first = prefill(chunk, end - 1);
-    } else { // (the token a chunk's last row samples is not the reply's: dropped)
-        struct NoEnd {
+    } else { // a chunk before the last: batched rows only (with MK_PREFILL=mk its last row samples a token: dropped)
+        struct Mid {
             Impl * p;
-            ~NoEnd() { p->pf_no_end_save = false; }
-        } ne{p_};
-        I.pf_no_end_save = true;
-        prefill(chunk);
-        truncate((int) I.seq.size() - 1);
+            ~Mid() { p->pf_mid = false; }
+        } mid{p_};
+        I.pf_mid = true;
+        if (prefill(chunk) >= 0) truncate((int) I.seq.size() - 1);
     }
     return (int) L.pend.size();
 }
