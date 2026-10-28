@@ -137,8 +137,8 @@ any of:
 
 `token_embd` can be Q4_K, Q6_K or Q8_0: it stays in mapped pinned host memory (not in VRAM) as stored, and each lookup
 (the decode embed phase, the MTP block's input, the prefill embed kernels) stages the token's row and dequantizes it the
-way ggml does. `output` can be Q6_K or Q8_0 (Q8_0: ~0.3 GB more VRAM; lm_head and the draft head have an instance per
-type). Q8_0 `ssm_alpha` /
+way ggml does. `output` can be Q6_K or Q8_0 (Q8_0: ~0.3 GB more VRAM; lm_head and the draft head switch on the type
+around the row reader). Q8_0 `ssm_alpha` /
 `ssm_beta` (UD) stay int8 with their block scales and the kernels apply the norm weight on the fly; other types are
 dequantized to F32 at load and folded with the norm weight into fp32 rows (the same values; `MK_AB_F32=1` forces this
 path). The exact re-encodes keep every weight's value (both formats store a small integer times the same fp16 `d` and an

@@ -4289,10 +4289,11 @@ constexpr int DQ4_RB = D / 256 * 144; // MK_DRAFT_Q4: bytes of one Q4_K lm_head 
 __device__ __forceinline__ float pen_logit(float a, float sc, int c, float pres, float freq) {
     return __fsub_rn(__fsub_rn(__fmul_rn(a, sc), __fmul_rn(freq, (float) c)), c > 0 ? pres : 0.f);
 }
-// HT: lm_head's type (output.weight: Q6_K, or Q8_0 in some fine-tunes); lm_head<...> below picks the instance.
-template <int TL, bool TOPK, bool FULL, bool LSE, int HT>
-__device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 * cand, bool pen, float pres, float freq,
-                                       int nx0) {
+// output.weight is Q6_K, or Q8_0 in some fine-tunes: one function per variant reads either, the type switch around the
+// row reader only (the two readers are exclusive branches: the loop needs the registers of one, not of both).
+template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false>
+__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr,
+                                     bool pen = false, float pres = 0.f, float freq = 0.f, int nx0 = 0) {
     static_assert(!LSE || TL == 1, "LSE: one row");
     if constexpr (FULL) pen = false; // no penalty when scoring (the FULL instances keep no penalty code)
     uint8_t * const sm = smem;
@@ -4311,6 +4312,7 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
     }
     float lm_m = -INFINITY, lm_s = 0.f; // LSE: running max / sum of exp (warp-uniform)
     const Mat head = draft ? cW.head_d : cW.head;
+    const bool q8 = cW.head.type == T_Q8_0; // (head_d: a row subset of head, the same type)
     // MK_DRAFT_Q4 (draft head only: its calls are the LSE ones): rows [0, nq4) from the Q4_K copy cW.dq4
     int nq4 = 0;
     if constexpr (LSE) nq4 = draft ? cW.dq4_n : 0;
@@ -4325,7 +4327,7 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
         int p0, p1; // token ids of the rows
         {
             const uint8_t * rp[2];
-            const __half * dp[2]; // Q6_K: the rows' scale (meta) streams
+            const __half * dp[2]; // the rows' scale streams (Q6_K: meta, Q8_0: d)
             p0 = ids ? __ldg(ids + r) : r;
             p1 = ids ? __ldg(ids + r + 1) : r + 1;
             if (LSE && r < nq4) { // (rows come in pairs and nq4 is even)
@@ -4337,7 +4339,8 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
                 rp[1] = head.w + (size_t) p1 * head.rb;
                 dp[0] = head.d + (size_t) p0 * head.nd;
                 dp[1] = head.d + (size_t) p1 * head.nd;
-                rows_t<TL, 5, 2, HT>(rp, dp, sx, a);
+                if (q8) rows_t<TL, 5, 2, T_Q8_0>(rp, dp, sx, a);
+                else rows_t<TL, 5, 2, T_Q6K>(rp, dp, sx, a);
             }
         }
         wsum_acc<TL, 2>(a);
@@ -4509,14 +4512,6 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
     if (tid == 0) *cB.cnt = 0;
     __syncthreads();
     return true;
-}
-// lm_head on the file's output.weight type: a thin out-of-line wrapper, so the callers (mk_cycle, mtp_pass) are unchanged
-// and each type's body is its own function (both bodies inline in one function would raise register pressure)
-template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false>
-__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr,
-                                     bool pen = false, float pres = 0.f, float freq = 0.f, int nx0 = 0) {
-    if (cW.head.type == T_Q8_0) return lm_head_t<TL, TOPK, FULL, LSE, T_Q8_0>(t0, draft, s_tok, cand, pen, pres, freq, nx0);
-    return lm_head_t<TL, TOPK, FULL, LSE, T_Q6K>(t0, draft, s_tok, cand, pen, pres, freq, nx0);
 }
 
 // ---- sampling (single thread) ----
@@ -7963,7 +7958,7 @@ struct MKEngine::Impl {
 #endif
         hw.onorm = up_f32("output_norm.weight", D);
         hw.head = up_mat("output.weight", D, VOCAB);
-        // Q8_0: lm_head_t<.., T_Q8_0> (some fine-tunes; ~0.3 GB more than Q6_K)
+        // Q8_0: some fine-tunes (~0.3 GB more than Q6_K); lm_head reads either type
         if (hw.head.type != T_Q6K && hw.head.type != T_Q8_0)
             throw std::runtime_error("output.weight is " + tname(hw.head.type) + ", the kernel needs Q6_K or Q8_0 (see README: the GGUF)");
         mem_mark("weights: eh, norms, lm_head");
