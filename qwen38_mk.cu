@@ -239,6 +239,15 @@ constexpr int NH = 24, NKV = 4, HD = 256;
 constexpr int NKH = 16, NVH = 48, HK = 128;
 constexpr int QKV = 10240, VD = 6144, QG = 12288, KVD = 1024;
 constexpr int MAXT = MK_MAXT;
+// batched launches (parallel slots) wider than a solo pass: RMAX rows over the lanes, the wv phases in K sub-chunk fills
+// (wv.cuh "batched passes wider than MAXT rows"); the row buffers hold RMAX rows
+#ifndef MK_PAR_RMAX
+// (16, 2026-10-28: 16-row passes beat 24-row ones at 3-4 lanes, temp 0.6 n=4 345 vs 322 tok/s, n=3 292 vs 274)
+#define MK_PAR_RMAX 16
+#endif
+#define MK_PAR_WIDE (MK_MAXT > 5 && MK_EGRESS && MK_WV && !MK_WV_OUT && MK_PAR_RMAX > MK_MAXT)
+constexpr int RMAX = MK_PAR_WIDE ? MK_PAR_RMAX : MAXT;
+static_assert(RMAX % 8 == 0 && RMAX <= 32, "RMAX: whole 8-row lm_head passes, store_lane_t's 32 lanes");
 constexpr int MAXT_PF = 5; // rows of prefill-mode and scoring launches (T >= 6 runs only as a decode verify pass)
 constexpr int NT = 512, NW = NT / 32;
 constexpr float EPS = 1e-6f;
@@ -438,7 +447,28 @@ struct Bufs {
 };
 
 __constant__ ModelW cW;
-__constant__ Bufs cB;
+// Buffer views: device code reads cB = view s_view of its block (MK_VIEW_INIT at every kernel's entry copies cView).
+// View 0: the engine's own sequence (solo launches, prefill), also the shared row buffers of a batched launch. Lanes
+// (MKEngine::slots_open) k = 0 .. MK_NSEQ - 1: view 1 + k = lane k's MAIN view in a batched launch (the row buffers
+// start at the lane's first row of the pass: uploaded per launch), view 1 + MK_NSEQ + k = its FULL view (row buffers from
+// row 0: prefill and solo launches of the lane, its MTP passes and control inside a batched launch).
+#ifndef MK_NSEQ
+#define MK_NSEQ 4
+#endif
+constexpr int NSEQ = MK_NSEQ;
+constexpr int NVIEW = 1 + 3 * NSEQ;
+__host__ __device__ constexpr int view_main(int k) { return 1 + k; }
+__host__ __device__ constexpr int view_full(int k) { return 1 + NSEQ + k; }
+__host__ __device__ constexpr int view_mtp(int k) { return 1 + 2 * NSEQ + k; } // (lane k's full view, row buffers at row k)
+__constant__ Bufs cBs[NVIEW];
+__constant__ int cView;
+__shared__ int s_view;
+#define cB cBs[s_view]
+#define MK_VIEW_INIT()                          \
+    do {                                        \
+        if (threadIdx.x == 0) s_view = cView;   \
+        __syncthreads();                        \
+    } while (0)
 
 struct Launch {
     int mode, T, last, ndraft;
@@ -463,8 +493,43 @@ struct Launch {
 #if MK_MAXT > 5
     int spec_blk; // sampled drafts: block verification of the verify rows (policy blk=1, sample_targets_blk)
 #endif
+    // batched launch (MKEngine::slots_step; 0: a solo launch): nl lanes, lane i = ln[i].lane (views view_main / view_full)
+    // with its rows r0 .. r0 + T - 1 of the pass (Launch::T = the pass's rows, at least their sum), the drafts its MTP
+    // passes produce for the next launch, and its sampling
+    int nl;
+    int mtpb; // batched launch: the lanes' MTP passes shared (mtp_batch; 0: one lane after the other, mtp_tail)
+    struct Lane {
+        int lane, T, r0, nd, top_k, spec_smp;
+        float temp, top_p, min_p;
+        unsigned long long seed;
+    } ln[NSEQ];
 };
 constexpr int TOPK_MAX = 32; // candidates kept per main lm_head row when sampling
+// the rows of a batched launch's lanes (Launch::ln without the sampling): row t belongs to lane i when
+// r0[i] <= t < r0[i] + T[i]; rows past the lanes (padding of the pass) belong to none
+struct RowTab {
+    int nl;
+    signed char lane[NSEQ], T[NSEQ], r0[NSEQ];
+};
+
+// lane i of a batched launch as a solo decode launch of its own (its rows, drafts and sampling)
+__device__ __forceinline__ Launch lane_launch(const Launch & P, int i) {
+    Launch Q = P;
+    const Launch::Lane & l = P.ln[i];
+    Q.T = l.T;
+    Q.ndraft = l.nd;
+    Q.top_k = l.top_k;
+    Q.spec_smp = l.spec_smp;
+    Q.temp = l.temp;
+    Q.top_p = l.top_p;
+    Q.min_p = l.min_p;
+    Q.seed = l.seed;
+#if MK_MAXT > 5
+    Q.spec_blk = P.spec_blk && l.spec_smp;
+#endif
+    Q.nl = 0;
+    return Q;
+}
 
 // ------------------------------------------------------------------------------------------
 // small device helpers
@@ -1429,13 +1494,46 @@ __device__ __forceinline__ void stage_embd_part(int tok, int b0, int nbytes, uin
         reinterpret_cast<uint4 *>(dst)[threadIdx.x] = reinterpret_cast<const uint4 *>(cW.embd + (size_t) tok * EMBD_RB + b0)[threadIdx.x];
     __syncthreads();
 }
-template <int T>
-__device__ __noinline__ void embed_prologue() {
+// BAT (batched launches): row t's token is its lane's ctl token t - r0 (rows past the lanes: token 0)
+template <int T, bool BAT = false>
+__device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
     constexpr int NB = U_D / EMB_UB; // blocks per row
+#if MK_PAR_WIDE
+    if constexpr (BAT && T > MAXT) { // (more items than blocks: each block takes items b, b + G, ...)
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        const float * w0 = cW.L[0].attn_norm;
+#pragma unroll 1
+        for (int it = blockIdx.x; it < T * NB; it += gridDim.x) {
+            const int t = it / NB, s = it - t * NB;
+            if (it != (int) blockIdx.x) __syncthreads(); // (the previous item's staged embedding is read)
+            int tok = 0;
+            for (int i = 0; i < rt.nl; i++)
+                if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) tok = ((volatile Ctl *) cBs[view_main(rt.lane[i])].ctl)->tok[t - rt.r0[i]];
+            const int j = EMB_UB * s + warp, e = 32 * j + lane;
+            float v;
+            if (cW.embd_t == T_Q4K) {
+                stage_embd_part(tok, 2 * s * 144, 2 * 144, smem);
+                v = dequant_q4k(smem, e - 512 * s);
+            } else {
+                v = embed_elem_other(tok, s, e);
+            }
+            cB.x[t * D + e] = v;
+            q32_store(cB.qn, t, j, v * w0[e], v * v, true);
+        }
+        return;
+    }
+#endif
     const int t = blockIdx.x / NB, s = blockIdx.x - t * NB;
     if (t >= T) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int tok = ((volatile Ctl *) cB.ctl)->tok[t];
+    int tok;
+    if constexpr (BAT) {
+        tok = 0;
+        for (int i = 0; i < rt.nl; i++)
+            if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) tok = ((volatile Ctl *) cBs[view_main(rt.lane[i])].ctl)->tok[t - rt.r0[i]];
+    } else {
+        tok = ((volatile Ctl *) cB.ctl)->tok[t];
+    }
     const float * w0 = cW.L[0].attn_norm;
     const int j = EMB_UB * s + warp, e = 32 * j + lane;
     float v;
@@ -1782,7 +1880,7 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
         }
 #pragma unroll
         for (int t = 0; t < T; t++) acc[t] = wsum(acc[t]) * s_rs[t];
-        store_lane_t<T>(cB.ab + ch * MAXT * 2 * NVH, 2 * NVH, row, acc);
+        store_lane_t<T>(cB.ab + ch * RMAX * 2 * NVH, 2 * NVH, row, acc);
     }
 #if MK_WV
     gemv_pairs_any<T, 5>(W.qkv, n_ab, n_ab + n_qkv, PairOut{conv, QKV, n});
@@ -1838,19 +1936,26 @@ __host__ __device__ __forceinline__ int dn_sidx(int col, int row) {
 
 // delta-net core: one block per value head (48 blocks).  conv1d+silu, l2-norm, gated delta
 // rule (with replay of pending accepted tokens), gated rms-norm, quantise for ssm_out.
-template <int T>
-__device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, int n_commit, uint8_t * /*sm*/) {
+// K5 (MK_K5 builds, solo launches): the head this block took at its dn_proj arrival (k5_arrive), the replay before the
+// barrier completes. K5 false: head hh (batched launches: one (lane, head) item after a grid barrier; hh < 0: blockIdx.x),
+// the same events in the same order (bit-identical).
+template <int T, bool K5 = (MK_K5 != 0)>
+__device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, int n_commit, uint8_t * /*sm*/, int hh = -1) {
     uint8_t * const sm = smem;
+    int h;
 #if MK_K5
-    const int h = s_k5h; // the head this block took at its dn_proj arrival (k5_arrive)
-    if (h < 0) {
-        k5_wait();
-        return;
-    }
-#else
-    const int h = blockIdx.x;
-    if (h >= NVH) return;
+    if constexpr (K5) {
+        h = s_k5h;
+        if (h < 0) {
+            k5_wait();
+            return;
+        }
+    } else
 #endif
+    {
+        h = hh >= 0 ? hh : (int) blockIdx.x;
+        if (h >= NVH) return;
+    }
     const int kh = h % NKH;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     // thread owns state column `col`, rows [32 r, 32 r + 32)  (S stored as [col][row])
@@ -1881,113 +1986,116 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     const float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
 
 #if MK_K5
-    // ---- K5 Pre (before the dn_proj barrier completes): the replayed events' inputs come from earlier launches (kvgb
-    // ring), so load them and run the replay now; the events' arithmetic and order are those of the single loop below ----
-    if (tid >= 448 && tid < 448 + np) {
-        const int e = tid - 448;
-        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
-        s_gb[2 * e] = __ldcg(slot + KVGB_G + h);
-        s_gb[2 * e + 1] = __ldcg(slot + KVGB_B + h);
-    }
-    for (int i = tid; i < np * 128; i += NT) { // replayed k / v
-        const int e = i >> 7, c = i & 127;
-        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
-        s_k[e * QS + (c >> 5) * 36 + (c & 31)] = __ldcg(slot + kh * 128 + c);
-        s_v[e * 128 + c] = __ldcg(slot + KVGB_V + h * 128 + c);
-    }
-    __syncthreads();
-    for (int e = 0; e < np; e++) { // (the commit event np + n_commit - 1 is never a replayed one)
-        const float g = s_gb[2 * e], beta = s_gb[2 * e + 1];
-        const float4 * kq = reinterpret_cast<const float4 *>(s_k + e * QS + r * 36);
-        float kv = 0.f;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const float4 k4 = kq[i];
-            kv += S[i].x * k4.x + S[i].y * k4.y + S[i].z * k4.z + S[i].w * k4.w;
+    if constexpr (K5) {
+        // ---- K5 Pre (before the dn_proj barrier completes): the replayed events' inputs come from earlier launches (kvgb
+        // ring), so load them and run the replay now; the events' arithmetic and order are those of the single loop below ----
+        if (tid >= 448 && tid < 448 + np) {
+            const int e = tid - 448;
+            const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
+            s_gb[2 * e] = __ldcg(slot + KVGB_G + h);
+            s_gb[2 * e + 1] = __ldcg(slot + KVGB_B + h);
         }
-        kv += __shfl_xor_sync(0xffffffffu, kv, 1);
-        kv += __shfl_xor_sync(0xffffffffu, kv, 2);
-        const float dlt = (s_v[e * 128 + col] - g * kv) * beta;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const float4 k4 = kq[i];
-            S[i].x = g * S[i].x + k4.x * dlt;
-            S[i].y = g * S[i].y + k4.y * dlt;
-            S[i].z = g * S[i].z + k4.z * dlt;
-            S[i].w = g * S[i].w + k4.w * dlt;
+        for (int i = tid; i < np * 128; i += NT) { // replayed k / v
+            const int e = i >> 7, c = i & 127;
+            const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
+            s_k[e * QS + (c >> 5) * 36 + (c & 31)] = __ldcg(slot + kh * 128 + c);
+            s_v[e * 128 + c] = __ldcg(slot + KVGB_V + h * 128 + c);
         }
-    }
-    k5_wait(); // every block's dn_proj outputs (conv rows n .. n + T - 1, z, alpha / beta partials) are visible from here
+        __syncthreads();
+        for (int e = 0; e < np; e++) { // (the commit event np + n_commit - 1 is never a replayed one)
+            const float g = s_gb[2 * e], beta = s_gb[2 * e + 1];
+            const float4 * kq = reinterpret_cast<const float4 *>(s_k + e * QS + r * 36);
+            float kv = 0.f;
+    #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float4 k4 = kq[i];
+                kv += S[i].x * k4.x + S[i].y * k4.y + S[i].z * k4.z + S[i].w * k4.w;
+            }
+            kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+            kv += __shfl_xor_sync(0xffffffffu, kv, 2);
+            const float dlt = (s_v[e * 128 + col] - g * kv) * beta;
+    #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float4 k4 = kq[i];
+                S[i].x = g * S[i].x + k4.x * dlt;
+                S[i].y = g * S[i].y + k4.y * dlt;
+                S[i].z = g * S[i].z + k4.z * dlt;
+                S[i].w = g * S[i].w + k4.w * dlt;
+            }
+        }
+        k5_wait(); // every block's dn_proj outputs (conv rows n .. n + T - 1, z, alpha / beta partials) are visible from here
 
-    // ---- K5 Post: the new tokens' inputs ----
-    if (tid < 384) {
-        const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? 2048 + kh * 128 + (tid - 128) : 4096 + h * 128 + (tid - 256));
-        const float4 w = *reinterpret_cast<const float4 *>(W.conv + ch * 4);
-        float raw[T + 3];
-#pragma unroll
-        for (int j = 0; j < T + 3; j++) {
-            const int p = n - 3 + j;
-            raw[j] = p >= 0 ? __ldcg(conv + (p % CONV_RING) * QKV + ch) : 0.f;
+        // ---- K5 Post: the new tokens' inputs ----
+        if (tid < 384) {
+            const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? 2048 + kh * 128 + (tid - 128) : 4096 + h * 128 + (tid - 256));
+            const float4 w = *reinterpret_cast<const float4 *>(W.conv + ch * 4);
+            float raw[T + 3];
+    #pragma unroll
+            for (int j = 0; j < T + 3; j++) {
+                const int p = n - 3 + j;
+                raw[j] = p >= 0 ? __ldcg(conv + (p % CONV_RING) * QKV + ch) : 0.f;
+            }
+    #pragma unroll
+            for (int t = 0; t < T; t++)
+                s_raw[t * 384 + tid] = silu(w.x * raw[t] + w.y * raw[t + 1] + w.z * raw[t + 2] + w.w * raw[t + 3]);
+        } else if (tid < 384 + T) {
+            const int t = tid - 384;
+            float al = 0.f, be = 0.f;
+    #pragma unroll
+            for (int c = 0; c < AB_SPLIT; c++) {
+                al += __ldcg(cB.ab + (c * RMAX + t) * 2 * NVH + h);
+                be += __ldcg(cB.ab + (c * RMAX + t) * 2 * NVH + NVH + h);
+            }
+            float sp = al + W.dt[h];
+            sp = sp > 20.0f ? sp : logf(1.0f + expf(sp));
+            s_gb[2 * (np + t)] = expf(sp * W.A[h]);
+            s_gb[2 * (np + t) + 1] = 1.0f / (1.0f + expf(-be));
         }
-#pragma unroll
-        for (int t = 0; t < T; t++)
-            s_raw[t * 384 + tid] = silu(w.x * raw[t] + w.y * raw[t + 1] + w.z * raw[t + 2] + w.w * raw[t + 3]);
-    } else if (tid < 384 + T) {
-        const int t = tid - 384;
-        float al = 0.f, be = 0.f;
-#pragma unroll
-        for (int c = 0; c < AB_SPLIT; c++) {
-            al += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH + h);
-            be += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH + NVH + h);
-        }
-        float sp = al + W.dt[h];
-        sp = sp > 20.0f ? sp : logf(1.0f + expf(sp));
-        s_gb[2 * (np + t)] = expf(sp * W.A[h]);
-        s_gb[2 * (np + t) + 1] = 1.0f / (1.0f + expf(-be));
-    }
-    for (int i = tid; i < T * 128; i += NT) s_z[i] = __ldcg(cB.z + (i >> 7) * VD + h * 128 + (i & 127));
-    __syncthreads();
-#else
-    // ---- prologue: every input of every event, one round of loads ----
-    if (tid < 384) {
-        const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? 2048 + kh * 128 + (tid - 128) : 4096 + h * 128 + (tid - 256));
-        const float4 w = *reinterpret_cast<const float4 *>(W.conv + ch * 4);
-        float raw[T + 3];
-#pragma unroll
-        for (int j = 0; j < T + 3; j++) {
-            const int p = n - 3 + j;
-            raw[j] = p >= 0 ? __ldcg(conv + (p % CONV_RING) * QKV + ch) : 0.f;
-        }
-#pragma unroll
-        for (int t = 0; t < T; t++)
-            s_raw[t * 384 + tid] = silu(w.x * raw[t] + w.y * raw[t + 1] + w.z * raw[t + 2] + w.w * raw[t + 3]);
-    } else if (tid < 384 + T) {
-        const int t = tid - 384;
-        float al = 0.f, be = 0.f;
-#pragma unroll
-        for (int c = 0; c < AB_SPLIT; c++) {
-            al += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH + h);
-            be += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH + NVH + h);
-        }
-        float sp = al + W.dt[h];
-        sp = sp > 20.0f ? sp : logf(1.0f + expf(sp));
-        s_gb[2 * (np + t)] = expf(sp * W.A[h]);
-        s_gb[2 * (np + t) + 1] = 1.0f / (1.0f + expf(-be));
-    } else if (tid >= 448 && tid < 448 + np) {
-        const int e = tid - 448;
-        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
-        s_gb[2 * e] = __ldcg(slot + KVGB_G + h);
-        s_gb[2 * e + 1] = __ldcg(slot + KVGB_B + h);
-    }
-    for (int i = tid; i < np * 128; i += NT) { // replayed k / v
-        const int e = i >> 7, c = i & 127;
-        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
-        s_k[e * QS + (c >> 5) * 36 + (c & 31)] = __ldcg(slot + kh * 128 + c);
-        s_v[e * 128 + c] = __ldcg(slot + KVGB_V + h * 128 + c);
-    }
-    for (int i = tid; i < T * 128; i += NT) s_z[i] = __ldcg(cB.z + (i >> 7) * VD + h * 128 + (i & 127));
-    __syncthreads();
+        for (int i = tid; i < T * 128; i += NT) s_z[i] = __ldcg(cB.z + (i >> 7) * VD + h * 128 + (i & 127));
+        __syncthreads();
+    } else
 #endif
+    {
+        // ---- prologue: every input of every event, one round of loads ----
+        if (tid < 384) {
+            const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? 2048 + kh * 128 + (tid - 128) : 4096 + h * 128 + (tid - 256));
+            const float4 w = *reinterpret_cast<const float4 *>(W.conv + ch * 4);
+            float raw[T + 3];
+    #pragma unroll
+            for (int j = 0; j < T + 3; j++) {
+                const int p = n - 3 + j;
+                raw[j] = p >= 0 ? __ldcg(conv + (p % CONV_RING) * QKV + ch) : 0.f;
+            }
+    #pragma unroll
+            for (int t = 0; t < T; t++)
+                s_raw[t * 384 + tid] = silu(w.x * raw[t] + w.y * raw[t + 1] + w.z * raw[t + 2] + w.w * raw[t + 3]);
+        } else if (tid < 384 + T) {
+            const int t = tid - 384;
+            float al = 0.f, be = 0.f;
+    #pragma unroll
+            for (int c = 0; c < AB_SPLIT; c++) {
+                al += __ldcg(cB.ab + (c * RMAX + t) * 2 * NVH + h);
+                be += __ldcg(cB.ab + (c * RMAX + t) * 2 * NVH + NVH + h);
+            }
+            float sp = al + W.dt[h];
+            sp = sp > 20.0f ? sp : logf(1.0f + expf(sp));
+            s_gb[2 * (np + t)] = expf(sp * W.A[h]);
+            s_gb[2 * (np + t) + 1] = 1.0f / (1.0f + expf(-be));
+        } else if (tid >= 448 && tid < 448 + np) {
+            const int e = tid - 448;
+            const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
+            s_gb[2 * e] = __ldcg(slot + KVGB_G + h);
+            s_gb[2 * e + 1] = __ldcg(slot + KVGB_B + h);
+        }
+        for (int i = tid; i < np * 128; i += NT) { // replayed k / v
+            const int e = i >> 7, c = i & 127;
+            const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
+            s_k[e * QS + (c >> 5) * 36 + (c & 31)] = __ldcg(slot + kh * 128 + c);
+            s_v[e * 128 + c] = __ldcg(slot + KVGB_V + h * 128 + c);
+        }
+        for (int i = tid; i < T * 128; i += NT) s_z[i] = __ldcg(cB.z + (i >> 7) * VD + h * 128 + (i & 127));
+        __syncthreads();
+    }
 
     // l2-normalise q and k of the new tokens (warp 2t: q of token t, warp 2t+1: k), copy v
     if (warp < 2 * T) {
@@ -2015,84 +2123,87 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     }
 
 #if MK_K5
-    // ---- gated delta rule over the new tokens' events (the replayed ones ran before the wait) ----
-    for (int e = np; e < np + T; e++) {
-        const float g = s_gb[2 * e], beta = s_gb[2 * e + 1];
-        const float4 * kq = reinterpret_cast<const float4 *>(s_k + e * QS + r * 36);
-        float kv = 0.f;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const float4 k4 = kq[i];
-            kv += S[i].x * k4.x + S[i].y * k4.y + S[i].z * k4.z + S[i].w * k4.w;
-        }
-        kv += __shfl_xor_sync(0xffffffffu, kv, 1);
-        kv += __shfl_xor_sync(0xffffffffu, kv, 2);
-        const float dlt = (s_v[e * 128 + col] - g * kv) * beta;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const float4 k4 = kq[i];
-            S[i].x = g * S[i].x + k4.x * dlt;
-            S[i].y = g * S[i].y + k4.y * dlt;
-            S[i].z = g * S[i].z + k4.z * dlt;
-            S[i].w = g * S[i].w + k4.w * dlt;
-        }
-        {
-            const float4 * qq = reinterpret_cast<const float4 *>(s_q + e * QS + r * 36);
-            float o = 0.f;
-#pragma unroll
+    if constexpr (K5) {
+        // ---- gated delta rule over the new tokens' events (the replayed ones ran before the wait) ----
+        for (int e = np; e < np + T; e++) {
+            const float g = s_gb[2 * e], beta = s_gb[2 * e + 1];
+            const float4 * kq = reinterpret_cast<const float4 *>(s_k + e * QS + r * 36);
+            float kv = 0.f;
+    #pragma unroll
             for (int i = 0; i < 8; i++) {
-                const float4 q4 = qq[i];
-                o += S[i].x * q4.x + S[i].y * q4.y + S[i].z * q4.z + S[i].w * q4.w;
+                const float4 k4 = kq[i];
+                kv += S[i].x * k4.x + S[i].y * k4.y + S[i].z * k4.z + S[i].w * k4.w;
             }
-            o += __shfl_xor_sync(0xffffffffu, o, 1);
-            o += __shfl_xor_sync(0xffffffffu, o, 2);
-            if (r == 0) s_o[(e - np) * 128 + col] = o;
-        }
-        if (e == np + n_commit - 1) {
-#pragma unroll
-            for (int i = 0; i < 8; i++) Sg[SGS * i] = S[i];
-        }
-    }
-#else
-    // ---- gated delta rule over all events; inputs are in shared memory, no barriers needed ----
-    for (int e = 0; e < np + T; e++) {
-        const float g = s_gb[2 * e], beta = s_gb[2 * e + 1];
-        const float4 * kq = reinterpret_cast<const float4 *>(s_k + e * QS + r * 36);
-        float kv = 0.f;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const float4 k4 = kq[i];
-            kv += S[i].x * k4.x + S[i].y * k4.y + S[i].z * k4.z + S[i].w * k4.w;
-        }
-        kv += __shfl_xor_sync(0xffffffffu, kv, 1);
-        kv += __shfl_xor_sync(0xffffffffu, kv, 2);
-        const float dlt = (s_v[e * 128 + col] - g * kv) * beta;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const float4 k4 = kq[i];
-            S[i].x = g * S[i].x + k4.x * dlt;
-            S[i].y = g * S[i].y + k4.y * dlt;
-            S[i].z = g * S[i].z + k4.z * dlt;
-            S[i].w = g * S[i].w + k4.w * dlt;
-        }
-        if (e >= np) {
-            const float4 * qq = reinterpret_cast<const float4 *>(s_q + e * QS + r * 36);
-            float o = 0.f;
-#pragma unroll
+            kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+            kv += __shfl_xor_sync(0xffffffffu, kv, 2);
+            const float dlt = (s_v[e * 128 + col] - g * kv) * beta;
+    #pragma unroll
             for (int i = 0; i < 8; i++) {
-                const float4 q4 = qq[i];
-                o += S[i].x * q4.x + S[i].y * q4.y + S[i].z * q4.z + S[i].w * q4.w;
+                const float4 k4 = kq[i];
+                S[i].x = g * S[i].x + k4.x * dlt;
+                S[i].y = g * S[i].y + k4.y * dlt;
+                S[i].z = g * S[i].z + k4.z * dlt;
+                S[i].w = g * S[i].w + k4.w * dlt;
             }
-            o += __shfl_xor_sync(0xffffffffu, o, 1);
-            o += __shfl_xor_sync(0xffffffffu, o, 2);
-            if (r == 0) s_o[(e - np) * 128 + col] = o;
+            {
+                const float4 * qq = reinterpret_cast<const float4 *>(s_q + e * QS + r * 36);
+                float o = 0.f;
+    #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    const float4 q4 = qq[i];
+                    o += S[i].x * q4.x + S[i].y * q4.y + S[i].z * q4.z + S[i].w * q4.w;
+                }
+                o += __shfl_xor_sync(0xffffffffu, o, 1);
+                o += __shfl_xor_sync(0xffffffffu, o, 2);
+                if (r == 0) s_o[(e - np) * 128 + col] = o;
+            }
+            if (e == np + n_commit - 1) {
+    #pragma unroll
+                for (int i = 0; i < 8; i++) Sg[SGS * i] = S[i];
+            }
         }
-        if (e == np + n_commit - 1) {
-#pragma unroll
-            for (int i = 0; i < 8; i++) Sg[SGS * i] = S[i];
-        }
-    }
+    } else
 #endif
+    {
+        // ---- gated delta rule over all events; inputs are in shared memory, no barriers needed ----
+        for (int e = 0; e < np + T; e++) {
+            const float g = s_gb[2 * e], beta = s_gb[2 * e + 1];
+            const float4 * kq = reinterpret_cast<const float4 *>(s_k + e * QS + r * 36);
+            float kv = 0.f;
+    #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float4 k4 = kq[i];
+                kv += S[i].x * k4.x + S[i].y * k4.y + S[i].z * k4.z + S[i].w * k4.w;
+            }
+            kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+            kv += __shfl_xor_sync(0xffffffffu, kv, 2);
+            const float dlt = (s_v[e * 128 + col] - g * kv) * beta;
+    #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float4 k4 = kq[i];
+                S[i].x = g * S[i].x + k4.x * dlt;
+                S[i].y = g * S[i].y + k4.y * dlt;
+                S[i].z = g * S[i].z + k4.z * dlt;
+                S[i].w = g * S[i].w + k4.w * dlt;
+            }
+            if (e >= np) {
+                const float4 * qq = reinterpret_cast<const float4 *>(s_q + e * QS + r * 36);
+                float o = 0.f;
+    #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    const float4 q4 = qq[i];
+                    o += S[i].x * q4.x + S[i].y * q4.y + S[i].z * q4.z + S[i].w * q4.w;
+                }
+                o += __shfl_xor_sync(0xffffffffu, o, 1);
+                o += __shfl_xor_sync(0xffffffffu, o, 2);
+                if (r == 0) s_o[(e - np) * 128 + col] = o;
+            }
+            if (e == np + n_commit - 1) {
+    #pragma unroll
+                for (int i = 0; i < 8; i++) Sg[SGS * i] = S[i];
+            }
+        }
+    }
     __syncthreads();
 
     // gated rms-norm + quantise: warp w -> token w / 4, 32-element block w % 4 of this head
@@ -2407,7 +2518,7 @@ __device__ __noinline__ void kv_store_emu(int8_t * q, __half * sc, const float (
 // Recent-window emulation ("win=N"): rows are stored as plain q8 and demoted to their slot's mode once they are older
 // than N positions. Re-quantises rows of positions p0 .. p1 - 1 of every emulated K / V slot (one warp per row; q8
 // in, kv_store_emu with the force bit out; sink rows are re-stored as q8, which is idempotent).
-__global__ void __launch_bounds__(256) k_kv_demote(int p0, int p1) {
+__global__ void __launch_bounds__(256) k_kv_demote(int p0, int p1) { MK_VIEW_INIT();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int n = p1 - p0;
     for (int i = blockIdx.x * 8 + warp; i < n * NKV * N_ATT_SLOTS * 2; i += gridDim.x * 8) {
@@ -2590,7 +2701,7 @@ __device__ __forceinline__ void kv_tile_to_f16(const uint8_t * src, __half * dK,
 // MK_KV_WIN after a checkpoint restore to position p1: the ring rows of positions p0 .. p1 - 1 may have been overwritten by
 // the abandoned continuation, so they are refilled from the main buffer (its low-bit values, re-stored as q8: the window
 // is at the main format's precision until those rows age out). One warp per row.
-__global__ void __launch_bounds__(256) k_ring_refill(int p0, int p1) {
+__global__ void __launch_bounds__(256) k_ring_refill(int p0, int p1) { MK_VIEW_INIT();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int n = p1 - p0;
     for (int i = blockIdx.x * 8 + warp; i < n * NKV * N_ATT_SLOTS * 2; i += gridDim.x * 8) {
@@ -5034,6 +5145,279 @@ __device__ void run_main(const Launch & P, uint8_t * /*sm*/, unsigned & epoch) {
 __device__ __noinline__ void run_wide(const Launch & P, unsigned & epoch) { main_forward<MAXT>(P, smem, epoch); }
 #endif
 
+// the launch's MTP passes (catch-up rows, then the drafts the next launch verifies) of the sequence of view s_view
+__device__ __noinline__ void mtp_tail(const Launch & P, unsigned & epoch) {
+    uint8_t * const sm = smem;
+    volatile Ctl * vc = cB.ctl;
+    const int Rtot = vc->mtp_R;
+    const bool lg = vc->mtp_logits;
+    int done = 0;
+#if MTP_KVC
+    while (cB.mtp_kvc && Rtot - done > 5) { // all but the last 5 rows: K / V only (at most 3 rows per pass)
+        const int R = min(3, Rtot - done - 5);
+        switch (R) {
+            case 1: mtp_kv_pass<1>(done, epoch); break;
+            case 2: mtp_kv_pass<2>(done, epoch); break;
+            default: mtp_kv_pass<3>(done, epoch); break;
+        }
+        done += R;
+    }
+#endif
+    while (done < Rtot) {
+        const int R = min(5, Rtot - done); // (the MTP block's dp4a ffn_down holds at most 5 rows)
+        const bool last_pass = done + R == Rtot;
+        const bool want = lg && last_pass && P.ndraft > 0;
+        switch (R) {
+            case 1: mtp_pass<1>(P, done, false, 0, want, sm, epoch); break;
+            case 2: mtp_pass<2>(P, done, false, 0, want, sm, epoch); break;
+            case 3: mtp_pass<3>(P, done, false, 0, want, sm, epoch); break;
+            case 4: mtp_pass<4>(P, done, false, 0, want, sm, epoch); break;
+            case 5: mtp_pass<5>(P, done, false, 0, want, sm, epoch); break;
+        }
+        done += R;
+    }
+    if (lg) {
+        // nd_stop is written before the PH_MTP_LMHEAD barrier, so every block takes the same exit
+        for (int i = 1; i < P.ndraft && !vc->nd_stop; i++) mtp_pass<1>(P, 0, true, i, true, sm, epoch);
+    }
+}
+
+#if MK_MAXT > 5 && MK_EGRESS
+// ---- batched launches (MKEngine::slots_step): the rows of several lanes in one pass ----
+// The weight phases run once over all rows (view 0's row buffers). The per-sequence phases run per lane in its main view
+// (its rows from row 0): attention, its combine and the delta-net core as the lanes' items back to back (no grid barrier
+// between lanes: a block done with lane i's items takes lane i + 1's), the h rows, the verify / control. Every phase is
+// T-invariant per row, so each lane gets the arithmetic of a solo launch of its own T: bit-identical rows.
+__device__ __forceinline__ void set_view(int v) {
+    __syncthreads();
+    if (threadIdx.x == 0) s_view = v;
+    __syncthreads();
+}
+__device__ __forceinline__ void attn_core_n(int T, const LayerW & W, int slot, int n) {
+    switch (T) {
+        case 1: attn_core<1>(W, slot, n, smem); break;
+        case 2: attn_core<2>(W, slot, n, smem); break;
+        case 3: attn_core<3>(W, slot, n, smem); break;
+        case 4: attn_core<4>(W, slot, n, smem); break;
+        case 5: attn_core<5>(W, slot, n, smem); break;
+        default: attn_core<MAXT>(W, slot, n, smem); break; // (an 8-row slot: rows past the lane's T are padding)
+    }
+}
+__device__ __forceinline__ void attn_combine_n(int T, int n, int slot) {
+    switch (T) {
+        case 1: attn_combine<1>(n, 0, slot); break;
+        case 2: attn_combine<2>(n, 0, slot); break;
+        case 3: attn_combine<3>(n, 0, slot); break;
+        case 4: attn_combine<4>(n, 0, slot); break;
+        case 5: attn_combine<5>(n, 0, slot); break;
+        default: attn_combine<MAXT>(n, 0, slot); break;
+    }
+}
+__device__ __forceinline__ void dn_core_n(int T, const LayerW & W, int dl, int n, int dn_c, int h) {
+    switch (T) {
+        case 1: dn_core<1, false>(W, dl, n, dn_c, 1, smem, h); break;
+        case 2: dn_core<2, false>(W, dl, n, dn_c, 1, smem, h); break;
+        case 3: dn_core<3, false>(W, dl, n, dn_c, 1, smem, h); break;
+        case 4: dn_core<4, false>(W, dl, n, dn_c, 1, smem, h); break;
+        case 5: dn_core<5, false>(W, dl, n, dn_c, 1, smem, h); break;
+        default: dn_core<MAXT, false>(W, dl, n, dn_c, 1, smem, h); break;
+    }
+}
+__device__ __forceinline__ void write_h_rows_n(int T, int n) {
+    switch (T) {
+        case 1: write_h_rows<1>(cB.x, cB.qn, cW.onorm, cB.h_hist, n, true, smem); break;
+        case 2: write_h_rows<2>(cB.x, cB.qn, cW.onorm, cB.h_hist, n, true, smem); break;
+        case 3: write_h_rows<3>(cB.x, cB.qn, cW.onorm, cB.h_hist, n, true, smem); break;
+        case 4: write_h_rows<4>(cB.x, cB.qn, cW.onorm, cB.h_hist, n, true, smem); break;
+        case 5: write_h_rows<5>(cB.x, cB.qn, cW.onorm, cB.h_hist, n, true, smem); break;
+        default: write_h_rows<MAXT>(cB.x, cB.qn, cW.onorm, cB.h_hist, n, true, smem); break;
+    }
+}
+
+// a greedy row's token from its sampling candidate list (descending, insertion order among equals): the smallest id of
+// the leading equal values, as the argmax's "larger value, then smaller id"
+__device__ __forceinline__ int cand_argmax(const float2 * c) {
+    const float v0 = c[0].x;
+    int id = __float_as_int(c[0].y);
+    for (int k = 1; k < TOPK_MAX && c[k].x == v0; k++) id = min(id, __float_as_int(c[k].y));
+    return id;
+}
+
+// the slot rows of a lane verifying T tokens in a batched pass: T <= 5 as they are, else an 8-row slot (padding rows, as a
+// solo MAXT-row pass: the host keeps the slot's rows in one attention partition)
+__host__ __device__ constexpr int lane_slot(int T) { return T <= 5 ? T : MAXT; }
+
+// the batched passes' lm_head in LT-row passes over the head (each pass's last block leaves its rows in cB.cand: sampling,
+// the candidates; greedy, the argmax id at .y of the row's first entry), a grid barrier after each
+template <int LT, int RT>
+__device__ __forceinline__ void lm_head_passes(bool smp, uint8_t * sm, int * s_tok, unsigned & epoch) {
+    static_assert(RT % LT == 0, "whole lm_head passes");
+#pragma unroll 1
+    for (int g = 0; g < RT / LT; g++) {
+        const bool last = smp ? lm_head<LT, true>(LT * g, false, sm, s_tok, cB.cand + LT * g * TOPK_MAX) : lm_head<LT>(LT * g, false, sm, s_tok);
+        if (last && !smp && threadIdx.x < LT) cB.cand[(LT * g + threadIdx.x) * TOPK_MAX] = make_float2(0.f, __int_as_float(s_tok[threadIdx.x]));
+        __threadfence();
+        gsync(epoch, PH_LMHEAD);
+    }
+}
+// the main pass of a batched launch: RT rows (the lanes' slots, then padding rows up to RT). RT > MAXT (MK_PAR_WIDE): the
+// weight phases in K sub-chunk fills (the _ck phases), lm_head in 8-row passes with the candidates / argmax in cB.cand
+template <int RT>
+__device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) {
+    uint8_t * const sm = smem;
+    constexpr bool CK = RT > MAXT;
+    RowTab rt;
+    rt.nl = P.nl;
+#pragma unroll
+    for (int i = 0; i < NSEQ; i++) {
+        rt.lane[i] = (signed char) (i < P.nl ? P.ln[i].lane : 0);
+        rt.T[i] = (signed char) (i < P.nl ? P.ln[i].T : 0);
+        rt.r0[i] = (signed char) (i < P.nl ? P.ln[i].r0 : 0);
+    }
+    embed_prologue<RT, true>(rt);
+    gsync(epoch, PH_EMBED);
+    int dl = 0;
+    for (int L = 0; L < NL; L++) {
+        const LayerW & W = cW.L[L];
+        const float * wnext = (L + 1 < NL) ? cW.L[L + 1].attn_norm : cW.onorm;
+        constexpr bool WIDE = RT > 5;
+        if (W.attn) {
+#if MK_PAR_WIDE
+            if constexpr (CK) attn_proj_ck<RT>(W);
+            else
+#endif
+                attn_proj_wv<RT>(W, L / 4, 0, false);
+            gsync(epoch, PH_ATTN_PROJ);
+            for (int i = 0; i < P.nl; i++) {
+                set_view(view_main(P.ln[i].lane));
+                attn_core_n(lane_slot(P.ln[i].T), W, L / 4, ((volatile Ctl *) cB.ctl)->n);
+            }
+            set_view(0);
+            gsync(epoch, PH_ATTN_CORE);
+            for (int i = 0; i < P.nl; i++) {
+                set_view(view_main(P.ln[i].lane));
+                attn_combine_n(lane_slot(P.ln[i].T), ((volatile Ctl *) cB.ctl)->n, L / 4);
+            }
+            set_view(0);
+            gsync(epoch, PH_ATTN_COMB);
+#if MK_PAR_WIDE
+            if constexpr (CK) resid_wv_ck<RT, false, VD>(W.o, cB.qo, W.post_norm, 0); // (out in the wv layout: host check)
+            else
+#endif
+            if (W.o.fm) resid_out_wv<RT>(W.o, W.post_norm);
+            else resid_dp<RT, 6>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
+            gsync(epoch, PH_RESID_O);
+        } else {
+#if MK_PAR_WIDE
+            if constexpr (CK) dn_proj_ck<RT>(W, dl, rt);
+            else
+#endif
+                dn_proj_wv<RT, true>(W, dl, 0, 0, rt);
+            gsync(epoch, PH_DN_PROJ);
+            for (int it = blockIdx.x; it < P.nl * NVH; it += gridDim.x) {
+                const int i = it / NVH;
+                set_view(view_main(P.ln[i].lane));
+                volatile Ctl * c = cB.ctl;
+                dn_core_n(lane_slot(P.ln[i].T), W, dl, c->n, c->dn_c, it - i * NVH);
+            }
+            set_view(0);
+            gsync(epoch, PH_DN_CORE);
+#if MK_PAR_WIDE
+            if constexpr (CK) resid_wv_ck<RT, false, VD>(W.sout, cB.qo, W.post_norm, 0);
+            else
+#endif
+            if (W.sout.fm) resid_out_wv<RT>(W.sout, W.post_norm);
+            else resid_dp<RT, 6>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
+            gsync(epoch, PH_RESID_SOUT);
+            dl++;
+        }
+#if MK_PAR_WIDE
+        if constexpr (CK) {
+            ffn_gu_ck<RT>(W);
+#if MK_C1
+            resid_wv_ck<RT, true, FF>(W.fd, cB.qa, wnext, 3);
+#else
+            gsync(epoch, PH_FFN_GU);
+            resid_wv_ck<RT, true, FF>(W.fd, cB.qa, wnext, 1);
+#endif
+            gsync(epoch, PH_FFN_DOWN);
+        } else
+#endif
+        {
+#if MK_C1
+            if (WIDE || ((W.fg.fm || W.fu.fm) && W.fd.fm)) {
+                ffn_gu_wv<RT>(W, true);
+                resid_wv<RT, true, FF>(W.fd, cB.qa, wnext, 3);
+                gsync(epoch, PH_FFN_DOWN);
+                continue;
+            }
+#endif
+            if constexpr (WIDE) ffn_gu_wv<RT>(W);
+            else if (W.fg.fm || W.fu.fm) ffn_gu_wv<RT>(W);
+            else ffn_gu<RT>(W, sm);
+            gsync(epoch, PH_FFN_GU);
+            if constexpr (WIDE) resid_wv<RT, true, FF>(W.fd, cB.qa, wnext, 1);
+            else if (W.fd.fm) resid_wv<RT, true, FF>(W.fd, cB.qa, wnext, 1);
+            else resid_any<RT, 17>(W.fd, cB.qa, cB.x, true, wnext, sm);
+            gsync(epoch, PH_FFN_DOWN);
+        }
+    }
+    for (int i = 0; i < P.nl; i++) { // (block 0 writes them)
+        set_view(view_main(P.ln[i].lane));
+        write_h_rows_n(lane_slot(P.ln[i].T), ((volatile Ctl *) cB.ctl)->n);
+    }
+    set_view(0);
+
+    int * s_tok = reinterpret_cast<int *>(misc(sm) + 400);
+    bool smp = false;
+    for (int i = 0; i < P.nl; i++) smp |= P.ln[i].temp > 0.f;
+    if constexpr (CK) {
+        lm_head_passes<8, RT>(smp, sm, s_tok, epoch); // (8-row passes, each over the whole head)
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            const float2 * cand = cB.cand; // (view 0's rows)
+            for (int i = 0; i < P.nl; i++) {
+                const Launch Q = lane_launch(P, i);
+                const int T = Q.T, r0 = P.ln[i].r0;
+                s_view = view_main(P.ln[i].lane);
+                int tg[MAXT];
+                if (Q.temp > 0.f) sample_targets(Q, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
+                else if (smp)
+                    for (int t = 0; t < T; t++) tg[t] = cand_argmax(cand + (r0 + t) * TOPK_MAX);
+                else
+                    for (int t = 0; t < T; t++) tg[t] = __float_as_int(cand[(r0 + t) * TOPK_MAX].y);
+                for (int t = 0; t < T; t++) cB.ctl->tgt[t] = tg[t];
+                main_control(MODE_DECODE, 0, T, tg, false, true);
+            }
+            s_view = 0;
+            __threadfence();
+        }
+        gsync(epoch, PH_LMHEAD);
+    } else {
+    // (sampling lanes: the candidates at SM_CAND; a greedy lane beside them takes each row's best candidate)
+    const bool am_last = smp ? lm_head<RT, true>(0, false, sm, s_tok) : lm_head<RT>(0, false, sm, s_tok);
+    if (am_last && threadIdx.x == 0) {
+        const float2 * cand = reinterpret_cast<const float2 *>(sm + SM_CAND);
+        for (int i = 0; i < P.nl; i++) {
+            const Launch Q = lane_launch(P, i);
+            const int T = Q.T, r0 = P.ln[i].r0;
+            s_view = view_main(P.ln[i].lane);
+            int tg[MAXT];
+            if (Q.temp > 0.f) sample_targets(Q, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
+            else if (smp)
+                for (int t = 0; t < T; t++) tg[t] = cand_argmax(cand + (r0 + t) * TOPK_MAX);
+            else
+                for (int t = 0; t < T; t++) tg[t] = s_tok[r0 + t];
+            for (int t = 0; t < T; t++) cB.ctl->tgt[t] = tg[t];
+            main_control(MODE_DECODE, 0, T, tg, false, true);
+        }
+        s_view = 0;
+        __threadfence();
+    }
+    gsync(epoch, PH_LMHEAD);
+    }
+}
+#endif
+
 template <int T>
 __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & epoch) {
     uint8_t * const sm = smem;
@@ -5079,6 +5463,274 @@ __device__ __noinline__ void gsync_bench(int n) {
     }
 }
 
+#if MK_MAXT > 5 && MK_EGRESS && MTP_KVC
+// ---- batched MTP (Launch::mtpb): the lanes' MTP passes shared, lane i at row i of view 0's row buffers ----
+// view_mtp(i) = lane i's full view with the row buffers at row i: the per-lane parts (attention at the lane's position,
+// its K / V rows, h, the draft head and its control) run there unchanged on one row; the GEMV phases run once over all
+// rows in view 0. A lane's catch-up rows: all but the last K / V only (mtp_kv_pass's arithmetic, one round per row), the
+// last one a full pass producing draft 1 (a solo full pass's last row: the same partition, the same K / V before it), then
+// draft k for the lanes still drafting. Rows of lanes not in a pass are computed and dropped.
+struct MtpRows {
+    int nl;
+    bool live[NSEQ];
+    int lane[NSEQ]; // (K / V-only passes: the row's lane slot; full passes: row s = lane s)
+    int pos[NSEQ], tok[NSEQ];
+    const float * hsrc[NSEQ];
+};
+static_assert(NSEQ <= 5, "batched MTP: one row per lane in the MTP block's dp4a passes (<= 5 rows); constant memory (views)");
+// M0 of mtp_pass for rows from several lanes (each row's token / position / h source from MtpRows)
+template <int R>
+__device__ __forceinline__ void mtp_m0_rows(const MtpRows & mr) {
+    uint8_t * const sm = smem;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    constexpr int M0_NB = MTP_M0_NB;
+    if (blockIdx.x < R * M0_NB) {
+        const int r = blockIdx.x / M0_NB, s = blockIdx.x - r * M0_NB;
+        const int tok = mr.live[r] ? mr.tok[r] : 0;
+        const float * hsrc = mr.live[r] ? mr.hsrc[r] : nullptr;
+        float * se = reinterpret_cast<float *>(sm);
+        float * sh = se + D;
+        float * red = sh + D;
+        const bool eq4 = cW.embd_t == T_Q4K;
+        uint8_t * const erow = reinterpret_cast<uint8_t *>(red + 32);
+        if (eq4) stage_embd_row(tok, erow);
+        else embed_row_other(tok, se, erow);
+        float ae = 0.f, ah = 0.f;
+        for (int e = tid; e < D; e += NT) {
+            const float v = eq4 ? dequant_q4k(erow, e) : se[e];
+            const float hv = hsrc ? __ldcg(hsrc + e) : 0.f;
+            se[e] = v;
+            sh[e] = hv;
+            ae += v * v;
+            ah += hv * hv;
+        }
+        ae = bsum(ae, red);
+        ah = bsum(ah, red + 16);
+        const float rse = rsqrtf(ae / (float) D + EPS), rsh = rsqrtf(ah / (float) D + EPS);
+        for (int j = s * NW + warp; j < 2 * U_D; j += M0_NB * NW) {
+            const int e = 32 * (j % U_D) + lane;
+            const float v = j < U_D ? se[e] * rse * cW.enorm[e] : sh[e] * rsh * cW.hnorm[e];
+            q32_store(cB.qe, r, j, v, 0.f, false);
+        }
+    }
+}
+
+// round j of the K / V-only catch-up rows: row i = lane i's catch-up row j (when j < its mtp_R - 1)
+template <int R>
+__device__ __noinline__ void mtp_kv_pass_b(const MtpRows & mr, unsigned & epoch) {
+    uint8_t * const sm = smem;
+    const int lane = threadIdx.x & 31;
+    mtp_m0_rows<R>(mr);
+    gsync(epoch, PH_MTP_KV_M0);
+    const LayerW & W = cW.L[NL];
+    resid_any<R, 10>(cW.eh, cB.qe, cB.xm, false, W.attn_norm, sm);
+    gsync(epoch, PH_MTP_KV_EH);
+    {
+        const SX sx = make_sx(sm, U_D);
+        fill_xs<R>(cB.qn, 0, true, sx, misc(sm));
+        const int nk = KVD / 2;
+        gemv_pairs_any<R, 5>(W.k, 0, nk, PairOut{cB.kbuf, KVD, -1});
+        gemv_pairs_any<R, 5>(W.v, nk, 2 * nk, PairOut{cB.vbuf, KVD, -1});
+    }
+    gsync(epoch, PH_MTP_KV_PROJ);
+    constexpr int slot = N_ATT_SLOTS - 1;
+    const float * const kb0 = cB.kbuf, * const vb0 = cB.vbuf; // (view 0's rows)
+    for (int i = 0; i < R; i++) { // (row i into its lane's MTP slot, as mtp_kv_pass's store; no barrier after it)
+        if (!mr.live[i]) continue;
+        set_view(view_full(mr.lane[i]));
+        const int pp = mr.pos[i];
+        for (int g = gwarp(); g < NKV; g += nwarps()) {
+            float v[8];
+            load8(kb0 + i * KVD + g * 256 + lane * 8, v);
+            float ss = 0.f;
+#pragma unroll
+            for (int k = 0; k < 8; k++) ss += v[k] * v[k];
+            const float rs = rsqrtf(wsum(ss) / 256.0f + EPS);
+#pragma unroll
+            for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
+            rope8(v, lane, pp);
+            kv_store(0, slot, g, pp, v);
+            load8(vb0 + i * KVD + g * 256 + lane * 8, v);
+            kv_store(1, slot, g, pp, v);
+        }
+    }
+    set_view(0);
+}
+
+// a full MTP pass over one row per lane (k = 0: the lanes' last catch-up rows, k >= 1: their draft-k rows) -> draft k + 1
+template <int R>
+__device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, const int (&li)[NSEQ], int k, unsigned & epoch) {
+    uint8_t * const sm = smem;
+    mtp_m0_rows<R>(mr);
+    gsync(epoch, PH_MTP_M0);
+    const LayerW & W = cW.L[NL];
+    resid_any<R, 10>(cW.eh, cB.qe, cB.xm, false, W.attn_norm, sm);
+    gsync(epoch, PH_MTP_EH);
+    attn_proj<R>(W, 16, 0, sm); // (position: L2 warm-up only)
+    gsync(epoch, PH_MTP_ATTN_PROJ);
+    for (int i = 0; i < R; i++) {
+        if (!mr.live[i]) continue;
+        set_view(view_mtp(i));
+        attn_core<1>(W, 16, mr.pos[i], sm);
+    }
+    set_view(0);
+    gsync(epoch, PH_MTP_ATTN_CORE);
+    for (int i = 0; i < R; i++) {
+        if (!mr.live[i]) continue;
+        set_view(view_mtp(i));
+        attn_combine<1>(mr.pos[i], mtp_ws(N_ATT_SLOTS - 1, mr.pos[i]), N_ATT_SLOTS - 1);
+    }
+    set_view(0);
+    gsync(epoch, PH_MTP_ATTN_COMB);
+    resid_any<R, 6>(W.o, cB.qo, cB.xm, true, W.post_norm, sm);
+    gsync(epoch, PH_MTP_RESID_O);
+    ffn_gu<R>(W, sm);
+    gsync(epoch, PH_MTP_FFN_GU);
+    resid_any<R, 17>(W.fd, cB.qa, cB.xm, true, cW.shnorm, sm);
+    gsync(epoch, PH_MTP_FFN_DOWN);
+    for (int i = 0; i < R; i++) { // (block 0)
+        if (!mr.live[i]) continue;
+        set_view(view_mtp(i));
+        write_h_rows<1>(cB.xm, cB.qn, cW.shnorm, cB.hm, 0, false, sm);
+    }
+    // the draft head of each lane on its row (mtp_pass's, with the lane's launch parameters), one grid pass each
+    for (int i = 0; i < R; i++) {
+        if (!mr.live[i]) continue;
+        set_view(view_mtp(i));
+        const Launch Q = lane_launch(P, li[i]);
+        {
+            int * s_tok = reinterpret_cast<int *>(misc(sm) + 400);
+            // sampled drafts need the draft head's top logits (TOPK path); argmax drafts only the reduction
+    #if MK_SPEC_LOG
+            float2 * const tl = cB.dlog + k * (TOPK_MAX + 1);
+            const bool lastb = lm_head<1, true, false, true>(0, true, sm, s_tok, tl);
+    #else
+            float2 * const tl = cB.dq + k * TOPK_MAX;
+            // presence / frequency penalty: draft k + 1 has the committed tokens and drafts 1..k in its context
+            const bool pen = Q.pres != 0.f || Q.freq != 0.f;
+            const bool lastb = Q.spec_smp ? (pen ? lm_head<1, true, false, true, true>(0, true, sm, s_tok, tl, Q.pres, Q.freq, k)
+                                                 : lm_head<1, true, false, true>(0, true, sm, s_tok, tl))
+                                          : (pen ? lm_head<1, false, false, true, true>(0, true, sm, s_tok, nullptr, Q.pres, Q.freq, k)
+                                                 : lm_head<1, false, false, true>(0, true, sm, s_tok));
+    #endif
+            if (lastb && threadIdx.x == 0) {
+                Ctl * c = cB.ctl;
+                const float * mm = misc(sm);
+                const float conf = __expf(mm[LM_BEST] - mm[LM_LSE]);
+    #if MK_MAXT > 5
+    #if MK_SPEC_LOG
+                cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
+    #endif
+                // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
+                const int dt = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
+                                                         (unsigned long long) c->mtp_P + 1 + k, Q.spec_blk ? launch_salt(c->mtp_P) : 0ull)
+                                          : s_tok[0];
+                c->tok[1 + k] = dt;
+                // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
+                // under q' (the distribution it was drawn from) instead of the draft head's top-1 probability
+                const float chain = (k == 0 ? 1.f : c->dchain) * (Q.gate_chain == 2 && Q.spec_smp ? dq_prob(cB.dq + k * TOPK_MAX, dt) : conf);
+                const float f = Q.gate_chain ? chain : conf;
+    #else
+                const float chain = (k == 0 ? 1.f : c->dchain) * conf;
+    #if MK_SPEC_LOG
+                cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
+    #endif
+                const float f = Q.gate_chain ? chain : conf;
+                // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
+                c->tok[1 + k] = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
+                                                          (unsigned long long) c->mtp_P + 1 + k)
+                                           : s_tok[0];
+    #endif
+                c->dsmp = Q.spec_smp;
+                c->dconf[k] = conf;
+                c->dchain = chain;
+                c->nd_prod = f < Q.gate_drop[k] ? k : k + 1;
+                c->nd_stop = f < Q.gate_stop[k] || f < Q.gate_drop[k];
+                __threadfence();
+            }
+
+        }
+        set_view(0);
+        gsync(epoch, PH_MTP_LMHEAD);
+    }
+    set_view(0);
+}
+
+__device__ __noinline__ void mtp_batch(const Launch & P, unsigned & epoch) {
+    // rows by lane slot (view_mtp(s): row s); every block reads the same lane ctls after a barrier: the same rows everywhere
+    int li[NSEQ];
+#pragma unroll
+    for (int s = 0; s < NSEQ; s++) li[s] = -1;
+    for (int i = 0; i < P.nl; i++) li[P.ln[i].lane] = i;
+    int nkv[NSEQ], maxnd = 0, tot = 0;
+    for (int s = 0; s < NSEQ; s++) {
+        nkv[s] = 0;
+        if (li[s] < 0) continue;
+        const volatile Ctl * c = cBs[view_full(s)].ctl;
+        if (P.ln[li[s]].nd <= 0 || !c->mtp_logits) continue;
+        nkv[s] = max(0, c->mtp_R - 1);
+        tot += nkv[s];
+        maxnd = max(maxnd, P.ln[li[s]].nd);
+    }
+    MtpRows mr;
+    mr.nl = NSEQ;
+    // the K / V-only catch-up rows of all lanes (each lane's rows 0 .. mtp_R - 2), NSEQ rows per pass in lane order
+    int ks = 0, kj = 0; // next (lane slot, row)
+    for (int done = 0; done < tot; done += NSEQ) {
+        for (int r = 0; r < NSEQ; r++) {
+            while (ks < NSEQ && kj >= nkv[ks]) {
+                ks++;
+                kj = 0;
+            }
+            mr.live[r] = ks < NSEQ;
+            if (!mr.live[r]) {
+                mr.lane[r] = 0;
+                mr.pos[r] = 0;
+                mr.tok[r] = 0;
+                mr.hsrc[r] = nullptr;
+                continue;
+            }
+            const Bufs & V = cBs[view_full(ks)];
+            const volatile Ctl * c = V.ctl;
+            mr.lane[r] = ks;
+            mr.pos[r] = c->mtp_pos[kj];
+            mr.tok[r] = c->mtp_tok[kj];
+            mr.hsrc[r] = mr.pos[r] >= 1 ? V.h_hist + (size_t) ((mr.pos[r] - 1) % H_RING) * D : nullptr;
+            kj++;
+        }
+        mtp_kv_pass_b<NSEQ>(mr, epoch);
+    }
+    for (int k = 0; k < maxnd; k++) {
+        bool any = false;
+        for (int s = 0; s < NSEQ; s++) {
+            const Bufs & V = cBs[view_full(s)];
+            const volatile Ctl * c = V.ctl;
+            bool live = li[s] >= 0 && P.ln[li[s]].nd > k && c->mtp_logits;
+            if (k > 0) live = live && !c->nd_stop;
+            mr.live[s] = live;
+            mr.lane[s] = s;
+            any |= live;
+            if (!live) {
+                mr.pos[s] = 0;
+                mr.tok[s] = 0;
+                mr.hsrc[s] = nullptr;
+            } else if (k == 0) {
+                const int last = c->mtp_R - 1;
+                mr.pos[s] = c->mtp_pos[last];
+                mr.tok[s] = c->mtp_tok[last];
+                mr.hsrc[s] = mr.pos[s] >= 1 ? V.h_hist + (size_t) ((mr.pos[s] - 1) % H_RING) * D : nullptr;
+            } else {
+                mr.pos[s] = c->mtp_P + k;
+                mr.tok[s] = c->tok[k];
+                mr.hsrc[s] = V.hm;
+            }
+        }
+        if (!any) break;
+        mtp_pass_b<NSEQ>(P, mr, li, k, epoch);
+    }
+}
+#endif
+
 #if MK_EGRESS
 // MK_EGRESS, after the launch's last grid barrier (every block has passed it, and with it every write to ctl): block 0
 // publishes the counts the next launch starts from (BAR_BASE, C1_BASE) and copies ctl to its mapped host mirror (the host
@@ -5098,7 +5750,46 @@ __device__ __forceinline__ void mk_egress(unsigned epoch) {
 }
 #endif
 
-__global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
+#if MK_MAXT > 5 && MK_EGRESS
+// a batched launch: the main pass, each lane's MTP passes (its full view: rows from 0), then mk_egress per lane
+__device__ __noinline__ void run_batch(const Launch & P, unsigned & epoch) {
+    switch (P.T) {
+        case 2: main_forward_b<2>(P, epoch); break;
+        case 3: main_forward_b<3>(P, epoch); break;
+        case 4: main_forward_b<4>(P, epoch); break;
+        case 5: main_forward_b<5>(P, epoch); break;
+#if MK_PAR_WIDE
+        case RMAX: main_forward_b<RMAX>(P, epoch); break;
+#endif
+        default: main_forward_b<MAXT>(P, epoch); break;
+    }
+#if MTP_KVC
+    if (P.mtpb) {
+        mtp_batch(P, epoch);
+    } else
+#endif
+    {
+        for (int i = 0; i < P.nl; i++) {
+            const Launch Q = lane_launch(P, i);
+            if (Q.ndraft == 0) continue;
+            set_view(view_full(P.ln[i].lane));
+            mtp_tail(Q, epoch);
+        }
+        set_view(0);
+    }
+    mk_egress(epoch); // (view 0: the barrier counts; its ctl mirror is not the lanes')
+    if (blockIdx.x != 0) return;
+    for (int i = 0; i < P.nl; i++) {
+        const Bufs & V = cBs[view_main(P.ln[i].lane)];
+        if (V.ctl_eg && threadIdx.x < sizeof(Ctl) / 4) {
+            reinterpret_cast<volatile int *>(V.ctl_eg)[threadIdx.x] = reinterpret_cast<volatile const int *>(V.ctl)[threadIdx.x];
+            __threadfence_system();
+        }
+    }
+}
+#endif
+
+__global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) { MK_VIEW_INIT();
     uint8_t * const sm = smem;
     unsigned epoch = 0;
 #if MK_EGRESS
@@ -5130,6 +5821,12 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
 #if MK_C1
     if (threadIdx.x == 0) s_c1n = 0; // (C1 split edges passed: c1_wait's target)
 #endif
+#if MK_MAXT > 5 && MK_EGRESS
+    if (P.nl > 0) {
+        run_batch(P, epoch);
+        return;
+    }
+#endif
     switch (P.T) {
         case 1: run_main<1>(P, sm, epoch); break;
         case 2: run_main<2>(P, sm, epoch); break;
@@ -5148,38 +5845,7 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
 #else
     if (P.ndraft == 0 || P.score) return;
 #endif
-    volatile Ctl * vc = cB.ctl;
-    const int Rtot = vc->mtp_R;
-    const bool lg = vc->mtp_logits;
-    int done = 0;
-#if MTP_KVC
-    while (cB.mtp_kvc && Rtot - done > 5) { // all but the last 5 rows: K / V only (at most 3 rows per pass)
-        const int R = min(3, Rtot - done - 5);
-        switch (R) {
-            case 1: mtp_kv_pass<1>(done, epoch); break;
-            case 2: mtp_kv_pass<2>(done, epoch); break;
-            default: mtp_kv_pass<3>(done, epoch); break;
-        }
-        done += R;
-    }
-#endif
-    while (done < Rtot) {
-        const int R = min(5, Rtot - done); // (the MTP block's dp4a ffn_down holds at most 5 rows)
-        const bool last_pass = done + R == Rtot;
-        const bool want = lg && last_pass && P.ndraft > 0;
-        switch (R) {
-            case 1: mtp_pass<1>(P, done, false, 0, want, sm, epoch); break;
-            case 2: mtp_pass<2>(P, done, false, 0, want, sm, epoch); break;
-            case 3: mtp_pass<3>(P, done, false, 0, want, sm, epoch); break;
-            case 4: mtp_pass<4>(P, done, false, 0, want, sm, epoch); break;
-            case 5: mtp_pass<5>(P, done, false, 0, want, sm, epoch); break;
-        }
-        done += R;
-    }
-    if (lg) {
-        // nd_stop is written before the PH_MTP_LMHEAD barrier, so every block takes the same exit
-        for (int i = 1; i < P.ndraft && !vc->nd_stop; i++) mtp_pass<1>(P, 0, true, i, true, sm, epoch);
-    }
+    mtp_tail(P, epoch);
 #if MK_EGRESS
     mk_egress(epoch);
 #endif
@@ -5192,7 +5858,7 @@ __global__ void pk_fault() { __trap(); }
 
 // silu(gate) * up from the fp32 outputs of two GEMMs, written like mmh<.., true>'s epilogue (fp16,
 // hperm order): the gate / up pairs it cannot fuse (different types, or Q6_K / Q8_0).
-__global__ void __launch_bounds__(256) pk_glu(const float * __restrict__ g, const float * __restrict__ u, __half * __restrict__ out, int ld) {
+__global__ void __launch_bounds__(256) pk_glu(const float * __restrict__ g, const float * __restrict__ u, __half * __restrict__ out, int ld) { MK_VIEW_INIT();
     // thread = 4 consecutive values (one float4 of g and u: a warp reads 512 contiguous bytes of each); within a
     // 16-group, values 4 j .. 4 j + 3 go to hperm slots 2 j, 2 j + 1 and 8 + 2 j, 9 + 2 j (two 4-byte stores)
     const size_t t = blockIdx.x;
@@ -5219,7 +5885,7 @@ __global__ void __launch_bounds__(256) pk_glu(const float * __restrict__ g, cons
 
 // state files: after a restore the GPU has been idle through the load (clocks down); this keeps every SM busy for ns
 // nanoseconds so the decode that follows starts at the clocks a decode after a fresh prefill sees (touches no memory)
-__global__ void st_warm(unsigned long long ns) {
+__global__ void st_warm(unsigned long long ns) { MK_VIEW_INIT();
     unsigned long long t0, t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
     do {
@@ -5230,7 +5896,7 @@ __global__ void st_warm(unsigned long long ns) {
 // keep-warm load (MKEngine::warm_launch; the server's idle windows, capi.cpp): keeps the GPU's clocks up while touching
 // no engine memory. Ends once the host-mapped word *stop is non-zero (thread 0 of each block polls it) or after ns
 // nanoseconds. spin 1: every thread busy-loops on the timer; 0: thread 0 alone waits, __nanosleep between polls.
-__global__ void kw_warm(const unsigned * stop, unsigned long long ns, int spin) {
+__global__ void kw_warm(const unsigned * stop, unsigned long long ns, int spin) { MK_VIEW_INIT();
     __shared__ volatile int s_stop;
     if (threadIdx.x == 0) s_stop = 0;
     __syncthreads();
@@ -6268,6 +6934,7 @@ struct MKEngine::Impl {
 
     // Adds the tokens not yet in the draft head's vocabulary (appends their ids).
     void dv_add(const int * toks, size_t n) {
+        if (dv_frozen) return; // (parallel slots: the base list for every sequence)
         if (dv_in.empty()) return; // full-vocabulary draft head
         const int n0 = (int) dv_ids.size();
         for (size_t i = 0; i < n && (int) dv_ids.size() < dv_base + DV_EXTRA - 1; i++)
@@ -6304,6 +6971,7 @@ struct MKEngine::Impl {
     // dv as a fresh prefill of seq[0, n) with image spans sp builds it (positions inside an image hold placeholder ids:
     // skipped, as prefill skips them)
     void dv_rebuild(int n, const std::vector<Span> & sp) {
+        if (dv_frozen) return; // (parallel slots: the base list for every sequence)
         dv_reset();
         dv_n = n;
         if (dv_in.empty()) return;
@@ -6318,6 +6986,7 @@ struct MKEngine::Impl {
     }
     // back to the first n ids (n >= dv_base, even: the size after a dv_add; a cancelled prefill's additions)
     void dv_truncate(size_t n) {
+        if (dv_frozen) return; // (parallel slots: the base list for every sequence)
         if (dv_in.empty() || dv_ids.size() <= n) return;
         for (size_t i = n; i < dv_ids.size(); i++) dv_in[dv_ids[i]] = 0;
         for (size_t i = 0; i < n; i++) dv_in[dv_ids[i]] = 1; // a padding duplicate may have been cleared
@@ -6996,10 +7665,10 @@ struct MKEngine::Impl {
     QBuf qbuf(int U) {
         QBuf q;
         q.U = U;
-        q.xa = dalloc<int8_t>((size_t) MAXT * U * 16);
-        q.xb = dalloc<int8_t>((size_t) MAXT * U * 16);
-        q.meta = dalloc<uint2>((size_t) MAXT * U);
-        q.ssq = dalloc<float>((size_t) MAXT * U);
+        q.xa = dalloc<int8_t>((size_t) RMAX * U * 16);
+        q.xb = dalloc<int8_t>((size_t) RMAX * U * 16);
+        q.meta = dalloc<uint2>((size_t) RMAX * U);
+        q.ssq = dalloc<float>((size_t) RMAX * U);
         return q;
     }
 
@@ -7449,17 +8118,17 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] MTP block: %d matrices re-quantised to Q4_K in %.1f s (drafts only; MK_MTP_Q4=0: as stored%s)\n",
                     n_req, req_s, mtp_q4 == 2 ? "; ab: both copies, policy mtpq=0|1" : "");
 
-        hb.x = dalloc<float>(MAXT * D);
-        hb.xm = dalloc<float>(MAXT * D);
+        hb.x = dalloc<float>(RMAX * D);
+        hb.xm = dalloc<float>(RMAX * D);
         hb.qn = qbuf(U_D);
         hb.qo = qbuf(U_VD);
         hb.qa = qbuf(U_FF);
         hb.qe = qbuf(U_EH);
-        hb.z = dalloc<float>(MAXT * VD);
-        hb.ab = dalloc<float>(AB_SPLIT * MAXT * 2 * NVH);
-        hb.qbuf = dalloc<float>(MAXT * QG);
-        hb.kbuf = dalloc<float>(MAXT * KVD);
-        hb.vbuf = dalloc<float>(MAXT * KVD);
+        hb.z = dalloc<float>(RMAX * VD);
+        hb.ab = dalloc<float>(AB_SPLIT * RMAX * 2 * NVH);
+        hb.qbuf = dalloc<float>(RMAX * QG);
+        hb.kbuf = dalloc<float>(RMAX * KVD);
+        hb.vbuf = dalloc<float>(RMAX * KVD);
         hb.conv = dalloc<float>((size_t) 48 * CONV_RING * QKV);
         hb.kvgb = dalloc<float>((size_t) 48 * KV_RING * KVGB);
         mem_mark("decode act bufs, conv, kvgb");
@@ -7638,7 +8307,7 @@ struct MKEngine::Impl {
         hb.blk_lse = dalloc<float2>((size_t) nsm);
         hb.dlog = dalloc<float2>((size_t) MAXT * (TOPK_MAX + 1));
         hb.dq = dalloc<float2>((size_t) MAXT * TOPK_MAX);
-        hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
+        hb.cand = dalloc<float2>((size_t) RMAX * TOPK_MAX);
         hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
         hb.pcnt = nullptr;   // 0.5 MB for the presence / frequency penalty, allocated by the first set_penalty
 #if MK_C1
@@ -7649,7 +8318,7 @@ struct MKEngine::Impl {
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
 #if MK_WV
-        hb.wvpart = dalloc<float>((size_t) WV_S * MAXT * D);
+        hb.wvpart = dalloc<float>((size_t) WV_S * RMAX * D);
         hb.wvcnt = dalloc<unsigned>(2 * (D / 32), DA_INIT0); // (starts at 0; the last arrival of each use resets it)
 #endif
         profiling = getenv("MK_PROFILE") != nullptr;
@@ -7672,7 +8341,7 @@ struct MKEngine::Impl {
             CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&hb.ctl_eg), ce, 0));
         }
 #endif
-        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+        CK(cudaMemcpyToSymbol(cBs, &hb, sizeof(Bufs)));
 
         CK(cudaFuncSetAttribute(mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
         int nb = 0;
@@ -7845,6 +8514,15 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] teardown: %s\n", e.what());
         }
         ck_free(); // (checkpoint copies may still read or write device buffers)
+        for (auto & l : lanes) { // (a live lane's resources are in the members above, the engine's own ones in its Lane)
+            for (auto & k : l.ck) {
+                if (k.ev) cudaEventDestroy(k.ev);
+                if (k.mem) cudaFreeHost(k.mem);
+            }
+#if MK_EGRESS
+            if (l.ctl_eg_host) cudaFreeHost(const_cast<Ctl *>(l.ctl_eg_host));
+#endif
+        }
         for (auto & p : parked)
             for (char * c : p.second.blob.chunks) cudaFreeHost(c);
         for (char * c : sw_blob.chunks) cudaFreeHost(c);
@@ -7946,44 +8624,48 @@ struct MKEngine::Impl {
         if (err_host[0] | err_host[1]) launch_failed();
         launches_seen++;
         if (memlog && launches_seen == 1) mem_mark("first mk_cycle launch");
-        if (profiling && mode == MODE_DECODE) {
-            std::vector<unsigned long long> pr(4096 + 1024 * 128);
-            CK(cudaMemcpy(pr.data(), hb.prof, pr.size() * 8, cudaMemcpyDeviceToHost));
-            unsigned long long prev = pr[0] >> 8;
-            auto & bn = best_ns[T];
-            auto & bt = best_tag[T];
-            auto & bf = best_fill[T];
-            for (int k = 1; k < 4096 && pr[k]; k++) {
-                const unsigned long long t = pr[k] >> 8;
-                const int tag = (int) (pr[k] & 0xff);
-                const double dt = (double) (t - prev);
-                ph_ns[tag] += dt;
-                ph_n[tag]++;
-                launch_ns += dt;
-                prev = t;
-                const unsigned long long mark = pr[2048 + k] & ((1ull << 56) - 1);
-                const double fill = mark ? (double) ((mark - (t - (unsigned long long) dt)) & ((1ull << 56) - 1)) : 0.0;
-                if ((int) bn.size() < k) { bn.resize(k, 1e30); bt.resize(k, -1); bf.resize(k, 0.0); }
-                if (k < 1024) {
-                    std::vector<double> arr;
-                    const unsigned long long t0 = t - (unsigned long long) dt;
-                    for (int b = 0; b < nsm; b++) {
-                        const unsigned long long a = pr[4096 + k * 128 + b];
-                        if (a) arr.push_back((double) (((a & ((1ull << 56) - 1)) - t0) & ((1ull << 56) - 1)));
-                    }
-                    if (arr.size() == (size_t) nsm) {
-                        std::sort(arr.begin(), arr.end());
-                        arr_first[tag] += arr.front();
-                        arr_med[tag] += arr[arr.size() / 2];
-                        arr_last[tag] += arr.back();
-                        arr_n[tag]++;
-                    }
+        if (profiling && mode == MODE_DECODE) prof_collect(T);
+
+    }
+
+    // MK_PROFILE: one decode launch's barrier stamps (T: its rows; 0 = a batched launch)
+    void prof_collect(int T) {
+        std::vector<unsigned long long> pr(4096 + 1024 * 128);
+        CK(cudaMemcpy(pr.data(), hb.prof, pr.size() * 8, cudaMemcpyDeviceToHost));
+        unsigned long long prev = pr[0] >> 8;
+        auto & bn = best_ns[T];
+        auto & bt = best_tag[T];
+        auto & bf = best_fill[T];
+        for (int k = 1; k < 4096 && pr[k]; k++) {
+            const unsigned long long t = pr[k] >> 8;
+            const int tag = (int) (pr[k] & 0xff);
+            const double dt = (double) (t - prev);
+            ph_ns[tag] += dt;
+            ph_n[tag]++;
+            launch_ns += dt;
+            prev = t;
+            const unsigned long long mark = pr[2048 + k] & ((1ull << 56) - 1);
+            const double fill = mark ? (double) ((mark - (t - (unsigned long long) dt)) & ((1ull << 56) - 1)) : 0.0;
+            if ((int) bn.size() < k) { bn.resize(k, 1e30); bt.resize(k, -1); bf.resize(k, 0.0); }
+            if (k < 1024) {
+                std::vector<double> arr;
+                const unsigned long long t0 = t - (unsigned long long) dt;
+                for (int b = 0; b < nsm; b++) {
+                    const unsigned long long a = pr[4096 + k * 128 + b];
+                    if (a) arr.push_back((double) (((a & ((1ull << 56) - 1)) - t0) & ((1ull << 56) - 1)));
                 }
-                if (bt[k - 1] != tag) { bt[k - 1] = tag; bn[k - 1] = dt; bf[k - 1] = fill; } // sequence changed
-                else if (dt < bn[k - 1]) { bn[k - 1] = dt; bf[k - 1] = fill; }
+                if (arr.size() == (size_t) nsm) {
+                    std::sort(arr.begin(), arr.end());
+                    arr_first[tag] += arr.front();
+                    arr_med[tag] += arr[arr.size() / 2];
+                    arr_last[tag] += arr.back();
+                    arr_n[tag]++;
+                }
             }
-            launches++;
+            if (bt[k - 1] != tag) { bt[k - 1] = tag; bn[k - 1] = dt; bf[k - 1] = fill; } // sequence changed
+            else if (dt < bn[k - 1]) { bn[k - 1] = dt; bf[k - 1] = fill; }
         }
+        launches++;
     }
 
     void print_profile() {
@@ -8005,7 +8687,7 @@ struct MKEngine::Impl {
             if (arr_n[i])
                 fprintf(stderr, "  %-16s %8.2f %8.2f %8.2f\n", names[i], arr_first[i] / arr_n[i] / 1e3, arr_med[i] / arr_n[i] / 1e3,
                         arr_last[i] / arr_n[i] / 1e3);
-        for (int T = 1; T <= MAXT; T++) {
+        for (int T = 0; T <= MAXT; T++) { // (T = 0: batched launches)
             if (best_ns[T].empty()) continue;
             std::vector<double> tot(PH_COUNT, 0.0), fil(PH_COUNT, 0.0);
             std::vector<int> cnt(PH_COUNT, 0);
@@ -9049,7 +9731,7 @@ struct MKEngine::Impl {
     void logits_alloc() {
         if (hb.logits) return;
         hb.logits = dalloc<float>((size_t) MAXT * VOCAB);
-        CK(cudaMemcpyToSymbol(cB, &hb.logits, sizeof(hb.logits), offsetof(Bufs, logits)));
+        CK(cudaMemcpyToSymbol(cBs, &hb.logits, sizeof(hb.logits), live_view * sizeof(Bufs) + offsetof(Bufs, logits)));
         mem_mark("scoring logits");
     }
 
@@ -9129,7 +9811,7 @@ struct MKEngine::Impl {
         kv_emu_parse(spec);
 #if MK_KV_EMU
         CK(cudaDeviceSynchronize());
-        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+        CK(cudaMemcpyToSymbol(cBs, &hb, sizeof(Bufs), live_view * sizeof(Bufs)));
 #endif
     }
     int demoted = 0; // recent-window emulation: positions < demoted have been demoted to their slot's mode
@@ -9149,7 +9831,7 @@ struct MKEngine::Impl {
         if (!std::isfinite(pres) || !std::isfinite(freq)) throw std::runtime_error("penalties must be finite");
         if ((pres != 0.f || freq != 0.f) && !hb.pcnt) {
             hb.pcnt = dalloc<unsigned short>(VOCAB, DA_INIT0); // (the first response's counts start from these zeros)
-            CK(cudaMemcpyToSymbol(cB, &hb.pcnt, sizeof(hb.pcnt), offsetof(Bufs, pcnt)));
+            CK(cudaMemcpyToSymbol(cBs, &hb.pcnt, sizeof(hb.pcnt), live_view * sizeof(Bufs) + offsetof(Bufs, pcnt)));
             mem_mark("penalty counts");
         }
         pen_pres = pres;
@@ -9737,6 +10419,435 @@ struct MKEngine::Impl {
         hs_release(sw_blob);
     }
 
+    // ---- lanes (MKEngine::slots_*): sequences of their own, decoded together by batched launches ----
+    // A lane holds a whole conversation: device state of its own (KV cache, recurrent state, rings, ctl), its host
+    // bookkeeping, a small checkpoint pool. While a lane is live (lane_in) its state sits in the Impl's own members and
+    // cView selects its full view, so every single-sequence path (prefill, rewind, truncate, a solo decode step) runs on it
+    // unchanged; lane_out swaps it back. Batched launches (lanes_step) read every lane through its views at once. The
+    // row buffers (x, qn, ..), the barrier words and the lm_head scratch are the engine's own, shared by all lanes.
+    struct Lane {
+        int ctx = 0;
+        Bufs hb{};
+        std::vector<int> seq;
+        Ctl hctl{};
+        int kv_top = 0, nd_avail = 0, ndraft = 0, last_acc = 0, demoted = 0, dv_n = 0;
+        bool all_acc = true;
+        float smp_temp = 0.f, smp_top_p = 1.f, smp_min_p = 0.f;
+        int smp_top_k = TOPK_MAX;
+        unsigned long long smp_seed = 0;
+        std::vector<Span> spans, rope_spans;
+#if MK_EGRESS
+        volatile Ctl * ctl_eg_host = nullptr;
+#endif
+        std::vector<CkSlot> ck;
+        std::vector<CkChunk> ck_plan;
+        std::vector<RingSide> rsides[N_ATT_SLOTS]; // MK_EXACT + MK_KV_WIN: its window rings as its checkpoints copy them
+        std::vector<int> pend; // prompt tokens slot_begin queued, not prefilled yet
+        int first = -1;        // the first token of the finished prefill: emitted by the next slots_step
+    };
+    std::vector<Lane> lanes;
+    int live = -1;          // the lane whose state the Impl's members hold (-1: the engine's own sequence)
+    int live_view = 0;      // cView: view_full(live), or 0
+    bool dv_frozen = false; // lanes open: the draft vocabulary stays the base list (shared by every sequence)
+    bool par_wide = false;  // batched passes up to RMAX rows (MK_PAR_WIDE build, the model's matrices and the GPU allow them)
+    bool pf_no_end_save = false; // (slot_prefill's chunks before the last: no checkpoint at their end)
+    void lane_swap(Lane & l) {
+        std::swap(ctx, l.ctx);
+        std::swap(hb, l.hb);
+        std::swap(seq, l.seq);
+        std::swap(hctl, l.hctl);
+        std::swap(kv_top, l.kv_top);
+        std::swap(nd_avail, l.nd_avail);
+        std::swap(ndraft, l.ndraft);
+        std::swap(last_acc, l.last_acc);
+        std::swap(demoted, l.demoted);
+        std::swap(dv_n, l.dv_n);
+        std::swap(all_acc, l.all_acc);
+        std::swap(smp_temp, l.smp_temp);
+        std::swap(smp_top_p, l.smp_top_p);
+        std::swap(smp_min_p, l.smp_min_p);
+        std::swap(smp_top_k, l.smp_top_k);
+        std::swap(smp_seed, l.smp_seed);
+        std::swap(spans, l.spans);
+        std::swap(rope_spans, l.rope_spans);
+#if MK_EGRESS
+        std::swap(ctl_eg_host, l.ctl_eg_host);
+#endif
+        std::swap(ck, l.ck);
+        std::swap(ck_plan, l.ck_plan);
+        std::swap(rsides, l.rsides);
+    }
+    void set_cview(int v) {
+        if (v == live_view) return;
+        CK(cudaMemcpyToSymbol(cView, &v, sizeof(int)));
+        live_view = v;
+    }
+    void lane_in(int k) {
+        if (k < 0 || k >= (int) lanes.size()) throw std::runtime_error("no slot " + std::to_string(k));
+        if (live == k) return;
+        lane_out();
+        hs_quiesce();
+        lane_swap(lanes[k]);
+        live = k;
+        set_cview(view_full(k));
+    }
+    void lane_out() {
+        if (live < 0) return;
+        hs_quiesce();
+        lane_swap(lanes[live]);
+        live = -1;
+        set_cview(0);
+    }
+    // n pinned checkpoint slots (as ck_alloc's: the streams and events are the engine's)
+    std::vector<CkSlot> ck_new_slots(int n) {
+        std::vector<CkSlot> v;
+        const size_t nf = CK_NS + CK_NC + CK_NH;
+        for (int i = 0; i < n; i++) {
+            CkSlot s;
+            if (cudaHostAlloc(&s.mem, nf * 4, cudaHostAllocMapped) != cudaSuccess) {
+                cudaGetLastError();
+                break;
+            }
+            s.dstate = static_cast<float *>(s.mem);
+            s.conv = s.dstate + CK_NS;
+            s.hhist = s.conv + CK_NC;
+            CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&s.hdev), s.hhist, 0));
+            CK(cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming));
+            if (ring_bytes_ck > 0 && cudaHostAlloc(reinterpret_cast<void **>(&s.ring), ring_bytes_ck, cudaHostAllocDefault) != cudaSuccess) {
+                cudaGetLastError();
+                s.ring = nullptr; // (as ck_alloc's: restores of this checkpoint refill the rings, not exact)
+                fprintf(stderr, "[mk] warning: no pinned host memory for a slot checkpoint's KV window rings: its restores refill them (not exact)\n");
+            }
+            v.push_back(s);
+        }
+        return v;
+    }
+    // device bytes of one lane's KV cache of lctx positions in the engine's format (MK_KV bits per slot and side, fp16 scales,
+    // the MK_KV_WIN q8 rings of the sides that have one)
+    size_t lane_kv_bytes(int lctx) const {
+        const size_t srows = (size_t) NKV * (lctx + KV_PAD);
+        size_t b = 0;
+        for (int w = 0; w < 2; w++)
+            for (int sl = 0; sl < kv_slots; sl++) {
+                b += srows * ((size_t) HD * hb.kvb[w][sl] / 8 + (HD / 32) * sizeof(__half));
+                if (hb.kvrp[w][sl]) b += (size_t) NKV * hb.kvrc * (HD + (HD / 32) * sizeof(__half));
+            }
+        return b;
+    }
+    // device bytes of one lane of ctx positions (KV cache; state, rings, partials, ctl)
+    size_t lane_bytes(int lctx) const {
+        return lane_kv_bytes(lctx) + sizeof(float) * ((size_t) 48 * CONV_RING * QKV + (size_t) 48 * KV_RING * KVGB +
+               (size_t) 48 * NVH * 128 * 128 + (size_t) NKV * MAX_CH * AR * 256 + (size_t) NKV * MAX_CH * AR * 2 +
+               (size_t) H_RING * D + D);
+    }
+    // MKEngine::slots_open: n lanes of lctx positions each (0: the most that fit, leaving MK_SLOT_RESERVE_MIB, default
+    // 1536, for the prefill and the runtime); returns lctx
+    int slots_open(int n, int lctx) {
+#if !(MK_MAXT > 5 && MK_EGRESS)
+        (void) n;
+        (void) lctx;
+        throw std::runtime_error("parallel slots need a MK_WV=1 MK_MAXT > 5 build");
+#else
+        if (!lanes.empty()) throw std::runtime_error("slots are open already");
+        if (n < 1 || n > NSEQ) throw std::runtime_error("slots: 1 .. " + std::to_string(NSEQ));
+        lane_out();
+        // (any MK_KV / MK_KV_WIN preset: every lane gets the engine's per-slot formats and window rings of its own; every
+        // device path reads them through the lane's views, the host's per-sequence ring state is in the Lane)
+        if (!hb.kvq8) throw std::runtime_error("parallel slots need the q8 KV cache (--kv q8; MK_KV / MK_KV_WIN presets are fine)");
+#if MK_KV_EMU
+        for (int w = 0; w < 2; w++)
+            for (int sl = 0; sl < N_ATT_SLOTS; sl++)
+                if (hb.kvemu[w][sl]) throw std::runtime_error("parallel slots: no MK_KV_EMU_SPEC (emulated formats)");
+#endif
+        for (int L = 0; L < NL; L++)
+            if (!hw.L[L].attn && !(hw.L[L].qkv.fm && hw.L[L].gate.fm))
+                throw std::runtime_error("parallel slots: this model's delta-net projections are not all in the wv layout (types the batched launch does not serve)");
+        if (!spans.empty()) throw std::runtime_error("parallel slots: the engine's own sequence holds images (reset it first)");
+        par_wide = false;
+#if MK_PAR_WIDE
+        {
+            // the RMAX-row pass (wv.cuh "batched passes wider than MAXT rows") runs every main matrix but ffn_gate / ffn_up in
+            // the wv layout, K6 without its K parts (bit 1 alone), and one item per warp in every weight phase
+            std::string why;
+            for (int L = 0; L < NL && why.empty(); L++) {
+                const LayerW & W = hw.L[L];
+                if (W.attn && !(W.q.fm && W.k.fm && W.v.fm && W.o.fm)) why = "an attention q / k / v / out matrix of a type outside the wv layout";
+                if (!W.attn && !W.sout.fm) why = "a delta-net ssm_out matrix of a type outside the wv layout";
+                if (!W.fd.fm) why = "an ffn_down matrix outside the wv layout";
+            }
+            if (why.empty() && (hb.k6 & 1) && !(hb.k6 & 4)) why = "MK_K6 K parts (bit 1 without bit 4)";
+            const int G = nsm / WV_S;
+            if (why.empty() && ((D / 16 + G - 1) / std::max(G, 1) > NW || (FF / 16 / WV_S + G - 1) / std::max(G, 1) > NW ||
+                                (QKV / 16 + VD / 16 + nsm - 1) / nsm > NW || QG / 16 + 4 * (KVD / 16) > nsm * NW))
+                why = "a GPU with fewer SMs than one item per warp needs";
+            if (getenv("MK_PAR_RMAX") && atoi(getenv("MK_PAR_RMAX")) <= MAXT) why = "MK_PAR_RMAX";
+            par_wide = why.empty();
+            fprintf(stderr, "[mk] parallel slots: batched passes of %s\n", par_wide ? (std::to_string(RMAX) + " rows").c_str()
+                                                                               : (std::to_string(MAXT) + " rows (" + why + ")").c_str());
+        }
+#endif
+        CK(cudaDeviceSynchronize());
+        if (lctx <= 0) {
+            size_t free_b = 0, total_b = 0;
+            CK(cudaMemGetInfo(&free_b, &total_b));
+            const size_t reserve = (size_t) (getenv("MK_SLOT_RESERVE_MIB") ? atol(getenv("MK_SLOT_RESERVE_MIB")) : 1536) << 20;
+            const size_t avail = free_b > reserve ? (free_b - reserve) / n : 0;
+            int lo = 0, hi = 1 << 20;
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) / 2;
+                if (lane_bytes(mid) <= avail) lo = mid;
+                else hi = mid - 1;
+            }
+            lctx = lo / ATT_BUCKET * ATT_BUCKET;
+            if (lctx < 2 * ATT_BUCKET) throw std::runtime_error("parallel slots: not enough free device memory");
+        }
+        // RoPE rows for the lanes (plain positions; the engine's own table when it is long enough)
+        float2 * rope = const_cast<float2 *>(hb.rope);
+        if (lctx + KV_PAD > hb.ctx) {
+            std::vector<float2> rt((size_t) (lctx + KV_PAD) * 32);
+            for (int p = 0; p < lctx + KV_PAD; p++)
+                for (int i = 0; i < 32; i++) {
+                    const double th = (double) p * std::pow((double) ROPE_BASE, -2.0 * i / 64.0);
+                    rt[(size_t) p * 32 + i] = make_float2((float) std::cos(th), (float) std::sin(th));
+                }
+            rope = dalloc<float2>(rt.size(), false);
+            CK(cudaMemcpy(rope, rt.data(), rt.size() * sizeof(float2), cudaMemcpyHostToDevice));
+        }
+        const int nck = getenv("MK_SLOT_CK") ? std::max(1, atoi(getenv("MK_SLOT_CK"))) : 2;
+        lanes.resize(n);
+        for (int k = 0; k < n; k++) {
+            Lane & l = lanes[k];
+            l.ctx = lctx;
+            l.hb = hb;
+            Bufs & b = l.hb;
+            b.ctx = lctx + KV_PAD;
+            // the KV cache in the engine's layout (the constructor's): per slot and side its MK_KV bits (kvb, kvr / kvrv rotation
+            // as hb's), slots packed in order (all-q8: [slot][kv head][ctx][HD]), fp16 scales [slot][kv head][ctx][HD / 32];
+            // a q8 window ring of its own for every side the engine keeps one for (MK_KV_WIN, kvwin / kvrc as hb's)
+            const size_t srows = (size_t) NKV * b.ctx;
+            size_t vbytes[2] = {0, 0};
+            for (int w = 0; w < 2; w++)
+                for (int sl = 0; sl < kv_slots; sl++) vbytes[w] += srows * HD * hb.kvb[w][sl] / 8;
+            b.kc = dalloc<int8_t>(vbytes[0]);
+            b.vc = dalloc<int8_t>(vbytes[1]);
+            b.ksc = dalloc<__half>((size_t) kv_slots * srows * (HD / 32));
+            b.vsc = dalloc<__half>((size_t) kv_slots * srows * (HD / 32));
+            size_t off[2] = {0, 0};
+            for (int sl = 0; sl < N_ATT_SLOTS; sl++)
+                for (int w = 0; w < 2; w++) {
+                    b.kvrp[w][sl] = nullptr;
+                    b.kvrs[w][sl] = nullptr;
+                    if (sl >= kv_slots) {
+                        b.kvp[w][sl] = nullptr;
+                        b.kvs[w][sl] = nullptr;
+                        continue;
+                    }
+                    b.kvp[w][sl] = static_cast<int8_t *>(w ? b.vc : b.kc) + off[w];
+                    b.kvs[w][sl] = (w ? b.vsc : b.ksc) + (size_t) sl * srows * (HD / 32);
+                    off[w] += srows * HD * hb.kvb[w][sl] / 8;
+                    if (hb.kvrp[w][sl]) {
+                        b.kvrp[w][sl] = dalloc<int8_t>((size_t) NKV * hb.kvrc * HD);
+                        b.kvrs[w][sl] = dalloc<__half>((size_t) NKV * hb.kvrc * (HD / 32));
+                    }
+                }
+            for (int sl = 0; sl < N_ATT_SLOTS; sl++) { // (ck_alloc's ring sides, offsets and order: the lane's rings)
+                l.rsides[sl].clear();
+                for (const RingSide & r : rsides[sl])
+                    for (int w = 0; w < 2; w++)
+                        if (r.q == hb.kvrp[w][sl]) l.rsides[sl].push_back({b.kvrp[w][sl], b.kvrs[w][sl], r.off});
+            }
+            b.conv = dalloc<float>((size_t) 48 * CONV_RING * QKV);
+            b.kvgb = dalloc<float>((size_t) 48 * KV_RING * KVGB);
+            b.dstate = dalloc<float>((size_t) 48 * NVH * 128 * 128);
+            b.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
+            b.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
+            b.h_hist = dalloc<float>((size_t) H_RING * D);
+            b.hm = dalloc<float>(D);
+            b.dlog = dalloc<float2>((size_t) MAXT * (TOPK_MAX + 1));
+            b.dq = dalloc<float2>((size_t) MAXT * TOPK_MAX);
+            b.ctl = dalloc<Ctl>(1);
+            b.pcnt = nullptr;
+            b.logits = nullptr;
+            b.rope = rope;
+            {
+                Ctl * ce = nullptr;
+                CK(cudaHostAlloc(reinterpret_cast<void **>(&ce), sizeof(Ctl), cudaHostAllocMapped));
+                memset(ce, 0, sizeof(Ctl));
+                l.ctl_eg_host = ce;
+                CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&b.ctl_eg), ce, 0));
+            }
+            l.ck = ck_new_slots(nck);
+            CK(cudaMemcpyToSymbol(cBs, &b, sizeof(Bufs), view_full(k) * sizeof(Bufs)));
+            CK(cudaMemcpyToSymbol(cBs, &b, sizeof(Bufs), view_main(k) * sizeof(Bufs)));
+            {
+                const Bufs vm = lane_main_view(l, k); // (batched MTP: lane k's rows at row k)
+                CK(cudaMemcpyToSymbol(cBs, &vm, sizeof(Bufs), view_mtp(k) * sizeof(Bufs)));
+            }
+            lane_in(k);
+            ck_make_plan();
+            reset();
+            seq.clear();
+            lane_out();
+        }
+        dv_reset();
+        dv_frozen = true;
+        bool lowbit = false;
+        for (int w = 0; w < 2; w++)
+            for (int sl = 0; sl < kv_slots; sl++) lowbit |= hb.kvb[w][sl] != 8 || (w ? hb.kvrv[sl] : hb.kvr[sl]);
+        int ck_rings = 0;
+        for (const CkSlot & c : lanes[0].ck) ck_rings += c.ring != nullptr;
+        fprintf(stderr, "[mk] %d parallel slots of %d positions (%s KV%s: %.2f GB, %.2f GB each in all, %zu checkpoints each",
+                n, lctx, lowbit ? "MK_KV" : "q8", hb.kvwin > 0 ? " + MK_KV_WIN rings" : "", lane_kv_bytes(lctx) / 1e9,
+                lane_bytes(lctx) / 1e9, lanes[0].ck.size());
+        if (ring_bytes_ck > 0) fprintf(stderr, ", %d with the window rings, %.1f MiB pinned host each", ck_rings, ring_bytes_ck / 1048576.0);
+        fprintf(stderr, ")\n");
+        return lctx;
+#endif
+    }
+#if MK_MAXT > 5 && MK_EGRESS
+    // the main view of lane k for a batched launch: its rows start at row r0 of the pass
+    Bufs lane_main_view(const Lane & l, int r0) const {
+        Bufs v = l.hb;
+        v.x += (size_t) r0 * D;
+        v.xm += (size_t) r0 * D;
+        auto qoff = [&](QBuf & q) {
+            q.xa += (size_t) r0 * q.U * 16;
+            q.xb += (size_t) r0 * q.U * 16;
+            q.meta += (size_t) r0 * q.U;
+            q.ssq += (size_t) r0 * q.U;
+        };
+        qoff(v.qn);
+        qoff(v.qo);
+        qoff(v.qa);
+        qoff(v.qe);
+        v.z += (size_t) r0 * VD;
+        v.ab += (size_t) r0 * 2 * NVH;
+        v.qbuf += (size_t) r0 * QG;
+        v.kbuf += (size_t) r0 * KVD;
+        v.vbuf += (size_t) r0 * KVD;
+        v.cand += (size_t) r0 * TOPK_MAX;
+        return v;
+    }
+    // one batched decode launch of lanes ks (>= 2, none live, every one past its prefill): returns each lane's tokens
+    // (empty: its context is full). Rows: lane i verifies T_i <= Tcap = MAXT / nl tokens (its drafts beyond are dropped,
+    // as att_cap_T drops them) and drafts up to Tcap - 1 for the next launch.
+    std::vector<std::vector<int>> lanes_step(const std::vector<int> & ks) {
+        lane_out();
+        const int nl = (int) ks.size();
+        std::vector<std::vector<int>> out(nl);
+        // rows per lane: the lanes' slots (lane_slot: T <= 5, or 8 rows) share RMAX rows (par_wide) or MAXT
+        const int rmax = par_wide ? RMAX : MAXT;
+        int tcap = rmax / nl >= MAXT ? MAXT : std::min(5, rmax / nl);
+        // two lanes: both in one MAXT-row pass (3 drafts each) beat a wide pass with deeper drafts (Q4_K_M, temp 0.6,
+        // 2026-10-28: 226 vs 183 tok/s total; the wide passes still win at 3 and 4 lanes)
+        if (nl == 2) tcap = MAXT / 2;
+        Launch L{};
+        L.mode = MODE_DECODE;
+        L.nl = 0;
+        int rows = 0, top = 0;
+        std::vector<int> li(nl, -1), nd(nl, 0), Ti(nl, 0);
+        for (int i = 0; i < nl; i++) {
+            Lane & l = lanes[ks[i]];
+            const Ctl & c = l.hctl;
+            if (c.n + MAXT + 2 >= l.ctx) continue; // (context full: no tokens)
+            int T = att_cap_T(c.n, std::min(tcap, 1 + l.nd_avail));
+            if (T > 5 && att_cap_T(c.n, MAXT) < MAXT) T = 5; // (an 8-row slot lies in one attention partition, as step_live's)
+            int d = std::min(depth_top(c.n), tcap - 1);
+            if (pol.depth == 0) d = (!l.all_acc && d > 3) ? d - 1 : d;
+            else if (pol.depth == 2) d = std::min(d, std::max(std::min(pol.dmin, d), 1 + l.last_acc));
+            Launch::Lane & q = L.ln[L.nl];
+            q.lane = ks[i];
+            q.T = T;
+            q.r0 = rows;
+            q.nd = d;
+            q.top_k = l.smp_top_k;
+            q.spec_smp = l.smp_temp > 0.f && pol.h1;
+            q.temp = l.smp_temp;
+            q.top_p = l.smp_top_p;
+            q.min_p = l.smp_min_p;
+            q.seed = l.smp_seed;
+            li[i] = L.nl++;
+            nd[i] = d;
+            Ti[i] = T;
+            rows += lane_slot(T);
+            top = std::max(top, d);
+        }
+        if (L.nl == 0) return out;
+        if (L.nl == 1) { // (the others are full: a solo step)
+            int k = -1;
+            for (int i = 0; i < nl; i++)
+                if (li[i] >= 0) k = i;
+            lane_in(ks[k]);
+            std::vector<int> o;
+            step_live(o);
+            out[k] = o;
+            lane_out();
+            return out;
+        }
+        L.T = rows <= 5 ? rows : rows <= MAXT ? MAXT : RMAX;
+        L.mtpb = hb.mtp_win <= 0; // (MK_MTP_WIN: the window start follows the pass's first row)
+        L.ndraft = top;
+        for (int k = 0; k < MAXT - 1; k++) {
+            L.gate_drop[k] = pol.gate_drop[k];
+            L.gate_stop[k] = pol.gate_stop[k];
+        }
+        if (top >= 1) L.gate_drop[top - 1] = std::max(L.gate_drop[top - 1], pol.drop_last);
+        L.gate_chain = pol.gate_chain;
+        L.spec_smp = 0;
+        for (int i = 0; i < L.nl; i++) L.spec_smp |= L.ln[i].spec_smp;
+        if (L.gate_chain == 2 && L.spec_smp)
+            for (int k = 0; k < MAXT - 1; k++) L.gate_drop[k] = 0.f;
+        L.spec_blk = 0;
+        for (int i = 0; i < nl; i++) {
+            if (li[i] < 0) continue;
+            Lane & l = lanes[ks[i]];
+            l.kv_top = std::max(l.kv_top, l.hctl.n + Ti[i] + nd[i]);
+            const Bufs v = lane_main_view(l, L.ln[li[i]].r0);
+            CK(cudaMemcpyToSymbolAsync(cBs, &v, sizeof(Bufs), view_main(ks[i]) * sizeof(Bufs), cudaMemcpyHostToDevice, 0));
+            if (L.mtpb) { // (the lane's MTP view: its buffers as they are now, rows at row ks[i])
+                const Bufs vm = lane_main_view(l, ks[i]);
+                CK(cudaMemcpyToSymbolAsync(cBs, &vm, sizeof(Bufs), view_mtp(ks[i]) * sizeof(Bufs), cudaMemcpyHostToDevice, 0));
+            }
+        }
+        void * args[] = {&L};
+        ck_wait_restore();
+        ck_guard_state();
+        ring_snap_guard();
+        if (!bar_live) {
+#if MK_C1
+            CK(cudaMemsetAsync(hb.bar, 0, C1_WORDS * 4));
+#else
+            CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
+#endif
+            bar_live = true;
+        }
+        if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
+        CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
+        wd_T = L.T;
+        wd_mode = MODE_DECODE;
+        wait_device("a batched decode launch", wd_limit);
+        if (err_host[0] | err_host[1]) launch_failed();
+        launches_seen++;
+        if (profiling) prof_collect(0);
+        for (int i = 0; i < nl; i++) {
+            if (li[i] < 0) continue;
+            Lane & l = lanes[ks[i]];
+            Ctl & c = l.hctl;
+            memcpy(&c, const_cast<const Ctl *>(l.ctl_eg_host), sizeof(Ctl));
+            l.nd_avail = nd[i] > 0 ? std::min(nd[i], c.nd_prod) : 0;
+            l.ndraft = nd[i];
+            out[i].assign(c.out, c.out + c.n_out);
+            l.seq.insert(l.seq.end(), c.out, c.out + c.n_out);
+            l.dv_n = -1;
+            l.all_acc = c.n_acc == Ti[i] - 1;
+            l.last_acc = c.n_acc;
+        }
+        return out;
+    }
+#endif
+    // one solo decode step of the live sequence (MKEngine::step's body): appends the emitted tokens to out
+    int step_live(std::vector<int> & out);
+
     void reset() {
         ck_rs_slot = -1;   // (a restore not issued yet is moot)
         ck_wait_restore(); // (an issued one still writes the state)
@@ -10119,7 +11230,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
 #if MK_SPEC_LOG
     p_->slog_drafts();
 #endif
-    if (end_save && p_->ck_find(c.dn_c) < 0) {
+    if (end_save && !p_->pf_no_end_save && p_->ck_find(c.dn_c) < 0) {
         const int si = p_->ck_assign({c.dn_c}, c.dn_c, c.dn_c)[0];
         if (si >= 0) p_->ck_save_end(si);
     }
@@ -10509,47 +11620,8 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
 }
 
 int MKEngine::step(std::vector<int> & out) {
-    Ctl & c = p_->hctl;
-    if (c.n + MAXT + 2 >= p_->ctx) throw std::runtime_error("context full"); // (rows past ctx: KV_PAD)
-    // verify the previous launch's drafts, minus any that would put this launch's rows across an
-    // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
-#if MK_MAXT > 5
-    // T >= 6 runs as one MAXT-row pass (padding rows): the whole n + 1 .. n + MAXT must lie in one partition, else at most 5
-    int T = att_cap_T(c.n, 1 + p_->nd_avail);
-    if (T > 5 && att_cap_T(c.n, MAXT) < MAXT) T = 5;
-#else
-    const int T = att_cap_T(c.n, 1 + p_->nd_avail);
-#endif
-    // Draft depth (an upper bound: the on-device gate may stop drafting earlier). Default (depth 0):
-    // after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper draft
-    // is then unlikely to be accepted; the full depth again after a fully accepted cycle.
-    const Impl::Policy & pol = p_->pol;
-    const int top = p_->depth_top(c.n); // n_draft (MK_MAXT > 5: at most 4 from Policy::dctx on)
-    int nd = top;
-    if (pol.depth == 0) nd = (!p_->all_acc && top > 3) ? top - 1 : top;
-    else if (pol.depth == 2) nd = std::min(top, std::max(std::min(pol.dmin, top), 1 + p_->last_acc));
-    p_->ndraft = nd;
-#if MK_SPEC_LOG
-    const int n0 = c.n;
-    int drafts[MAXT];
-    for (int i = 1; i < T; i++) drafts[i] = c.tok[i];
-#endif
-    p_->launch(MODE_DECODE, T, 0);
-#if MK_EGRESS
-    p_->ctl_fetch(c);
-#else
-    CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
-#endif
-    p_->nd_avail = nd > 0 ? std::min(nd, c.nd_prod) : 0;
-#if MK_SPEC_LOG
-    p_->slog_cycle(n0, T, drafts, c);
-#endif
-    for (int i = 0; i < c.n_out; i++) out.push_back(c.out[i]);
-    p_->seq.insert(p_->seq.end(), c.out, c.out + c.n_out);
-    p_->dv_add(c.out, c.n_out);
-    p_->dv_n = -1;
-    p_->all_acc = c.n_acc == T - 1;
-    p_->last_acc = c.n_acc;
+    const int T = p_->step_live(out);
+    const Ctl & c = p_->hctl;
     stats.cycles++;
     stats.drafted += T - 1;
     stats.accepted += c.n_acc;
@@ -10557,6 +11629,170 @@ int MKEngine::step(std::vector<int> & out) {
     stats.last_nd = p_->nd_avail;
     stats.last_acc = c.n_acc;
     return c.n_out;
+}
+
+// ---- parallel slots (open-jet's slot API over lanes, see Impl::Lane) ----
+// Every slot call leaves the engine's own sequence live again, so the single-sequence API is unaffected between them.
+#define MK_LANE_OUT()                                       \
+    struct LaneOut {                                        \
+        Impl * p;                                           \
+        ~LaneOut() { p->lane_out(); }                       \
+    } lane_out_guard{p_}
+
+int MKEngine::slots_open(int n, int ctx, int /*seg_tokens*/) { return p_->slots_open(n, ctx); }
+
+int MKEngine::slots_count() const { return (int) p_->lanes.size(); }
+
+int MKEngine::slot_begin(int slot, const std::vector<int> & toks, float temp, float top_p, int top_k, float min_p,
+                         unsigned long long seed, int /*share_len*/, bool /*pin*/) {
+    Impl & I = *p_;
+    MK_LANE_OUT();
+    if (toks.empty()) throw std::runtime_error("empty prompt");
+    I.lane_in(slot);
+    set_sampling(temp, top_p, top_k, min_p, seed);
+    Impl::Lane & L = I.lanes[slot];
+    L.first = -1;
+    L.pend.clear();
+    if ((int) toks.size() + 8 > I.ctx) throw std::runtime_error("prompt exceeds the slot's context");
+    size_t c = 0;
+    while (c < I.seq.size() && c < toks.size() && I.seq[c] == toks[c]) c++;
+    if (c < I.seq.size() || c == toks.size()) {
+        // back to a position <= c from which at least the prompt's last token is fed: a truncate (emitted tokens past the
+        // committed position), else the newest checkpoint there, else from scratch
+        const int target = (int) std::min(c, toks.size() - 1);
+        int best = -1;
+        for (const auto & k : I.ck)
+            if (k.pos >= 0 && k.pos <= target && k.pos > best) best = k.pos;
+        if (target >= I.hctl.dn_c) truncate(target);
+        else if (best >= 0 && rewind_to(best)) {
+        } else reset();
+    }
+    const int reused = (int) I.seq.size();
+    L.pend.assign(toks.begin() + reused, toks.end());
+    return reused;
+}
+
+int MKEngine::slot_prefill(int slot, int budget) {
+    Impl & I = *p_;
+    MK_LANE_OUT();
+    I.lane_in(slot);
+    Impl::Lane & L = I.lanes[slot];
+    if (budget <= 0) { // (abandoned: the sequence keeps what was prefilled)
+        L.pend.clear();
+        return 0;
+    }
+    if (L.pend.empty()) return 0;
+    const size_t n = std::min<size_t>(L.pend.size(), (size_t) budget);
+    const std::vector<int> chunk(L.pend.begin(), L.pend.begin() + n);
+    L.pend.erase(L.pend.begin(), L.pend.begin() + n);
+    if (L.pend.empty()) { // the prompt's last chunk: its first token, a checkpoint before the prompt's last token
+        const int end = (int) I.seq.size() + (int) chunk.size();
+        L.first = prefill(chunk, end - 1);
+    } else { // (the token a chunk's last row samples is not the reply's: dropped)
+        struct NoEnd {
+            Impl * p;
+            ~NoEnd() { p->pf_no_end_save = false; }
+        } ne{p_};
+        I.pf_no_end_save = true;
+        prefill(chunk);
+        truncate((int) I.seq.size() - 1);
+    }
+    return (int) L.pend.size();
+}
+
+std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slots) {
+    Impl & I = *p_;
+    MK_LANE_OUT();
+    std::vector<std::vector<int>> out(slots.size());
+    std::vector<int> ks, at;
+    for (size_t i = 0; i < slots.size(); i++) {
+        if (slots[i] < 0 || slots[i] >= (int) I.lanes.size()) throw std::runtime_error("no slot " + std::to_string(slots[i]));
+        Impl::Lane & L = I.lanes[slots[i]];
+        if (L.first >= 0) { // (its prefill's token first: this call only emits it)
+            out[i].push_back(L.first);
+            L.first = -1;
+            continue;
+        }
+        ks.push_back(slots[i]);
+        at.push_back((int) i);
+    }
+    if (ks.size() == 1) {
+        I.lane_in(ks[0]);
+        std::vector<int> o;
+        const Ctl & c = I.hctl;
+        if (c.n + MAXT + 2 < I.ctx) step(o); // (else full: no tokens)
+        out[at[0]] = o;
+    } else if (ks.size() >= 2) {
+#if MK_MAXT > 5 && MK_EGRESS
+        const auto r = I.lanes_step(ks);
+        for (size_t j = 0; j < ks.size(); j++) out[at[j]] = r[j];
+#endif
+    }
+    return out;
+}
+
+// the next chunk of slot pslot's prompt after the step (not yet in the step's pass)
+std::vector<std::vector<int>> MKEngine::slots_step_mixed(int pslot, int budget, const std::vector<int> & slots, int & remain) {
+    auto out = slots_step(slots);
+    remain = slot_prefill(pslot, budget);
+    return out;
+}
+
+std::vector<int> MKEngine::slot_sequence(int slot) {
+    MK_LANE_OUT();
+    p_->lane_in(slot);
+    return p_->seq;
+}
+
+std::vector<float> MKEngine::slot_h(int slot) {
+    MK_LANE_OUT();
+    p_->lane_in(slot);
+    return last_hidden();
+}
+
+// MKEngine::step's body on the live sequence; returns the launch's T
+int MKEngine::Impl::step_live(std::vector<int> & out) {
+    Ctl & c = hctl;
+    if (c.n + MAXT + 2 >= ctx) throw std::runtime_error("context full"); // (rows past ctx: KV_PAD)
+    // verify the previous launch's drafts, minus any that would put this launch's rows across an
+    // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
+#if MK_MAXT > 5
+    // T >= 6 runs as one MAXT-row pass (padding rows): the whole n + 1 .. n + MAXT must lie in one partition, else at most 5
+    int T = att_cap_T(c.n, 1 + nd_avail);
+    if (T > 5 && att_cap_T(c.n, MAXT) < MAXT) T = 5;
+#else
+    const int T = att_cap_T(c.n, 1 + nd_avail);
+#endif
+    // Draft depth (an upper bound: the on-device gate may stop drafting earlier). Default (depth 0):
+    // after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper draft
+    // is then unlikely to be accepted; the full depth again after a fully accepted cycle.
+    const int top = depth_top(c.n); // n_draft (MK_MAXT > 5: at most 4 from Policy::dctx on)
+    int nd = top;
+    if (pol.depth == 0) nd = (!all_acc && top > 3) ? top - 1 : top;
+    else if (pol.depth == 2) nd = std::min(top, std::max(std::min(pol.dmin, top), 1 + last_acc));
+    ndraft = nd;
+#if MK_SPEC_LOG
+    const int n0 = c.n;
+    int drafts[MAXT];
+    for (int i = 1; i < T; i++) drafts[i] = c.tok[i];
+#endif
+    launch(MODE_DECODE, T, 0);
+#if MK_EGRESS
+    ctl_fetch(c);
+#else
+    CK(cudaMemcpy(&c, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+#endif
+    nd_avail = nd > 0 ? std::min(nd, c.nd_prod) : 0;
+#if MK_SPEC_LOG
+    slog_cycle(n0, T, drafts, c);
+#endif
+    for (int i = 0; i < c.n_out; i++) out.push_back(c.out[i]);
+    seq.insert(seq.end(), c.out, c.out + c.n_out);
+    dv_add(c.out, c.n_out);
+    dv_n = -1;
+    all_acc = c.n_acc == T - 1;
+    last_acc = c.n_acc;
+    return T;
 }
 
 std::vector<float> MKEngine::last_hidden() {

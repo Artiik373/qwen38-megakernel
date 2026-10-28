@@ -441,6 +441,13 @@ struct WvXS {
 #endif
 };
 template <int NG> struct WvAcc { float v[NG][4]; };
+// a tile's running sums carried across the K sub-chunk fills of a batched pass wider than MAXT rows (wv_tile_st): v as WvAcc,
+// v1 the FM Q6_K k16 form's chunk-1 sums; finished once after the last sub-chunk (wv_st_fin), so every token's fmaf chain
+// is the whole-K tile's: the same bits as a solo launch
+template <int T, bool X16> struct WvSt {
+    float v[WvCfg<T, X16>::NG][4];
+    float v1[(MK_WV_Q6F && !X16) ? WvCfg<T, X16>::NG : 1][4];
+};
 
 template <int US, int T, bool X16>
 __host__ __device__ constexpr int wv_smem() {
@@ -620,19 +627,10 @@ __device__ __forceinline__ void wv_sb(const typename WV<TYPE>::Raw & r0, const t
 #if MK_WV_Q6F
 // FM Q6_K tile (see "FM Q6_K"): X16 = the split m16n8k32 form, else m16n8k16 per 16-chunk (xs from a q6 fill)
 template <int T, bool X16>
-__device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_q6f(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
+__device__ __forceinline__ void wv_q6f_acc(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs, float (&acc)[WvCfg<T, X16>::NG][4],
+                                           float (&acc1)[X16 ? 1 : WvCfg<T, X16>::NG][4]) {
     using C = WvCfg<T, X16>;
     const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3, h = tq >> 1;
-    WvAcc<C::NG> acc;
-    float acc1[X16 ? 1 : C::NG][4]; // k16 form: chunk 1's sums (acc: chunk 0's)
-#pragma unroll
-    for (int n = 0; n < C::NG; n++)
-#pragma unroll
-        for (int c = 0; c < 4; c++) acc.v[n][c] = 0.f;
-#pragma unroll
-    for (int n = 0; n < (X16 ? 1 : C::NG); n++)
-#pragma unroll
-        for (int c = 0; c < 4; c++) acc1[n][c] = 0.f;
     // B: k16 token 8 n + g, elements 16 c + 4 tq of the sub-block; split token 4 n + (g & 3), chunk g >> 2 only
     const int tok = X16 ? (g & 3) : g, co = X16 ? 16 * (g >> 2) : 0;
     const int8_t * xra = xs.xa + tok * xs.ld + co + 4 * tq;
@@ -664,10 +662,10 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_q6f(const Mat & m, i
                     int c0[4], c1[4];
                     mma16816(c0, w00, w10, b0, ci0);
                     mma16816(c1, w01, w11, b1, ci1);
-                    acc.v[n][0] = fmaf(f00, fmaf(md.x, __int_as_float(c0[0]), md.y), acc.v[n][0]);
-                    acc.v[n][1] = fmaf(f00, fmaf(md.z, __int_as_float(c0[1]), md.w), acc.v[n][1]);
-                    acc.v[n][2] = fmaf(f10, fmaf(md.x, __int_as_float(c0[2]), md.y), acc.v[n][2]);
-                    acc.v[n][3] = fmaf(f10, fmaf(md.z, __int_as_float(c0[3]), md.w), acc.v[n][3]);
+                    acc[n][0] = fmaf(f00, fmaf(md.x, __int_as_float(c0[0]), md.y), acc[n][0]);
+                    acc[n][1] = fmaf(f00, fmaf(md.z, __int_as_float(c0[1]), md.w), acc[n][1]);
+                    acc[n][2] = fmaf(f10, fmaf(md.x, __int_as_float(c0[2]), md.y), acc[n][2]);
+                    acc[n][3] = fmaf(f10, fmaf(md.z, __int_as_float(c0[3]), md.w), acc[n][3]);
                     acc1[n][0] = fmaf(f01, fmaf(md.x, __int_as_float(c1[0]), md.y), acc1[n][0]);
                     acc1[n][1] = fmaf(f01, fmaf(md.z, __int_as_float(c1[1]), md.w), acc1[n][1]);
                     acc1[n][2] = fmaf(f11, fmaf(md.x, __int_as_float(c1[2]), md.y), acc1[n][2]);
@@ -685,25 +683,45 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_q6f(const Mat & m, i
                     const int ci[4] = {__float_as_int(mx.x), __float_as_int(mx.y), __float_as_int(mx.x), __float_as_int(mx.y)};
                     int cc[4];
                     mma16832(cc, a, b0, b1, ci);
-                    acc.v[n][0] = fmaf(fA0, fmaf(md.x, __int_as_float(cc[0]), md.y), acc.v[n][0]);
-                    acc.v[n][1] = fmaf(fA0, fmaf(md.z, __int_as_float(cc[1]), md.w), acc.v[n][1]);
-                    acc.v[n][2] = fmaf(fA1, fmaf(md.x, __int_as_float(cc[2]), md.y), acc.v[n][2]);
-                    acc.v[n][3] = fmaf(fA1, fmaf(md.z, __int_as_float(cc[3]), md.w), acc.v[n][3]);
+                    acc[n][0] = fmaf(fA0, fmaf(md.x, __int_as_float(cc[0]), md.y), acc[n][0]);
+                    acc[n][1] = fmaf(fA0, fmaf(md.z, __int_as_float(cc[1]), md.w), acc[n][1]);
+                    acc[n][2] = fmaf(fA1, fmaf(md.x, __int_as_float(cc[2]), md.y), acc[n][2]);
+                    acc[n][3] = fmaf(fA1, fmaf(md.z, __int_as_float(cc[3]), md.w), acc[n][3]);
                 }
             }
         }
     }
+}
+template <int T, bool X16>
+__device__ __forceinline__ void wv_q6f_fin(float (&acc)[WvCfg<T, X16>::NG][4], const float (&acc1)[X16 ? 1 : WvCfg<T, X16>::NG][4]) {
+    using C = WvCfg<T, X16>;
     if constexpr (!X16) { // chunk 0 + chunk 1 (the split form's tq < 2 sum: own chunk-0 sum + the partner's chunk 1)
 #pragma unroll
         for (int n = 0; n < C::NG; n++)
 #pragma unroll
-            for (int c = 0; c < 4; c++) acc.v[n][c] += acc1[n][c];
+            for (int c = 0; c < 4; c++) acc[n][c] += acc1[n][c];
     } else {
 #pragma unroll
         for (int n = 0; n < C::NG; n++)
 #pragma unroll
-            for (int c = 0; c < 4; c++) acc.v[n][c] += __shfl_xor_sync(0xffffffffu, acc.v[n][c], 2);
+            for (int c = 0; c < 4; c++) acc[n][c] += __shfl_xor_sync(0xffffffffu, acc[n][c], 2);
     }
+}
+template <int T, bool X16>
+__device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_q6f(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
+    using C = WvCfg<T, X16>;
+    WvAcc<C::NG> acc;
+    float acc1[X16 ? 1 : C::NG][4]; // k16 form: chunk 1's sums (acc: chunk 0's)
+#pragma unroll
+    for (int n = 0; n < C::NG; n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) acc.v[n][c] = 0.f;
+#pragma unroll
+    for (int n = 0; n < (X16 ? 1 : C::NG); n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) acc1[n][c] = 0.f;
+    wv_q6f_acc<T, X16>(m, tile, sb0, nsb, xs, acc.v, acc1);
+    wv_q6f_fin<T, X16>(acc.v, acc1);
     return acc;
 }
 #endif
@@ -851,9 +869,27 @@ __device__ __forceinline__ void wv_store(float * dst, int ld, int tile, const Wv
 
 // delta-net input projections: alpha / beta (fp32 path, as dn_proj), qkv -> conv ring and z (wv tiles, or dp4a pairs
 // for a hybrid-type matrix)
-template <int T>
-__device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_c) {
+// BAT (batched launches): row t's qkv goes to the conv ring of its own lane at its own position: rt (the pass's lanes) gives
+// each row its lane, the conv-ring rows are looked up at the start (s_cvp); orphan rows (past the lanes) are not stored.
+// No L2 warm-up of dn_core's inputs (they are per lane). Every matrix of the phase must be in the wv layout (host check).
+template <int T, bool BAT = false>
+__device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_c, RowTab rt = RowTab{}) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, tq = lane & 3;
+    float ** const s_cvp = reinterpret_cast<float **>(misc(nullptr) + 64); // (BAT: per row, its conv-ring row or null)
+    if constexpr (BAT) {
+        if (threadIdx.x < T) {
+            const int t = threadIdx.x;
+            float * cv = nullptr;
+            for (int i = 0; i < rt.nl; i++)
+                if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) {
+                    const Bufs & V = cBs[view_main(rt.lane[i])];
+                    const int p = ((volatile Ctl *) V.ctl)->n + t - rt.r0[i];
+                    cv = V.conv + (size_t) dl * CONV_RING * QKV + (size_t) (p % CONV_RING) * QKV;
+                }
+            s_cvp[t] = cv;
+        }
+        // (published by wv_fill's barrier)
+    }
 #if MK_WV_Q6F // (every main-layer Q6_K is FM: the q32 tiles need the per-chunk qsum table)
     const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.qkv.type == T_Q6K || W.gate.type == T_Q6K);
 #else
@@ -913,7 +949,7 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
         }
 #pragma unroll
         for (int t = 0; t < T; t++) acc[t] = wsum(acc[t]) * s_rs[t];
-        store_lane_t<T>(cB.ab + ch * MAXT * 2 * NVH, 2 * NVH, row, acc);
+        store_lane_t<T>(cB.ab + ch * RMAX * 2 * NVH, 2 * NVH, row, acc);
     }
     int lo = n_ab;
     if (!W.qkv.fm) {
@@ -931,14 +967,18 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
 #pragma unroll
             for (int c = 0; c < 4; c++) {
                 const int t = 2 * tq + (c & 1), r = 16 * lt + g + 8 * (c >> 1);
-                if (t < T) conv[((n + t) % CONV_RING) * QKV + r] = a.v[0][c] * s_rs[t];
+                if constexpr (BAT) {
+                    if (t < T && s_cvp[t]) s_cvp[t][r] = a.v[0][c] * s_rs[t];
+                } else {
+                    if (t < T) conv[((n + t) % CONV_RING) * QKV + r] = a.v[0][c] * s_rs[t];
+                }
             }
         } else {
             wv_store<T>(cB.z, VD, lt, a, s_rs);
         }
     }
     // Warm L2 with what dn_core will read (as dn_proj)
-    if (blockIdx.x < NVH) {
+    if (!BAT && blockIdx.x < NVH) {
         const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x;
         pf_l2(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
         if (tid == 0) {
@@ -996,7 +1036,7 @@ __device__ __noinline__ void attn_kv_part(const Mat m, int w, int lt, int part, 
 #pragma unroll
     for (int c = 0; c < 4; c++) {
         const int t = 2 * tq + (c & 1), r = 16 * lt + g + 8 * (c >> 1);
-        if (t < T) __stcg(pb + ((size_t) part * MAXT + t) * D + r, a.v[0][c]);
+        if (t < T) __stcg(pb + ((size_t) part * RMAX + t) * D + r, a.v[0][c]);
     }
     __threadfence();
     __syncwarp();
@@ -1013,7 +1053,7 @@ __device__ __noinline__ void attn_kv_part(const Mat m, int w, int lt, int part, 
         const int t = 2 * tq + (c & 1), r = 16 * lt + g + 8 * (c >> 1);
         if (t < T) {
             float s = __ldcg(pb + (size_t) t * D + r);
-            for (int p = 1; p < ns; p++) s += __ldcg(pb + ((size_t) p * MAXT + t) * D + r);
+            for (int p = 1; p < ns; p++) s += __ldcg(pb + ((size_t) p * RMAX + t) * D + r);
             dst[t * KVD + r] = s * s_rs[t];
         }
     }
@@ -1050,8 +1090,9 @@ __device__ __noinline__ void attn_kv_rh(const Mat m, int w, int lt, int rh, cons
 }
 
 // attention q / k / v projections (wv tiles of the wv-layout matrices, dp4a pairs of the hybrid's)
+// pf false (batched launches): no L2 warm-up of attn_core's inputs (they are per lane)
 template <int T>
-__device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n) {
+__device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, bool pf = true) {
     const int warp = threadIdx.x >> 5;
 #if MK_WV_Q6F // (every main-layer Q6_K is FM: the q32 tiles need the per-chunk qsum table)
     const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.q.type == T_Q6K || W.k.type == T_Q6K || W.v.type == T_Q6K);
@@ -1100,6 +1141,7 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n) {
         wv_store<T>(w == 0 ? cB.qbuf : w == 1 ? cB.kbuf : cB.vbuf, w == 0 ? QG : KVD, lt, a, s_rs);
     }
     // Warm L2 with what attn_core reads first (as attn_proj)
+    if (!pf) return;
     pf_block(W.qn, HD * 4);
     pf_block(W.kn, HD * 4);
     pf_block(cB.rope + (size_t) n * 32, T * 32 * 8);
@@ -1285,7 +1327,7 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
 #else
         const WvAcc<C::NG> a = wv_tile_any<T, X16>(Wm, tile, CH * kc, CH, xs);
 #endif
-        float * part = cB.wvpart + (size_t) kc * MAXT * D;
+        float * part = cB.wvpart + (size_t) kc * RMAX * D;
         if (!X16 || tq < 2) {
 #pragma unroll
             for (int n = 0; n < C::NG; n++)
@@ -1317,7 +1359,7 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
                     for (int u = 0; u < TB; u++)
                         if (tb + u < T) {
 #pragma unroll
-                            for (int k = 0; k < WV_S; k++) p[u][k] = __ldcg(cB.wvpart + ((size_t) k * MAXT + tb + u) * D + row);
+                            for (int k = 0; k < WV_S; k++) p[u][k] = __ldcg(cB.wvpart + ((size_t) k * RMAX + tb + u) * D + row);
                             xo[u] = __ldcg(x + (tb + u) * D + row);
                         }
 #pragma unroll
@@ -1336,7 +1378,7 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
                 for (int t = 0; t < T; t++) {
                     float s = __ldcg(cB.wvpart + (size_t) t * D + row);
 #pragma unroll
-                    for (int k = 1; k < WV_S; k++) s += __ldcg(cB.wvpart + ((size_t) k * MAXT + t) * D + row);
+                    for (int k = 1; k < WV_S; k++) s += __ldcg(cB.wvpart + ((size_t) k * RMAX + t) * D + row);
                     const float xv = s + __ldcg(x + t * D + row);
                     x[t * D + row] = xv;
                     q32_store(cB.qn, t, j, xv * wnext[row], xv * xv, true);
@@ -1360,3 +1402,616 @@ __device__ __forceinline__ void resid_out_wv(const Mat & Wm, const float * wnext
 #endif
     resid_wv<T, false, VD>(Wm, cB.qo, wnext, 0);
 }
+
+#if MK_PAR_WIDE
+// ---- batched passes wider than MAXT rows (RT = RMAX, MKEngine::lanes_step) ----------------------------------------------
+// 24 rows of K = D activations do not fit shared memory (6.4 KB a row): every wv phase fills the K range in super-block
+// aligned sub-chunks (wv_fill_ck) and each warp carries its single item's sums across them (wv_tile_st, WvSt), finishing
+// once at the end (wv_st_fin). A token's fmaf chain is the same as in the whole-K tile of a solo launch (the same super-blocks
+// in the same order, the finishing shuffle / Q6F chunk-1 add after the last one): bit-identical rows at any RT. Every phase
+// gives a warp at most one item at RMAX (attn_proj <= 1024 items, dn_proj 1024 tiles, ffn_gu 1088 gate / up pairs, resid_wv
+// 320 tiles per split-K chunk on 82 SMs x 16 warps); host checks (slots_open) cover the configurations this does not run.
+
+// sub-chunk size (super-blocks) of a fill of T rows: the largest whose activations + scale tables fit SM_MISC
+__host__ __device__ constexpr int wv_smem_rt(int us, int T, bool X16) { // (wv_smem<us, T, X16>())
+    return 2 * ((T + (X16 ? 3 : 7)) / (X16 ? 4 : 8) * (X16 ? 4 : 8)) * (us + 2) * 16 + T * (us + 2) * 8 +
+           us * ((T + (X16 ? 3 : 7)) / (X16 ? 4 : 8)) * 4 * (MK_WV_Q6F && !X16 ? 40 : 24);
+}
+template <int T, bool X16, int NSB>
+__host__ __device__ constexpr int wv_csb() {
+    int c = NSB;
+    while (c > 1 && wv_smem_rt(8 * c, T, X16) > SM_MISC) c--;
+    return c;
+}
+static_assert(wv_smem_rt(56, 24, false) == wv_smem<56, 24, false>() && wv_smem_rt(48, 24, true) == wv_smem<48, 24, true>(), "wv_smem_rt");
+
+// the RMS-norm scales s_rs[t] of T rows (as wv_fill's): once per phase, published by the first fill's barrier
+template <int T>
+__device__ __forceinline__ void rs_rows(const QBuf & q) {
+    float * s_rs = misc(nullptr);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int t = warp; t < T; t += NW) {
+        float pp[U_D / 32];
+#pragma unroll
+        for (int k = 0; k < U_D / 32; k++) pp[k] = __ldcg(q.ssq + t * U_D + lane + 32 * k);
+        float acc = 0.f;
+#pragma unroll
+        for (int k = 0; k < U_D / 32; k++) acc += pp[k];
+        acc = wsum(acc);
+        if (lane == 0) s_rs[t] = rsqrtf(acc / (float) D + EPS);
+    }
+}
+
+// wv_fill of units [u0, u0 + nu) (nu <= US) without the s_rs part; a barrier first (the previous sub-chunk may be in use)
+template <int T, bool X16, int US>
+__device__ __forceinline__ WvXS wv_fill_ck(const QBuf & q, int u0, int nu, bool min2, bool q6) {
+    using C = WvCfg<T, X16>;
+    constexpr int LDU = US + 2;
+    static_assert(wv_smem<US, T, X16>() <= SM_MISC, "wv activations");
+    uint8_t * const sm = smem;
+    int4 * xa = reinterpret_cast<int4 *>(sm);
+    int4 * xb = xa + C::NTOKP * LDU;
+    uint2 * xm = reinterpret_cast<uint2 *>(xb + C::NTOKP * LDU);
+    float4 * md = reinterpret_cast<float4 *>(xm + T * LDU);
+    float2 * mx = reinterpret_cast<float2 *>(md + US * C::NG * 4);
+    const int tid = threadIdx.x;
+    __syncthreads();
+    for (int i = tid; i < T * nu; i += NT) {
+        const int t = i / nu, u = i - t * nu;
+        const size_t gi = (size_t) t * q.U + u0 + u;
+        cp_async16(xa + t * LDU + u, q.xa + gi * 16);
+        cp_async16(xb + t * LDU + u, q.xb + gi * 16);
+    }
+    for (int i = tid; i < T * nu / 2; i += NT) {
+        const int t = 2 * i / nu, u = 2 * i - t * nu;
+        cp_async16(xm + t * LDU + u, q.meta + (size_t) t * q.U + u0 + u);
+    }
+    asm volatile("cp.async.commit_group;\ncp.async.wait_all;" ::: "memory");
+    __syncthreads();
+    for (int i = tid; i < nu * C::NG * 4; i += NT) {
+        const int j = i / (C::NG * 4), n = (i / 4) % C::NG, tq = i & 3;
+        const int ub = j - (j & 7) + 2 * ((j & 7) >> 1), part = j & 1;
+        float v[4];
+        float2 x2;
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+            int t, hh = -1;
+            if (X16) {
+                t = 4 * n + ((2 * tq) & 3) + k;
+                hh = tq >> 1;
+            } else {
+                t = 8 * n + 2 * tq + k;
+            }
+            float dx = 0.f;
+            int qs = 0;
+            if (t < T) {
+                const uint2 m0 = xm[t * LDU + ub + (hh < 0 ? 0 : hh)];
+                const uint2 m1 = xm[t * LDU + ub + 1];
+                dx = __half2float(reinterpret_cast<const __half *>(&m0.x)[part]);
+                const int q0 = reinterpret_cast<const short *>(&m0.y)[part], q1 = reinterpret_cast<const short *>(&m1.y)[part];
+                qs = hh < 0 ? q0 + q1 : q0;
+            }
+            v[2 * k] = dx;
+            v[2 * k + 1] = -WV_FMAGIC * dx;
+            (k ? x2.y : x2.x) = min2 ? __int_as_float(WV_MAGIC - 32 * qs) : dx * (float) qs;
+        }
+        md[i] = make_float4(v[0], v[1], v[2], v[3]);
+        mx[i] = x2;
+    }
+#if MK_WV_Q6F
+    float4 * const mx4 = reinterpret_cast<float4 *>(mx + US * C::NG * 4);
+    if (!X16 && q6)
+        for (int i = tid; i < nu * C::NG * 4; i += NT) {
+            const int j = i / (C::NG * 4), n = (i / 4) % C::NG, tq = i & 3;
+            const int ub = j - (j & 7) + 2 * ((j & 7) >> 1), part = j & 1;
+            int qv[2][2];
+#pragma unroll
+            for (int k = 0; k < 2; k++) {
+                const int t = 8 * n + 2 * tq + k;
+#pragma unroll
+                for (int c = 0; c < 2; c++) qv[k][c] = t < T ? reinterpret_cast<const short *>(&xm[t * LDU + ub + c].y)[part] : 0;
+            }
+            mx4[i] = make_float4(__int_as_float(WV_MAGIC - 32 * qv[0][0]), __int_as_float(WV_MAGIC - 32 * qv[1][0]),
+                                 __int_as_float(WV_MAGIC - 32 * qv[0][1]), __int_as_float(WV_MAGIC - 32 * qv[1][1]));
+        }
+#endif
+    __syncthreads();
+    mark_fill();
+#if MK_WV_Q6F
+    return WvXS{reinterpret_cast<const int8_t *>(xa), reinterpret_cast<const int8_t *>(xb), LDU * 16, md, mx, mx4};
+#else
+    return WvXS{reinterpret_cast<const int8_t *>(xa), reinterpret_cast<const int8_t *>(xb), LDU * 16, md, mx};
+#endif
+}
+
+template <int T, bool X16>
+__device__ __forceinline__ void wv_st_zero(WvSt<T, X16> & st) {
+#pragma unroll
+    for (int n = 0; n < WvCfg<T, X16>::NG; n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) st.v[n][c] = 0.f;
+#pragma unroll
+    for (int n = 0; n < ((MK_WV_Q6F && !X16) ? WvCfg<T, X16>::NG : 1); n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) st.v1[n][c] = 0.f;
+}
+
+// the generic tile's super-block loop (wv_tile's), on the caller's sums
+template <int TYPE, int T, bool X16>
+__device__ __forceinline__ void wv_gen_acc(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs, float (&acc)[WvCfg<T, X16>::NG][4]) {
+    static_assert(!wv_s16(TYPE) || X16, "per-16 weight scales need the split MMAs");
+    const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
+    const int tok = X16 ? (g & 3) : g;
+    const int8_t * xra = xs.xa + tok * xs.ld + 8 * tq;
+    const int8_t * xrb = xs.xb + tok * xs.ld + 8 * tq;
+    const bool bon = !X16 || (g >> 2) == (tq >> 1);
+#pragma unroll 1
+    for (int sb = 0; sb < nsb; sb++) {
+        typename WV<TYPE>::Raw r0, r1;
+        wv_load2<TYPE>(r0, r1, m, tile, sb0 + sb, g, tq);
+        wv_sb<TYPE, T, X16>(r0, r1, sb, xs, xra, xrb, bon, acc);
+    }
+}
+
+// super-blocks [sb0, sb0 + nsb) of tile `tile` (xs = their fill), continuing st (out of line per type, as wv_tile)
+template <int TYPE, int T, bool X16>
+__device__ __noinline__ WvSt<T, X16> wv_tile_st(const Mat m, int tile, int sb0, int nsb, const WvXS xs, WvSt<T, X16> st) {
+#if MK_WV_Q6F
+    if constexpr (TYPE == T_Q6K) wv_q6f_acc<T, X16>(m, tile, sb0, nsb, xs, st.v, st.v1);
+    else
+#endif
+        wv_gen_acc<TYPE, T, X16>(m, tile, sb0, nsb, xs, st.v);
+    return st;
+}
+
+template <int T, bool X16>
+__device__ __forceinline__ WvSt<T, X16> wv_tile_any_st(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs, const WvSt<T, X16> & st) {
+#if MK_WV_Q6F
+    if constexpr (!X16)
+        if (m.type == T_Q6K) return wv_tile_st<T_Q6K, T, false>(m, tile, sb0, nsb, xs, st);
+#endif
+    if constexpr (X16) {
+        switch (m.type) {
+            case T_Q6K: return wv_tile_st<T_Q6K, T, X16>(m, tile, sb0, nsb, xs, st);
+            case T_Q3K: return wv_tile_st<T_Q3K, T, X16>(m, tile, sb0, nsb, xs, st);
+            case T_IQ3S: return wv_tile_st<T_IQ3S, T, X16>(m, tile, sb0, nsb, xs, st);
+            default: break;
+        }
+    }
+    switch (m.type) {
+        case T_Q4K: return wv_tile_st<T_Q4K, T, X16>(m, tile, sb0, nsb, xs, st);
+        case T_Q5K: return wv_tile_st<T_Q5K, T, X16>(m, tile, sb0, nsb, xs, st);
+        case T_IQ4NL: return wv_tile_st<T_IQ4NL, T, X16>(m, tile, sb0, nsb, xs, st);
+        case T_Q8_0: return wv_tile_st<T_Q8_0, T, X16>(m, tile, sb0, nsb, xs, st);
+        default: return wv_tile_st<T_IQ4X, T, X16>(m, tile, sb0, nsb, xs, st);
+    }
+}
+
+// the tile's finished C fragment (wv_tile's ending: X16 chunk 0 + chunk 1; FM Q6_K k16 form chunk 0 + chunk 1)
+template <int T, bool X16>
+__device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_st_fin(const WvSt<T, X16> & st, int type) {
+    using C = WvCfg<T, X16>;
+    WvAcc<C::NG> a;
+#pragma unroll
+    for (int n = 0; n < C::NG; n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) a.v[n][c] = st.v[n][c];
+    if constexpr (X16) {
+#pragma unroll
+        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) a.v[n][c] += __shfl_xor_sync(0xffffffffu, a.v[n][c], 2);
+    }
+#if MK_WV_Q6F
+    else if (type == T_Q6K) {
+#pragma unroll
+        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) a.v[n][c] += st.v1[n][c];
+    }
+#endif
+    return a;
+}
+
+// K6 bit 4 (exact Q8_0 k / v row halves, attn_kv_rh) on a sub-chunk, continuing st
+template <int T>
+__device__ __noinline__ WvSt<T, false> attn_kv_rh_st(const Mat m, int lt, int rh, int sb0, int nsb, const WvXS xs, WvSt<T, false> st) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
+    const int8_t * xra = xs.xa + g * xs.ld + 8 * tq;
+    const int8_t * xrb = xs.xb + g * xs.ld + 8 * tq;
+#pragma unroll 1
+    for (int sb = 0; sb < nsb; sb++) {
+        typename WV<T_Q8_0>::Raw r0;
+        WV<T_Q8_0>::load(r0, m, lt, g + 8 * rh, sb0 + sb, tq);
+        wv_sb<T_Q8_0, T, false>(r0, r0, sb, xs, xra, xrb, true, st.v);
+    }
+    return st;
+}
+
+// non-split C fragment of tile `tile`, all token groups -> dst[t * ld + 16 tile + row] = v * s_rs[t] (wv_store's values)
+template <int T>
+__device__ __forceinline__ void wv_store_n(float * dst, int ld, int tile, const WvAcc<WvCfg<T, false>::NG> & a, const float * s_rs) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
+#pragma unroll
+    for (int n = 0; n < WvCfg<T, false>::NG; n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const int t = 8 * n + 2 * tq + (c & 1);
+            if (t < T) dst[t * ld + 16 * tile + g + 8 * (c >> 1)] = a.v[n][c] * s_rs[t];
+        }
+}
+
+// non-split C fragment, all token groups -> lane r < 16 holds row r (wv_to_lane's layout)
+template <int T>
+__device__ __forceinline__ LaneT<T> wv_to_lane_n(const WvAcc<WvCfg<T, false>::NG> & a) {
+    const int r = threadIdx.x & 15;
+    LaneT<T> o;
+#pragma unroll
+    for (int t = 0; t < T; t++) {
+        const int n = t >> 3, tt = t & 7, src = 4 * (r & 7) + (tt >> 1);
+        const float x0 = __shfl_sync(0xffffffffu, a.v[n][tt & 1], src);
+        const float x1 = __shfl_sync(0xffffffffu, a.v[n][2 + (tt & 1)], src);
+        o.v[t] = (r >> 3) ? x1 : x0;
+    }
+    return o;
+}
+
+// a hybrid (dp4a) matrix's rows 16 j .. + 15 for token group grp (rows 8 grp .. + 7) read from the QBuf in global memory:
+// the per-lane unit order and warp sums of rows16 (the activations are the same values as its shared-memory copy)
+template <int TYPE>
+__device__ __noinline__ LaneT<8> rows16_g(const Mat m, int j, int grp) {
+    const int lane = threadIdx.x & 31;
+    const QBuf & q = cB.qn;
+    SX sx;
+    sx.xa = reinterpret_cast<int4 *>(q.xa + (size_t) 8 * grp * q.U * 16);
+    sx.xb = reinterpret_cast<int4 *>(q.xb + (size_t) 8 * grp * q.U * 16);
+    sx.xm = q.meta + (size_t) 8 * grp * q.U;
+    sx.U = q.U;
+    const float * s_rs = misc(nullptr) + 8 * grp;
+    constexpr int R = 2;
+    LaneT<8> res;
+#pragma unroll
+    for (int t = 0; t < 8; t++) res.v[t] = 0.f;
+#pragma unroll 1
+    for (int r = 0; r < 16; r += R) {
+        float a[R][8];
+        zero_acc<8, R>(a);
+        mrows<8, 5, R, TYPE, 0>(m, 16 * j + r, sx, a);
+        wsum_acc<8, R>(a);
+#pragma unroll
+        for (int k = 0; k < R; k++)
+            if (lane == r + k) {
+#pragma unroll
+                for (int t = 0; t < 8; t++) res.v[t] = a[k][t] * s_rs[t];
+            }
+    }
+    return res;
+}
+__device__ __forceinline__ LaneT<8> rows16_dp_g(const Mat & m, int j, int grp) {
+    switch (m.type) {
+        case T_Q6K: return rows16_g<T_Q6K>(m, j, grp);
+        case T_Q3K: return rows16_g<T_Q3K>(m, j, grp);
+        default: return rows16_g<T_IQ3S>(m, j, grp);
+    }
+}
+template <int T>
+__device__ __forceinline__ void rows16_dp_all(const Mat & m, int j, LaneT<T> & o) {
+#pragma unroll 1
+    for (int grp = 0; grp < T / 8; grp++) {
+        const LaneT<8> p = rows16_dp_g(m, j, grp);
+#pragma unroll
+        for (int t = 0; t < 8; t++)
+#pragma unroll
+            for (int u = 0; u < T / 8; u++)
+                if (u == grp) o.v[8 * u + t] = p.v[t];
+    }
+}
+
+// attention q / k / v projections, RT rows (every matrix in the wv layout; K6 bit 1 not here: host check)
+template <int T>
+__device__ __noinline__ void attn_proj_ck(const LayerW & W) {
+    using C = WvCfg<T, false>;
+    constexpr int NSB = D / 256, CSB = wv_csb<T, false, NSB>(), NCH = (NSB + CSB - 1) / CSB, US = 8 * CSB;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, tq = lane & 3;
+    rs_rows<T>(cB.qn);
+    const bool q6 = W.q.type == T_Q6K || W.k.type == T_Q6K || W.v.type == T_Q6K;
+    const int k6 = cB.k6, ks = (k6 & 4) ? 2 : 1;
+    const int nq = QG / 16, nk = KVD / 16, nv = KVD / 16;
+    const int sk = W.k.type == T_Q8_0 ? ks : 1, sv = W.v.type == T_Q8_0 ? ks : 1;
+    const int nkk = nk * sk, ni = nq + nkk + nv * sv;
+    int it;
+    if (k6 & 2) {
+        it = blockIdx.x + gridDim.x * (NW - 1 - warp);
+    } else {
+        const int i0 = ni * blockIdx.x / gridDim.x, i1 = ni * (blockIdx.x + 1) / gridDim.x;
+        it = i0 + (NW - 1 - warp) < i1 ? i0 + (NW - 1 - warp) : ni;
+    }
+    const bool have = it < ni;
+    const int w = !have ? 0 : it < nq ? 0 : it < nq + nkk ? 1 : 2;
+    const int j = have ? it - (w == 0 ? 0 : w == 1 ? nq : nq + nkk) : 0, ns = w == 0 ? 1 : w == 1 ? sk : sv;
+    const int lt = j / ns, rh = j - lt * ns;
+    const Mat & m = w == 0 ? W.q : w == 1 ? W.k : W.v;
+    WvSt<T, false> st;
+    wv_st_zero<T, false>(st);
+#pragma unroll 1
+    for (int c = 0; c < NCH; c++) {
+        const int s0 = NSB * c / NCH, s1 = NSB * (c + 1) / NCH;
+        const WvXS xs = wv_fill_ck<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, q6);
+        if (have) {
+            if (ns > 1) st = attn_kv_rh_st<T>(m, lt, rh, s0, s1 - s0, xs, st);
+            else st = wv_tile_any_st<T, false>(m, lt, s0, s1 - s0, xs, st);
+        }
+    }
+    if (!have) return;
+    const float * s_rs = misc(nullptr);
+    float * const dst = w == 0 ? cB.qbuf : w == 1 ? cB.kbuf : cB.vbuf;
+    if (ns > 1) { // (the row half's first MMA row: c < 2)
+#pragma unroll
+        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 2; c++) {
+                const int t = 8 * n + 2 * tq + c;
+                if (t < T) dst[t * KVD + 16 * lt + g + 8 * rh] = st.v[n][c] * s_rs[t];
+            }
+        return;
+    }
+    wv_store_n<T>(dst, w == 0 ? QG : KVD, lt, wv_st_fin<T, false>(st, m.type), s_rs);
+}
+
+// delta-net input projections, RT rows of several lanes (dn_proj_wv<T, true>'s stores: each row's qkv to its lane's conv
+// ring, s_cvp; alpha / beta as dn_proj_wv)
+template <int T>
+__device__ __noinline__ void dn_proj_ck(const LayerW & W, int dl, RowTab rt) {
+    using C = WvCfg<T, false>;
+    constexpr int NSB = D / 256, CSB = wv_csb<T, false, NSB>(), NCH = (NSB + CSB - 1) / CSB, US = 8 * CSB;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, tq = lane & 3;
+    float ** const s_cvp = reinterpret_cast<float **>(misc(nullptr) + 64);
+    if (threadIdx.x < T) {
+        const int t = threadIdx.x;
+        float * cv = nullptr;
+        for (int i = 0; i < rt.nl; i++)
+            if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) {
+                const Bufs & V = cBs[view_main(rt.lane[i])];
+                const int p = ((volatile Ctl *) V.ctl)->n + t - rt.r0[i];
+                cv = V.conv + (size_t) dl * CONV_RING * QKV + (size_t) (p % CONV_RING) * QKV;
+            }
+        s_cvp[t] = cv;
+    }
+    rs_rows<T>(cB.qn);
+    const bool q6 = W.qkv.type == T_Q6K || W.gate.type == T_Q6K;
+    constexpr int NTL = QKV / 16 + VD / 16, nt_q = QKV / 16;
+    const int t0 = NTL * blockIdx.x / gridDim.x, t1 = NTL * (blockIdx.x + 1) / gridDim.x;
+    const int tile = t0 + (NW - 1 - warp);
+    const bool have = tile < t1;
+    const bool isq = tile < nt_q;
+    const int lt = isq ? tile : tile - nt_q;
+    const Mat & m = isq ? W.qkv : W.gate;
+    // alpha / beta items on the warps without a tile (dn_proj_wv's K1 dealing; the same rows / K-chunks: bit-exact)
+    const int n_ab = AB_SPLIT * 2 * NVH;
+    const int nb = t1 - t0, nlw = NW - nb % NW;
+    int ab0 = gwarp(), ab1 = n_ab, astep = nwarps();
+    if (cB.k1) {
+        ab1 = n_ab * (blockIdx.x + 1) / gridDim.x;
+        ab0 = warp < nlw ? n_ab * blockIdx.x / gridDim.x + warp : ab1;
+        astep = nlw;
+    }
+    WvSt<T, false> st;
+    wv_st_zero<T, false>(st);
+#pragma unroll 1
+    for (int c = 0; c < NCH; c++) {
+        const int s0 = NSB * c / NCH, s1 = NSB * (c + 1) / NCH;
+        const WvXS xs = wv_fill_ck<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, q6);
+        if (c == 0) {
+            const float * s_rs = misc(nullptr);
+            for (int it = ab0; it < ab1; it += astep) {
+                const int row = it % (2 * NVH), ch = it / (2 * NVH);
+                float acc[T];
+#pragma unroll
+                for (int t = 0; t < T; t++) acc[t] = 0.f;
+                if (W.abq) {
+                    const int8_t * qr = W.abq + (size_t) row * D;
+                    const __half * dr = W.abd + (size_t) row * (D / 32);
+                    for (int k = ch * (D / AB_SPLIT) + lane * 4; k < (ch + 1) * (D / AB_SPLIT); k += 128) {
+                        const int qw = ldw1(qr + k);
+                        const float d = __half2float(dr[k >> 5]);
+                        const float4 fn = __ldg(reinterpret_cast<const float4 *>(W.attn_norm + k));
+                        float4 wf;
+                        wf.x = ((float) (int8_t) (qw) * d) * fn.x;
+                        wf.y = ((float) (int8_t) (qw >> 8) * d) * fn.y;
+                        wf.z = ((float) (int8_t) (qw >> 16) * d) * fn.z;
+                        wf.w = ((float) (int8_t) (qw >> 24) * d) * fn.w;
+#pragma unroll
+                        for (int t = 0; t < T; t++) {
+                            const float4 xv = __ldcg(reinterpret_cast<const float4 *>(cB.x + t * D + k));
+                            acc[t] += wf.x * xv.x + wf.y * xv.y + wf.z * xv.z + wf.w * xv.w;
+                        }
+                    }
+                } else {
+                    const float * wr = W.ab + (size_t) row * D;
+                    for (int k = ch * (D / AB_SPLIT) + lane * 4; k < (ch + 1) * (D / AB_SPLIT); k += 128) {
+                        const float4 wf = ldw4f(wr + k);
+#pragma unroll
+                        for (int t = 0; t < T; t++) {
+                            const float4 xv = __ldcg(reinterpret_cast<const float4 *>(cB.x + t * D + k));
+                            acc[t] += wf.x * xv.x + wf.y * xv.y + wf.z * xv.z + wf.w * xv.w;
+                        }
+                    }
+                }
+#pragma unroll
+                for (int t = 0; t < T; t++) acc[t] = wsum(acc[t]) * s_rs[t];
+                store_lane_t<T>(cB.ab + ch * RMAX * 2 * NVH, 2 * NVH, row, acc);
+            }
+        }
+        if (have) st = wv_tile_any_st<T, false>(m, lt, s0, s1 - s0, xs, st);
+    }
+    if (!have) return;
+    const float * s_rs = misc(nullptr);
+    const WvAcc<C::NG> a = wv_st_fin<T, false>(st, m.type);
+    if (isq) {
+#pragma unroll
+        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const int t = 8 * n + 2 * tq + (c & 1), r = 16 * lt + g + 8 * (c >> 1);
+                if (t < T && s_cvp[t]) s_cvp[t][r] = a.v[n][c] * s_rs[t];
+            }
+    } else {
+        wv_store_n<T>(cB.z, VD, lt, a, s_rs);
+    }
+}
+
+// FFN gate / up, RT rows (C1 dealing as ffn_gu_wv; a hybrid gate or up matrix: rows16 over token groups from global memory)
+template <int T>
+__device__ __noinline__ void ffn_gu_ck(const LayerW & W) {
+    using C = WvCfg<T, false>;
+    constexpr int NSB = D / 256, CSB = wv_csb<T, false, NSB>(), NCH = (NSB + CSB - 1) / CSB, US = 8 * CSB;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tq = lane & 3;
+#if MK_C1
+    const int G1 = gridDim.x / WV_S, kc1 = blockIdx.x / G1;
+    if (kc1 >= WV_S) return;
+    constexpr int NJC = FF / 16 / WV_S;
+    const int bi = blockIdx.x - kc1 * G1;
+    const int t0 = NJC * kc1 + NJC * bi / G1, t1 = NJC * kc1 + NJC * (bi + 1) / G1;
+#else
+    constexpr int NJ = FF / 16;
+    const int t0 = NJ * blockIdx.x / gridDim.x, t1 = NJ * (blockIdx.x + 1) / gridDim.x;
+#endif
+    rs_rows<T>(cB.qn);
+    const bool q6 = W.fg.type == T_Q6K || W.fu.type == T_Q6K;
+    const int j = t0 + (NW - 1 - warp);
+    const bool have = j < t1;
+    const bool gw = W.fg.fm, uw = W.fu.fm;
+    WvSt<T, false> sg, su;
+    wv_st_zero<T, false>(sg);
+    wv_st_zero<T, false>(su);
+#pragma unroll 1
+    for (int c = 0; c < NCH; c++) {
+        const int s0 = NSB * c / NCH, s1 = NSB * (c + 1) / NCH;
+        const WvXS xs = wv_fill_ck<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, q6);
+        if (have) {
+            if (gw) sg = wv_tile_any_st<T, false>(W.fg, j, s0, s1 - s0, xs, sg);
+            if (uw) su = wv_tile_any_st<T, false>(W.fu, j, s0, s1 - s0, xs, su);
+        }
+    }
+    if (have) {
+        const float * s_rs = misc(nullptr);
+        float act[T];
+        if (gw && uw) { // GLU on the C fragments, one transpose (ffn_gu_wv's)
+            const WvAcc<C::NG> ga = wv_st_fin<T, false>(sg, W.fg.type), ua = wv_st_fin<T, false>(su, W.fu.type);
+            WvAcc<C::NG> a;
+#pragma unroll
+            for (int n = 0; n < C::NG; n++)
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const int t = 8 * n + 2 * tq + (c & 1);
+                    const float s = t < T ? s_rs[t] : 0.f;
+                    a.v[n][c] = silu(ga.v[n][c] * s) * (ua.v[n][c] * s);
+                }
+            const LaneT<T> l = wv_to_lane_n<T>(a);
+#pragma unroll
+            for (int t = 0; t < T; t++) act[t] = lane < 16 ? l.v[t] : 0.f;
+        } else {
+            LaneT<T> gl, ul;
+            if (gw) {
+                gl = wv_to_lane_n<T>(wv_st_fin<T, false>(sg, W.fg.type));
+#pragma unroll
+                for (int t = 0; t < T; t++) gl.v[t] *= s_rs[t];
+            } else {
+                rows16_dp_all<T>(W.fg, j, gl);
+            }
+            if (uw) {
+                ul = wv_to_lane_n<T>(wv_st_fin<T, false>(su, W.fu.type));
+#pragma unroll
+                for (int t = 0; t < T; t++) ul.v[t] *= s_rs[t];
+            } else {
+                rows16_dp_all<T>(W.fu, j, ul);
+            }
+#pragma unroll
+            for (int t = 0; t < T; t++) act[t] = lane < 16 ? silu(gl.v[t]) * ul.v[t] : 0.f;
+        }
+        glu_store<T>(j, act);
+    }
+#if MK_C1
+    c1_arrive(kc1);
+#endif
+}
+
+// out / ssm_out / ffn_down with the residual add, RT rows (resid_wv's split-K WV_S chunks; each chunk's K range in
+// sub-chunk fills, the tile's sums carried across them: its partial is resid_wv's)
+template <int T, bool X16, int K>
+__device__ __noinline__ void resid_wv_ck(const Mat Wm, const QBuf in, const float * wnext, int role) {
+    constexpr int NSB = K / 256, CH = NSB / WV_S, CSB = wv_csb<T, X16, CH>(), NCH = (CH + CSB - 1) / CSB, US = 8 * CSB;
+    static_assert(NSB % WV_S == 0, "split-K chunks of whole super-blocks");
+    using C = WvCfg<T, X16>;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, tq = lane & 3;
+    if (threadIdx.x < 4 && blockIdx.x + threadIdx.x * gridDim.x < D / 32) pf_l2(wnext + 32 * (blockIdx.x + threadIdx.x * gridDim.x));
+    const int G = gridDim.x / WV_S, b = blockIdx.x;
+    if (b >= WV_S * G) return;
+    const int kc = b / G, bi = b - kc * G;
+#if MK_C1
+    if (role & 2) c1_wait(kc, G);
+    unsigned * cnt = cB.wvcnt + (role & 1) * (D / 32);
+#else
+    unsigned * cnt = cB.wvcnt + role * (D / 32);
+#endif
+    constexpr int NTILE = D / 16;
+    const int t0 = NTILE * bi / G, t1 = NTILE * (bi + 1) / G;
+    const int tile = t0 + (NW - 1 - warp);
+    const bool have = tile < t1;
+    const bool min2 = X16 && wv_min2(Wm.type), q6 = !X16 && Wm.type == T_Q6K;
+    WvSt<T, X16> st;
+    wv_st_zero<T, X16>(st);
+#pragma unroll 1
+    for (int c = 0; c < NCH; c++) {
+        const int s0 = CH * c / NCH, s1 = CH * (c + 1) / NCH;
+        const WvXS xs = wv_fill_ck<T, X16, US>(in, 8 * (CH * kc + s0), 8 * (s1 - s0), min2, q6);
+        if (have) st = wv_tile_any_st<T, X16>(Wm, tile, CH * kc + s0, s1 - s0, xs, st);
+    }
+    if (!have) return;
+    const WvAcc<C::NG> a = wv_st_fin<T, X16>(st, Wm.type);
+    float * x = cB.x;
+    float * part = cB.wvpart + (size_t) kc * RMAX * D;
+    if (!X16 || tq < 2) {
+#pragma unroll
+        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const int t = X16 ? 4 * n + 2 * tq + (c & 1) : 8 * n + 2 * tq + (c & 1);
+                if (t < T) __stcg(part + (size_t) t * D + 16 * tile + g + 8 * (c >> 1), a.v[n][c]);
+            }
+    }
+    __threadfence();
+    __syncwarp();
+    unsigned old = 0;
+    if (lane == 0) old = atomicAdd(cnt + (tile >> 1), 1u);
+    old = __shfl_sync(0xffffffffu, old, 0);
+    if (old != 2 * WV_S - 1) return;
+    __threadfence();
+    const int jj = tile >> 1, row = 32 * jj + lane;
+    // (resid_wv's K2 epilogue: per-element order (((p0 + p1) + p2) + p3) + x, batches of TB tokens)
+    constexpr int TB = MK_K2_TB < 8 ? MK_K2_TB : 8;
+    const float wn = wnext[row];
+#pragma unroll 1
+    for (int tb = 0; tb < T; tb += TB) {
+        float p[TB][WV_S], xo[TB];
+#pragma unroll
+        for (int u = 0; u < TB; u++)
+            if (tb + u < T) {
+#pragma unroll
+                for (int k = 0; k < WV_S; k++) p[u][k] = __ldcg(cB.wvpart + ((size_t) k * RMAX + tb + u) * D + row);
+                xo[u] = __ldcg(x + (tb + u) * D + row);
+            }
+#pragma unroll
+        for (int u = 0; u < TB; u++)
+            if (tb + u < T) {
+                float s = p[u][0];
+#pragma unroll
+                for (int k = 1; k < WV_S; k++) s += p[u][k];
+                const float xv = s + xo[u];
+                x[(tb + u) * D + row] = xv;
+                q32_store(cB.qn, tb + u, jj, xv * wn, xv * xv, true);
+            }
+    }
+    if (lane == 0) cnt[jj] = 0;
+}
+#endif // MK_PAR_WIDE

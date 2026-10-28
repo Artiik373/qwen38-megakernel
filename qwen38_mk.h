@@ -197,6 +197,28 @@ class MKEngine {
     int prefill_state(const std::vector<int> & tokens, const std::string & dir, int * how = nullptr);
 
     int position() const;
+
+    // Parallel slots (open-jet's slot API): n persistent sequences (lanes) of ctx positions each (0: the most that fit),
+    // decoded together by batched launches; returns ctx. MK_WV=1 MK_MAXT > 5 builds, the plain q8 KV cache, a model whose
+    // delta-net projections are all in the wv layout (plain Q4_K_M). The draft vocabulary is the base list from then on.
+    // slot_begin: the slot takes the prompt (sampling as set_sampling), reusing the longest prefix it can (a truncate of
+    // emitted tokens, else its newest checkpoint before the divergence); returns the reused tokens, slot_prefill feeds
+    // up to budget of the rest per call and returns how many remain (0: ready; budget 0: abandon the rest). The prompt's
+    // last chunk saves a checkpoint before its last token (a repeat of the prompt resumes there). slots_step: one step
+    // of the given slots (two or more: one batched launch, each slot up to 1 + MAXT / n - 1 tokens), the tokens each
+    // emitted (a slot's first call after its prefill: the prefill's token only; empty: its context is full).
+    // slots_step_mixed: slots_step, then the next chunk of pslot's prompt. Every slot call leaves the engine's own
+    // sequence current again.
+    int slots_open(int n, int ctx, int seg_tokens = 0);
+    int slots_count() const;
+    int slot_begin(int slot, const std::vector<int> & toks, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
+                   int share_len = 0, bool pin = false);
+    int slot_prefill(int slot, int budget);
+    std::vector<std::vector<int>> slots_step(const std::vector<int> & slots);
+    std::vector<std::vector<int>> slots_step_mixed(int pslot, int budget, const std::vector<int> & slots, int & remain);
+    int slot_segment(int) const { return 0; } // (no shared segments)
+    std::vector<int> slot_sequence(int slot);
+    std::vector<float> slot_h(int slot);
     // Teacher-forced greedy predictions: pred[i] = argmax of the next-token distribution after
     // tokens[0..i] (resets the sequence).
     std::vector<int> score(const std::vector<int> & tokens);

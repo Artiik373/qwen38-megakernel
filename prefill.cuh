@@ -79,7 +79,7 @@ __device__ __forceinline__ float embd_elem_pf(const uint8_t * row, int e) {
     else return dequant_embd<ET>(row, e);
 }
 template <int ET>
-__global__ void pk_embed(int T) {
+__global__ void pk_embed(int T) { MK_VIEW_INIT();
     const int t = blockIdx.x;
     const uint8_t * row = cW.embd + (size_t) cP.tok[t] * embd_rb<ET>();
     for (int e = threadIdx.x; e < D; e += blockDim.x) cP.x[(size_t) t * D + e] = embd_elem_pf<ET>(row, e);
@@ -88,7 +88,7 @@ __global__ void pk_embed(int T) {
 // pk_embed for a chunk with image rows (MKImage): a token with erow >= 0 takes that row of cP.emb (the vision encoder's
 // fp32 embedding, which llama.cpp feeds as is) instead of its token_embd row; the other tokens as pk_embed
 template <int ET>
-__global__ void pk_embed_img(int T) {
+__global__ void pk_embed_img(int T) { MK_VIEW_INIT();
     const int t = blockIdx.x, r = __ldg(cP.erow + t);
     if (r < 0) {
         const uint8_t * row = cW.embd + (size_t) cP.tok[t] * embd_rb<ET>();
@@ -101,7 +101,7 @@ __global__ void pk_embed_img(int T) {
 }
 
 // RMS-norm (weight w) of rows of src [T][D] -> fp16 xh (K = D); rs per token
-__global__ void __launch_bounds__(256) pk_norm_quant(const float * src, const float * w) {
+__global__ void __launch_bounds__(256) pk_norm_quant(const float * src, const float * w) { MK_VIEW_INIT();
     __shared__ float red[8];
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const float * x = src + (size_t) t * D;
@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(256) pk_norm_quant(const float * src, const fl
 // stock2 K8b: pk_norm_quant with x read once. Thread tid reads e = tid + 256 i (i = 0 .. D / 256 - 1) in the sum of squares
 // and, as warp w = tid >> 5 / lane, writes the 32-blocks j = w + 8 i (e = 32 j + lane = the same e): the values stay in
 // registers. Same sums in the same order, same products: bit-identical to pk_norm_quant.
-__global__ void __launch_bounds__(256) pk_norm_quant1(const float * src, const float * w) {
+__global__ void __launch_bounds__(256) pk_norm_quant1(const float * src, const float * w) { MK_VIEW_INIT();
     __shared__ float red[8];
     constexpr int NE = D / 256;
     static_assert(D % 256 == 0, "pk_norm_quant1");
@@ -146,7 +146,7 @@ __global__ void __launch_bounds__(256) pk_norm_quant1(const float * src, const f
 // into Wab).  Block = 64 tokens x 96 rows x one of AB_SPLITS K-splits; thread = 4 tokens x 6 rows.
 constexpr int AB_SPLITS = 8, AB_KS = D / AB_SPLITS;
 // Q8_0 alpha / beta (abq != nullptr): weights (q * d) * attn_norm formed while filling sw, the folded fp32 values
-__global__ void __launch_bounds__(256) pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T) {
+__global__ void __launch_bounds__(256) pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T) { MK_VIEW_INIT();
     __shared__ __align__(16) float sx[32][64 + 4]; // read as float4
     __shared__ __align__(16) float sw[32][96 + 4];
     const int tid = threadIdx.x, tg = tid & 15, rg = tid >> 4; // tokens 4 tg .. , rows 6 rg ..
@@ -206,7 +206,7 @@ __global__ void __launch_bounds__(256) pk_ab(const float * Wab, const int8_t * a
 
 // conv1d (kernel 4, causal, continuing from the conv ring) + silu, l2-norm of q / k, log g / beta
 __global__ void __launch_bounds__(256) pk_dn_prep(int T, int n0, int dl, const float * convw, const float * dt,
-                                                  const float * A) {
+                                                  const float * A) { MK_VIEW_INIT();
     const int t = blockIdx.x, pos = n0 + t, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const float * ring = cB.conv + (size_t) dl * CONV_RING * QKV;
     auto raw = [&](int j, int c) -> float { // input of position pos - 3 + j
@@ -254,7 +254,7 @@ __global__ void __launch_bounds__(256) pk_dn_prep(int T, int n0, int dl, const f
 // expressions (same products, sums and order per element): bit-identical to pk_dn_prep.
 template <int NT>
 __global__ void __launch_bounds__(256) pk_dn_prep_t(int T, int n0, int dl, const float * convw, const float * dt,
-                                                    const float * A) {
+                                                    const float * A) { MK_VIEW_INIT();
     const int t0 = blockIdx.x * NT, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int nt = min(NT, T - t0);
     const float * ring = cB.conv + (size_t) dl * CONV_RING * QKV;
@@ -316,7 +316,7 @@ __global__ void __launch_bounds__(256) pk_dn_prep_t(int T, int n0, int dl, const
 }
 
 // raw qkv rows of the chunk's last positions -> conv ring (after pk_dn_prep consumed the old ones)
-__global__ void pk_conv_ring(int T, int n0, int dl) {
+__global__ void pk_conv_ring(int T, int n0, int dl) { MK_VIEW_INIT();
     float * ring = cB.conv + (size_t) dl * CONV_RING * QKV;
     const int nt = min(T, CONV_RING), t = T - nt + blockIdx.x;
     for (int c = threadIdx.x; c < QKV; c += blockDim.x)
@@ -326,7 +326,7 @@ __global__ void pk_conv_ring(int T, int n0, int dl) {
 // Checkpoint at position P inside the chunk at n0 (pf_run): the conv ring as it is after position P - 1, i.e. slot
 // p % CONV_RING = raw qkv of p for p in [P - CONV_RING, P): the chunk's rows (y0) for p >= n0, else the ring before
 // the chunk (launched before pk_conv_ring overwrites it; slots of p < 0 are copied as they are, never read).
-__global__ void pk_ck_conv(int n0, int P, int dl, float * dst) {
+__global__ void pk_ck_conv(int n0, int P, int dl, float * dst) { MK_VIEW_INIT();
     const int p = P - CONV_RING + (int) blockIdx.x, s = (p % CONV_RING + CONV_RING) % CONV_RING;
     const float * src = p >= n0 ? cP.y0 + (size_t) (p - n0) * QKV : cB.conv + ((size_t) dl * CONV_RING + s) * QKV;
     for (int c = threadIdx.x; c < QKV; c += blockDim.x) dst[(size_t) s * QKV + c] = __ldg(src + c);
@@ -334,7 +334,7 @@ __global__ void pk_ck_conv(int n0, int P, int dl, float * dst) {
 // ... and the h ring: slot p % H_RING = final h of p for p in lo .. lo + gridDim.x - 1, from the ring before the chunk
 // (from_ring: launched before pk_final_h overwrites it) or from the chunk's h rows (after pk_final_h).  dst: the
 // checkpoint's ring (mapped host memory, or device memory with MK_CK_DEVICE=1)
-__global__ void pk_ck_hist(int lo, int n0, int from_ring, float * dst) {
+__global__ void pk_ck_hist(int lo, int n0, int from_ring, float * dst) { MK_VIEW_INIT();
     const int p = lo + (int) blockIdx.x, s = (p % H_RING + H_RING) % H_RING;
     const float * src = from_ring ? cB.h_hist + (size_t) s * D : cP.h + (size_t) (p - n0 + 1) * D;
     for (int e = threadIdx.x; e < D; e += blockDim.x) dst[(size_t) s * D + e] = __ldg(src + e);
@@ -384,7 +384,7 @@ __device__ __forceinline__ void mma4(float (&c)[4], const unsigned (&a)[4], unsi
 // Rows t0 .. t0 + T - 1 of the chunk (32-token chunks from row t0): the state is read from st_in and written to st_out
 // (one layer's [NVH][128 cols][128 rows]). Normally both are the layer's live state and t0 = 0; a checkpoint at row
 // t0 + T splits the scan there (the first part writes a staging copy that the second part reads; pf_run).
-__global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float * st_in, float * st_out) {
+__global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float * st_in, float * st_out) { MK_VIEW_INIT();
     __shared__ __align__(16) __half sK[DC][DC_LD], sQ[DC][DC_LD], sV[DC][DC_LV];
     __shared__ __align__(16) __half sT0[DC][DC_LP], sT1[DC][DC_LP], sP[DC][DC_LP];
     __shared__ __align__(16) float sAT[DC][DC_LA]; // A transposed: sAT[j][i] = A_ij
@@ -592,7 +592,7 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float 
 }
 
 // gated RMS norm of the delta-net output (z = y1) -> fp16 xh (K = VD)
-__global__ void __launch_bounds__(256) pk_dn_out(const float * snorm) {
+__global__ void __launch_bounds__(256) pk_dn_out(const float * snorm) { MK_VIEW_INIT();
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int hh = warp; hh < NVH; hh += 8) {
         const float * o = cP.y2 + (size_t) t * VD + hh * 128;
@@ -614,7 +614,7 @@ __global__ void __launch_bounds__(256) pk_dn_out(const float * snorm) {
 
 // attention q / k / v post-processing: RMS norms, RoPE, K / V -> cache (fp16), q -> qh
 // (r0: first chunk row of this launch; MK_EXACT with KV window rings runs the chunk in 640-position pieces)
-__global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const float * qn, const float * kn, int do_q, int r0 = 0) {
+__global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const float * qn, const float * kn, int do_q, int r0 = 0) { MK_VIEW_INIT();
     const int t = r0 + blockIdx.x, pos = n0 + t, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const size_t ctx = cB.ctx;
     for (int it = warp; it < 32; it += 8) {
@@ -657,7 +657,7 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
 
 // attention output * sigmoid(gate) -> fp16 xh (K = VD, hperm order within each 16-group). One warp per head, 8 dims per
 // lane: a slot whose V is stored rotated (MK_KV "r" on V) gets its output rotated back here (WHT, its own inverse).
-__global__ void __launch_bounds__(256) pk_attn_out(int slot) {
+__global__ void __launch_bounds__(256) pk_attn_out(int slot) { MK_VIEW_INIT();
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const bool rotv = cB.kvq8 && cB.kvrv[slot];
     for (int h = warp; h < NH; h += 8) {
@@ -678,7 +678,7 @@ __global__ void __launch_bounds__(256) pk_attn_out(int slot) {
 }
 
 // final RMS norm -> h rows (h[t + 1] = position n0 + t) and the decode h ring (last 16 positions)
-__global__ void __launch_bounds__(256) pk_final_h(int T, int n0) {
+__global__ void __launch_bounds__(256) pk_final_h(int T, int n0) { MK_VIEW_INIT();
     __shared__ float red[8];
     const int t = blockIdx.x;
     const float * x = cP.x + (size_t) t * D;
@@ -700,7 +700,7 @@ __global__ void __launch_bounds__(256) pk_final_h(int T, int n0) {
 // IMG (a chunk with image rows): embed(tok_p) of an image position is its input-embedding row (as llama.cpp's MTP
 // draft takes the vision embedding there, #30257)
 template <bool IMG, int ET>
-__global__ void __launch_bounds__(256) pk_mtp_in() {
+__global__ void __launch_bounds__(256) pk_mtp_in() { MK_VIEW_INIT();
     __shared__ float se[D];
     __shared__ float red[8];
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -728,7 +728,7 @@ __global__ void __launch_bounds__(256) pk_mtp_in() {
 }
 
 // argmax over logits rows y0[t][0..VOCAB) (scoring)
-__global__ void __launch_bounds__(256) pk_argmax(int t0) {
+__global__ void __launch_bounds__(256) pk_argmax(int t0) { MK_VIEW_INIT();
     __shared__ float bv[8];
     __shared__ int bi[8];
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;

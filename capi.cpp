@@ -266,6 +266,105 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
     return mk_new_mtp(model, ctx, n_draft, draft_vocab, kv_mode, nullptr);
 }
 
+// open-jet's mk_new2: kv_ctx > 0 = the engine's own sequence's positions (parallel slots hold their own; ctx then only
+// bounds what the caller expects of a slot)
+void * mk_new2(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode, int kv_ctx) {
+    return mk_new_mtp(model, kv_ctx > 0 ? kv_ctx : ctx, n_draft, draft_vocab, kv_mode, nullptr);
+}
+
+// ---- parallel slots (open-jet's slot API; MKEngine::slots_open) ----
+// n slots of ctx positions each (0: the most that fit); returns ctx (a slot's positions), or -1
+int mk_slots_open2(void * hp, int n, int ctx, int seg_tokens) {
+    try {
+        return static_cast<Handle *>(hp)->eng->slots_open(n, ctx, seg_tokens);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+int mk_slots_open(void * hp, int n, int ctx) { return mk_slots_open2(hp, n, ctx, 0); }
+
+// slot <- the prompt (temp 0: greedy), reusing what it can: returns the reused count (or -1); mk_slot_prefill feeds the rest
+int mk_slot_begin2(void * hp, int slot, const int * toks, int n, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
+                   int share_len, int pin) {
+    try {
+        return static_cast<Handle *>(hp)->eng->slot_begin(slot, std::vector<int>(toks, toks + n), temp, top_p, top_k, min_p, seed, share_len,
+                                                          pin != 0);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+int mk_slot_begin(void * hp, int slot, const int * toks, int n, float temp, float top_p, int top_k, float min_p, unsigned long long seed) {
+    return mk_slot_begin2(hp, slot, toks, n, temp, top_p, top_k, min_p, seed, 0, 0);
+}
+
+// feeds up to budget prompt tokens: returns how many remain (0: ready to step; -1: error)
+int mk_slot_prefill(void * hp, int slot, int budget) {
+    try {
+        return static_cast<Handle *>(hp)->eng->slot_prefill(slot, budget);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+// one step of the n slots: out[i * per + j] = the j-th token slot i emitted, counts[i] how many (0: its context is full)
+static void slots_out(const std::vector<std::vector<int>> & em, int n, int * out, int per, int * counts) {
+    for (int i = 0; i < n; i++) {
+        counts[i] = std::min((int) em[i].size(), per);
+        for (int j = 0; j < counts[i]; j++) out[i * per + j] = em[i][j];
+    }
+}
+int mk_slots_step(void * hp, const int * slots, int n, int * out, int per, int * counts) {
+    try {
+        slots_out(static_cast<Handle *>(hp)->eng->slots_step(std::vector<int>(slots, slots + n)), n, out, per, counts);
+        return 0;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+// mk_slots_step, then the next budget tokens of slot pslot's prompt; *remain <- the prompt tokens left
+int mk_slots_step_mixed(void * hp, int pslot, int budget, const int * slots, int n, int * out, int per, int * counts, int * remain) {
+    try {
+        int rem = 0;
+        slots_out(static_cast<Handle *>(hp)->eng->slots_step_mixed(pslot, budget, std::vector<int>(slots, slots + n), rem), n, out, per, counts);
+        *remain = rem;
+        return 0;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+int mk_slot_segment(void * hp, int slot) { return static_cast<Handle *>(hp)->eng->slot_segment(slot); }
+
+// (test) the slot's sequence -> out (up to cap); returns its length
+int mk_slot_sequence(void * hp, int slot, int * out, int cap) {
+    try {
+        const auto s = static_cast<Handle *>(hp)->eng->slot_sequence(slot);
+        for (int i = 0; i < std::min(cap, (int) s.size()); i++) out[i] = s[i];
+        return (int) s.size();
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+// (test) the hidden state of the slot's last processed position -> out[0 .. n), returns its size
+int mk_slot_h(void * hp, int slot, float * out, int n) {
+    try {
+        const auto h = static_cast<Handle *>(hp)->eng->slot_h(slot);
+        for (int i = 0; i < std::min(n, (int) h.size()); i++) out[i] = h[i];
+        return (int) h.size();
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
 // 1: the engine has an MTP layer (drafting), 0: plain decoding (depth 0)
 int mk_has_mtp(void * hp) { return static_cast<Handle *>(hp)->eng->has_mtp() ? 1 : 0; }
 

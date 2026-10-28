@@ -9,7 +9,7 @@
 constexpr int AT_Q = 16, AT_K = 32, AT_LD = HD + 8;
 constexpr int AT_SMEM = (6 * AT_Q + 2 * AT_K) * AT_LD * 2; // Q, K/V tile
 template <bool Q8>
-__global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
+__global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) { MK_VIEW_INIT();
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sQ = reinterpret_cast<__half *>(asm_); // [96][AT_LD]
     __half * sK = sQ + 6 * AT_Q * AT_LD;            // [32][AT_LD]
@@ -316,7 +316,7 @@ __device__ __forceinline__ void a2_cp_f16(__half * dst, const __half * src, int 
 }
 
 template <bool Q8, bool PV16>
-__global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0) {
+__global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0) { MK_VIEW_INIT();
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sQ = reinterpret_cast<__half *>(asm_); // [96][A2_LD]
     __half * sK = sQ + 6 * A2_Q * A2_LD;            // [32][A2_LD]
@@ -579,7 +579,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
 }
 
 // merge the S partials of each split item (block = item nfull + blockIdx.x) into y2
-__global__ void __launch_bounds__(256) pk_attn2_comb(int T, int nfull, int S, const float * __restrict__ part) {
+__global__ void __launch_bounds__(256) pk_attn2_comb(int T, int nfull, int S, const float * __restrict__ part) { MK_VIEW_INIT();
     const int item = nfull + blockIdx.x, nqt = (T + A2_Q - 1) / A2_Q, qt = item % nqt, g = item / nqt;
     const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
     const float * P = part + (size_t) blockIdx.x * S * A2_PART;
@@ -716,7 +716,7 @@ __device__ __forceinline__ float ex_f(float a, float R, float b, float s) { retu
 
 template <bool QROW, bool KLOW, bool EXA = false, int KB = 0, int VB = 0>
 __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0,
-                                                     int segt = 0, int exh = 0, float * __restrict__ part2 = nullptr, int exa = 0) {
+                                                     int segt = 0, int exh = 0, float * __restrict__ part2 = nullptr, int exa = 0) { MK_VIEW_INIT();
     static_assert(KB == 0 || (KLOW && KB >= 4 && KB <= 7), "pk_attn8 KB");
     static_assert(VB == 0 || (VB >= 4 && VB <= 7), "pk_attn8 VB");
     extern __shared__ __align__(16) uint8_t asm_[];
@@ -1175,7 +1175,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
 // r0 + ..). Block = split item; S slots per item (in part for the first exa items, then in part2); exh >= 1 = the head
 // unit's segments (an item may have fewer).
 __global__ void __launch_bounds__(256) pk_attn8_combx(int T, int n0, int nfull, int S, int segt, int exh, int r0, const float * __restrict__ part,
-                                                      const float * __restrict__ part2, int exa) {
+                                                      const float * __restrict__ part2, int exa) { MK_VIEW_INIT();
     const int item = nfull + blockIdx.x, nqt = (T + A2_Q - 1) / A2_Q, qt = item % nqt, g = item / nqt;
     const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
     const int ntile = (n0 + t0 + nq - 1) / A2_K + 1, nsg = (ntile + segt - 1) / segt, sh = min(exh, nsg);
