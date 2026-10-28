@@ -2442,10 +2442,8 @@ class SlotScheduler:
     While slots decode, a waiting prompt is fed in chunks, one per cycle in the same pass as their step
     (mk_slots_step_mixed, MK_PF_MIX rows, default 256; MK_PF_MIX=0: MK_PF_CHUNK tokens between the cycles, default 512,
     0: the whole prompt), so they keep decoding while a long prompt is read; while none decodes, MK_PF_SOLO tokens per call
-    (default 0: the whole prompt). The engine runs the last row of every prefill call through the decode kernels, so a
-    prompt fed in other chunks computes other rows: until the engine feeds a call's rows all as batched rows, a reply to a
-    prompt that arrived while others decoded can differ from the same request alone (MK_PF_SOLO = MK_PF_MIX feeds it alike
-    alone). A closed job is dropped from the queue, its prefill abandoned at the next chunk, or its slot left out of the
+    (default 0: the whole prompt). With MK_EXACT the chunks change no row (the engine feeds every chunk but a prompt's
+    last as batched rows), so a prompt that arrives while others decode gets the reply it gets alone. A closed job is dropped from the queue, its prefill abandoned at the next chunk, or its slot left out of the
     next cycle. Open-jet's SlotScheduler (--parallel / --agents), with jobs that can be closed at any point.
 
     With MK_EXACT (exact reuse; --agents sets it), a prompt never reuses the rows a slot decoded: those depend on how many
@@ -3919,8 +3917,6 @@ class SlotServer(Server):
             feed = "a waiting prompt is fed whole between two decode cycles (the other slots wait meanwhile)"
         if s.solo:
             feed += f", {s.solo} tokens at a time while no slot decodes"
-        if s.mix or s.chunk or s.solo:
-            feed += " (a prompt fed in chunks can get another reply than alone: the engine runs each call's last row as a decode row)"
         log(f"--agents {args.agents}: {plural(args.agents, 'slot')} of {args.ctx:,} positions each (q8_0 KV{', ' + kv if kv else ''}"
             f"{', MK_EXACT: prefill rows independent of the chunking' if self.eng.exact else ''}); {feed}; side requests, "
             f"parked conversations, pinned checkpoints and images are off; presence / frequency penalties are refused")

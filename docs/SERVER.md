@@ -428,22 +428,23 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
   A prompt that does not fit its slot gets the usual 400. The KV cache is q8_0 (`--kv f16` is refused at startup); the
   presets (`MK_KV`, `MK_KV_WIN`) apply to every slot.
 - **The same replies:** a greedy reply is the one the request gets when it runs alone on the server, bit for bit,
-  whatever runs beside it, its follow-up turns included, with one exception below. Each slot decodes as it decodes
+  whatever runs beside it, its follow-up turns included. Each slot decodes as it decodes
   alone, and `--agents` turns on `MK_EXACT` (unless it is set), so a prompt never reuses the rows a slot decoded (their
   bits depend on how many drafts each cycle verified, which depends on the slots beside it): a follow-up that reaches
   into its last reply resumes at a checkpoint inside its last prompt, as with
-  [exact reuse](#exact-and-how-it-is-checked). The exception: a prompt that arrives while other slots decode is fed in
-  chunks beside their cycles, and the engine computes the last row of every prefill call with the decode kernels, so its
-  rows differ from the same prompt fed in one go, and its reply can too (`MK_PF_SOLO=256` feeds a prompt that runs alone
-  in the same chunks). Sampled replies (temperature above 0 with a `seed`) are reproducible alone, and beside other
+  [exact reuse](#exact-and-how-it-is-checked). A prompt that arrives while other slots decode is fed in chunks beside
+  their cycles; with `MK_EXACT` its rows are those of the same prompt fed in one go (the engine computes every chunk
+  but the prompt's last with the batched prefill kernels, and those rows do not depend on where a chunk starts).
+  Sampled replies (temperature above 0 with a `seed`) are reproducible alone, and beside other
   requests keep their distribution but not their tokens: speculative sampling's tokens depend on the draft schedule,
   and a slot's drafts depend on how many slots share the cycle (an engine limitation). Measured on 2026-10-28 (Q4_K_M;
   OpenAI chat and Anthropic Messages, streamed or not, with and without tools, 2 to 4 at once, an 8k-token prompt
   arriving while three others decode, follow-up turns, a client that disconnects mid-stream, stop strings,
   `max_tokens`): every greedy comparison was identical (45 of 45, also with UD-Q4_K_XL) and every sampled reply alone,
   while 13 of the 15 sampled replies decoded beside others differed. A 1.6k-token prompt decoded to the end of a
-  2,048-position slot, beside three others: identical to alone when the alone run was fed in the same chunks
-  (`MK_PF_SOLO=256`), different when it was fed whole (the exception).
+  2,048-position slot beside three others gave the greedy reply it gets alone, and long prompts (3.8k-5.7k tokens) fed
+  in 256-token chunks between other slots' cycles gave the replies of the same prompts fed whole, with q8_0 and preset
+  D', on Q4_K_M and UD-Q4_K_XL (2026-10-28).
 - **Scheduling:** requests wait for a free slot in arrival order. A request takes the free slot whose cached sequence
   shares the most with its prompt, less what that discards of the slot's last prompt: a conversation's next turn goes
   back to its own slot, and a new conversation takes an empty slot before it evicts another one for the few template
