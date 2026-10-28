@@ -64,6 +64,9 @@ file, the best value of each row over three sessions on 2026-10-12 and 10-13.
 The short-prompt rows are means of per-request rates, as the client reports them; the full table, token-weighted
 rates, preset D's column and earlier runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
+Several agents at once (`--agents 4`, Q4_K_M, 2026-10-28): 353 tok/s in total on short prompts and 296 with a
+~23k-token context each; one agent alone 190 and 178 tok/s ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#parallel-agents)).
+
 ## Picks up where you left off
 
 The server keeps more than the conversation in front of it, and with exact reuse everything it restores answers as the
