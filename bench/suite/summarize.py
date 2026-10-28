@@ -1,16 +1,17 @@
 """Tables of the published runs from the clients' JSON lines and score.py's scores.
 usage: python bench/suite/summarize.py FILE [FILE ...] [--scores scores.json ...] [--col LABEL[=TITLE] ...]
                                        [--sub LABEL:KEY[,KEY...]=OTHER ...] [--out results.json]
-  FILE    speed_client.py / scratch_client.py / maxctx_client.py output. Each file is one session: a label found in
-          several files gets the best session's value in each row (the published llama.cpp column is the best of three
-          sessions); give every run its own label unless that is what you want
+  FILE    speed_client.py / scratch_client.py / maxctx_client.py / parallel_client.py output. Each file is one session:
+          a label found in several files gets the best session's value in each row (the published llama.cpp column is
+          the best of three sessions); give every run its own label unless that is what you want
   --col   the columns, in order (default: every label with short-prompt decode records)
   --sub   take some rows of LABEL's column from another label, e.g. a re-run of a disturbed step. KEY: a row key below,
           qa (all question sets) or qa.SET (one set: its answers and its time)
 The from-scratch prefill row prefers scratch_client.py's record of the label (any file), then the speed client's own
 "fresh" request when the server reports no cached tokens for it, then a long_pf101k request without cached tokens.
 Row keys: greedy greedy_tw sampled sampled_tw dec11k dec38k dec101k ttft turn2 pf11k pf38k pf101k edit_msg edit_sys
-vram_idle vram_101k. Prints markdown tables; --out writes them as JSON."""
+vram_idle vram_101k. parallel_client.py's records make a table of their own (per label and request count, the best
+session). Prints markdown tables; --out writes them as JSON."""
 import argparse
 import json
 import statistics as st
@@ -76,6 +77,27 @@ def best(vals, better):
     return (max(v) if better == "up" else min(v)) if v else None
 
 
+PARALLEL = [  # (key, metric, unit, better, test, field)
+    ("short", "short prompts, total decode", "tok/s", "up", "short_total", "tps"),
+    ("ctx", "23k-token contexts, total decode", "tok/s", "up", "ctx_total", "tps"),
+    ("ctx_ttft", "23k-token contexts, slowest first token", "s", "down", "ctx_total", "ttft_max_s"),
+    ("stagger_ttft", "stagger: the 20k-token prompt's first token", "s", "down", "stagger", "ttft_s"),
+    ("stagger_other", "stagger: the other request meanwhile", "tok/s", "up", "stagger", "other_tps"),
+]
+
+
+def parallel(sessions, labels):
+    """parallel_client.py's records: {(key, n): {label: best session's value}} (a session's value: its best rep)"""
+    out = {}
+    for key, _, _, better, test, field in PARALLEL:
+        for s in sessions:
+            for r in s:
+                if r.get("test") == test and r.get("label") in labels and r.get(field) is not None:
+                    cell = out.setdefault((key, r.get("n")), {})
+                    cell[r["label"]] = best([cell.get(r["label"]), r[field]], better)
+    return out
+
+
 def metric(sessions, lb, key, fn, better):
     if key == "pf101k":
         scratch = [one(s, lb, "long_pf101k_scratch", "prompt_ms", 1e-3) for s in sessions]
@@ -119,6 +141,12 @@ def main():
     for c in a.col:
         lb, _, title = c.partition("=")
         cols.append((lb, title or lb))
+    par_labels = []
+    for s in sessions:
+        for r in s:
+            if r.get("test") in ("short_total", "ctx_total", "stagger") and r.get("label") not in par_labels:
+                par_labels.append(r["label"])
+    par_cols = [(lb, t) for lb, t in cols if lb in par_labels] if cols else [(lb, lb) for lb in par_labels]
     if not cols:
         seen = []
         for s in sessions:
@@ -167,8 +195,17 @@ def main():
                     mx[s_name] = f"{e['correct']}/{e['n']}"
             maxctx[lb] = mx  # a later file's run of the same label replaces an earlier one
     gpu = [r for s in sessions for r in s if str(r.get("test", "")).startswith("gpu_") and r.get("label") in dict(cols)]
+    par = parallel(sessions, {lb for lb, _ in par_cols})
+    par_rows = []
+    for n in sorted({n for _, n in par if n is not None}, reverse=True):
+        for key, label, unit, _, _, _ in PARALLEL:
+            if (key, n) in par:
+                name = label if key.startswith("stagger") else f"{label}, {n} at once"
+                par_rows.append({"key": key, "n": n, "metric": name, "unit": unit,
+                                 **{lb: par[(key, n)].get(lb) for lb, _ in par_cols}})
     res = {"columns": [{"label": lb, "title": t} for lb, t in cols], "subs": subs, "rows": rows, "qa": qa,
-           "maxctx": maxctx, "gpu": gpu}
+           "maxctx": maxctx, "gpu": gpu,
+           "parallel": {"columns": [{"label": lb, "title": t} for lb, t in par_cols], "rows": par_rows}}
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:
             json.dump(res, f, indent=1)
@@ -176,12 +213,19 @@ def main():
     def fmt(x):
         return "-" if x is None else str(x)
 
-    print("| metric | " + " | ".join(t for _, t in cols) + " |")
-    print("|---|" + "---|" * len(cols))
-    for r in rows:
-        print(f"| {r['metric']} ({r['unit']}) | " + " | ".join(fmt(r[lb]) for lb, _ in cols) + " |")
-    print("| questions: right / scored, total time (s) | " +
-          " | ".join(f"{q['right']} / {q['n']}, {q['wall_s']}" if q else "-" for q in (qa[lb] for lb, _ in cols)) + " |")
+    if any(r[lb] is not None for r in rows for lb, _ in cols) or any(qa.values()):
+        print("| metric | " + " | ".join(t for _, t in cols) + " |")
+        print("|---|" + "---|" * len(cols))
+        for r in rows:
+            print(f"| {r['metric']} ({r['unit']}) | " + " | ".join(fmt(r[lb]) for lb, _ in cols) + " |")
+        print("| questions: right / scored, total time (s) | " +
+              " | ".join(f"{q['right']} / {q['n']}, {q['wall_s']}" if q else "-" for q in (qa[lb] for lb, _ in cols)) + " |")
+    if par_rows:
+        print("")
+        print("| parallel agents | " + " | ".join(t for _, t in par_cols) + " |")
+        print("|---|" + "---|" * len(par_cols))
+        for r in par_rows:
+            print(f"| {r['metric']} ({r['unit']}) | " + " | ".join(fmt(r[lb]) for lb, _ in par_cols) + " |")
     for lb, _ in cols:
         if qa[lb]:
             print(f"questions {lb}: {qa[lb]['sets']}" + (f", from {qa[lb]['from']}" if qa[lb].get("from") else ""))
