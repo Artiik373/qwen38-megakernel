@@ -277,8 +277,8 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--no-mtp` | `MK_NO_MTP=1` (engine) | off | no MTP layer: plain decoding at depth 0, no MTP weights or KV slot | drafts only | f334fd0, 2026-10-18 |
 | `--lib` | - | `libqwen38mk.so` / `qwen38mk.dll` in the repo root | the engine library | - | upstream (4d92fd2) |
 | `--kv` | - | `auto` (launchers `q8`) | KV cache format: `f16`, `q8` (q8_0), `auto` (q8_0 when fp16 does not fit next to ~1.5 GB of working memory, or when `MK_KV` is set; with `--agents` q8_0, which the slots need) | changes (f16 vs q8_0) | upstream (4d92fd2) |
-| `--agents N` | `MK_AGENTS` | `0`: one request at a time | up to N requests (1-4) at once, each in a parallel slot of the engine with its own context (`-c`), decoded together in one batched launch per cycle; images, video and the presence / frequency penalties get a 400, side requests, parking and pinned checkpoints are off ([SERVER.md](SERVER.md#several-agents-at-once---agents)) | greedy: the reply alone, bit for bit (a prompt fed in chunks beside other slots: see `MK_PF_MIX`); sampled: the same distribution, not the same tokens beside other requests | 1afc37c, 2026-10-28 |
-| `--parallel N`, `-np N` | - | `0` | `--agents N` with `-c` defaulting to 32,768 per slot (llama-server's and open-jet's option) | as `--agents` | ea282eb, 2026-10-28 |
+| `--agents N` | `MK_AGENTS` | `0`: one request at a time | up to N requests (1-4) at once, each in a parallel slot of the engine with its own context (`-c`), decoded together in one batched launch per cycle; images, video and the presence / frequency penalties get a 400, side requests, parking and pinned checkpoints are off ([SERVER.md](SERVER.md#several-agents-at-once---agents)) | greedy: the reply alone, bit for bit (a prompt fed in chunks beside other slots: see `MK_PF_MIX`); sampled: the same distribution, not the same tokens beside other requests | 6fa95e9, 2026-10-28 |
+| `--parallel N`, `-np N` | - | `0` | `--agents N` with `-c` defaulting to 32,768 per slot (llama-server's and open-jet's option) | as `--agents` | 6fa95e9, 2026-10-28 |
 | `--ck-every N` | - | `4096` | a DeltaNet checkpoint every N prompt tokens (0: off); the pool has `MK_CK_SLOTS` slots | same with exact reuse | 045e47b, 2026-10-12 |
 | `--ck-msgs` | - | `1` | a checkpoint at each message start (1 / 0) | same with exact reuse | 045e47b, 2026-10-12 |
 | `--ck-pin` | - | `1` | pin the checkpoint at the end of the system message (and where new sessions left the cached one) against eviction, and park it with the conversation: a client's new session resumes after its system prompt and tools | same with exact reuse | 4eb7b51, 2026-10-21 |
@@ -320,9 +320,9 @@ Read by the server only (there is no option for them):
 | `MK_MAX_BODY_MB` | `128` | largest request body in MB, Content-Length or chunked; larger ones get a 413 | 5a61fb6, 2026-10-17 |
 | `MK_MAX_IMAGES` | `32` | images per request; more get a 400 | 87ab132, 2026-10-17 |
 | `MK_MAX_VIDEO_FRAMES` | `256` | video frames per request, all of its videos (64 s at 4 fps) | 1ffaa76, 2026-10-18 |
-| `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed in each decode cycle's pass beside the decoding slots (`mk_slots_step_mixed`), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. Until the engine feeds a prefill call's rows all as batched rows, a prompt fed in chunks can get another reply than alone | 1afc37c, 2026-10-28 |
-| `MK_PF_CHUNK` | `512` | `--agents` with `MK_PF_MIX=0`: prompt tokens fed between two decode cycles (`0`: the whole prompt, the other slots wait) | 1afc37c, 2026-10-28 |
-| `MK_PF_SOLO` | `0` | `--agents`: prompt tokens fed per call while no slot decodes (`0`: the whole prompt; equal to `MK_PF_MIX`: a prompt is fed in the same chunks alone as beside other slots) | 1afc37c, 2026-10-28 |
+| `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed in each decode cycle's pass beside the decoding slots (`mk_slots_step_mixed`), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. Until the engine feeds a prefill call's rows all as batched rows, a prompt fed in chunks can get another reply than alone | 6fa95e9, 2026-10-28 |
+| `MK_PF_CHUNK` | `512` | `--agents` with `MK_PF_MIX=0`: prompt tokens fed between two decode cycles (`0`: the whole prompt, the other slots wait) | 6fa95e9, 2026-10-28 |
+| `MK_PF_SOLO` | `0` | `--agents`: prompt tokens fed per call while no slot decodes (`0`: the whole prompt; equal to `MK_PF_MIX`: a prompt is fed in the same chunks alone as beside other slots) | 6fa95e9, 2026-10-28 |
 | `MK_IMAGE_MAX_PIXELS` | `100000000` | largest image or video frame in pixels, checked from the file header before decoding; also read by the vision library. The server reads it only with `--mmproj` | 8f24df3, 2026-10-17 |
 
 `MK_MAX_BODY_MB`, `MK_MAX_IMAGES`, `MK_MAX_VIDEO_FRAMES` and `MK_IMAGE_MAX_PIXELS` must be positive integers, the three
@@ -423,8 +423,8 @@ These switch single decode kernels back to an earlier form, for A/B measurements
 
 | Variable | Default | What it does | Output | Status | Since |
 |---|---|---|---|---|---|
-| `MK_SLOT_RESERVE_MIB` | `1536` | device memory left free when the slots take the most context that fits (`-c 0`), for the prefill and the runtime | - | option | 3c2dc48, 2026-10-28 |
-| `MK_SLOT_CK` | `2` | DeltaNet checkpoints per slot (where a slot's next prompt resumes when it diverges inside the slot's sequence) | same with exact reuse | option | 3c2dc48, 2026-10-28 |
+| `MK_SLOT_RESERVE_MIB` | `1536` | device memory left free when the slots take the most context that fits (`-c 0`), for the prefill and the runtime | - | option | f09ef59, 2026-10-28 |
+| `MK_SLOT_CK` | `2` | DeltaNet checkpoints per slot (where a slot's next prompt resumes when it diverges inside the slot's sequence) | same with exact reuse | option | f09ef59, 2026-10-28 |
 
 ### Memory and host store
 
