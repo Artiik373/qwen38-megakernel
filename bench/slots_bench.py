@@ -6,7 +6,9 @@
   exact:   each prompt alone on a slot (greedy), then all of them together on other slots, then again on the same slots
            (prefix reuse): every slot's tokens must equal its solo run's
   stagger: the last prompt begins after --lead batched steps of the others and is prefilled in --budget-token chunks
-           between their steps (mk_slots_step_mixed): every slot's tokens must equal its solo run's
+           between their steps (mk_slots_step_mixed): every slot's tokens must equal its solo run's, whose prompt is
+           prefilled in one piece (with MK_EXACT=1 the chunking changes no row; --ref-chunked: the solo run of the late
+           prompt fed in the same chunks, for engines or modes where it does)
   all:     exact, then speed
 
   python3 bench/slots_bench.py MODEL [speed|exact|stagger|all] [--n 4] [--gen 256] [--draft 7] [--long] [--lib LIB]
@@ -185,6 +187,7 @@ def main():
     ap.add_argument("--long", action="store_true", help="the long prompts (see above)")
     ap.add_argument("--budget", type=int, default=1024, help="stagger: the late slot's prefill chunk")
     ap.add_argument("--lead", type=int, default=8, help="stagger: steps of the others before the late slot begins")
+    ap.add_argument("--ref-chunked", action="store_true", help="stagger: the late prompt's solo run fed in the same chunks")
     a = ap.parse_args()
     e = Eng(a.lib, a.model, a.draft, a.draft_vocab or None)
     print(f"slots: {a.n} x {e.slots_open(a.n, a.ctx)} positions", flush=True)
@@ -210,8 +213,9 @@ def main():
             o, _ = gen(e, slots, pr, a.gen)
             bad += sum(compare(f"prompt {i}: slot {slots[i]} repeat (prefix reuse) vs solo", o[slots[i]], ref[i])
                        for i in range(a.n))
-        else:  # stagger (the solo reference of the late prompt is prefilled in the same chunks)
-            ref = {i: gen(e, [i], [pr[i]], a.gen, budget=a.budget if i == a.n - 1 else 1 << 30)[0][i] for i in range(a.n)}
+        else:  # stagger
+            ref = {i: gen(e, [i], [pr[i]], a.gen, budget=a.budget if a.ref_chunked and i == a.n - 1 else 1 << 30)[0][i]
+                   for i in range(a.n)}
             o, chunks = stagger(e, slots, pr, a.gen, a.budget, a.lead)
             print(f"stagger: slot {slots[-1]} began after {a.lead} steps, prefilled in {chunks} chunks of <= {a.budget}",
                   flush=True)
