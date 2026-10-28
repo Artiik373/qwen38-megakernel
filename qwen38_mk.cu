@@ -489,7 +489,7 @@ struct Launch {
     // presence / frequency penalty (vLLM's semantics, OpenAI's parameters): the logit of token v is lowered by
     // freq * c(v) + pres * (c(v) > 0), c(v) = how often v occurs in this response's generated tokens before the row's
     // position (Bufs::pcnt: the committed ones; a verify row adds the drafts in its own context). Applied to the main
-    // decode rows and to the MTP draft head before the argmax / top-k; 0 / 0: off (the kernels without the penalty).
+    // decode rows and to the MTP draft head before the argmax / top-k; 0 / 0: off (lm_head skips the penalty code).
     float pres, freq;
     // batched launch (MKEngine::slots_step; 0: a solo launch): nl lanes, lane i = ln[i].lane (views view_main / view_full)
     // with its rows r0 .. r0 + T - 1 of the pass (Launch::T = the pass's rows, at least their sum), the drafts its MTP
@@ -4278,7 +4278,7 @@ static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + MK_MAX_GRID * 8 <= SM_M
 // every logit of each row in cB.logits (scoring).  LSE (TL == 1): also the log-sum-exp of the row's
 // true logits; the last block leaves misc[LM_LSE] = lse and misc[LM_BEST] = the best true logit.
 // Draft rows: s_tok and the TOPK ids are token ids (mapped through cW.draft_ids).
-// PEN: presence / frequency penalty (Launch::pres / freq) on the true logits, the occurrences of a token = its count in
+// pen: presence / frequency penalty (Launch::pres / freq) on the true logits, the occurrences of a token = its count in
 // cB.pcnt plus its occurrences in ctl->tok[1 .. nx0 + t] (the drafts in row t's context; nx0: the drafts before row 0).
 // Every value is then the true logit minus the penalty (correctly rounded, no contraction: the same in any T).
 // misc() slots ([LM_WLSE, +2 * NW): per-warp lse), above the argmax lists [16, 16 + 2 NW MAXT) and s_last (LM_LAST)
@@ -4290,10 +4290,11 @@ __device__ __forceinline__ float pen_logit(float a, float sc, int c, float pres,
     return __fsub_rn(__fsub_rn(__fmul_rn(a, sc), __fmul_rn(freq, (float) c)), c > 0 ? pres : 0.f);
 }
 // HT: lm_head's type (output.weight: Q6_K, or Q8_0 in some fine-tunes); lm_head<...> below picks the instance.
-template <int TL, bool TOPK, bool FULL, bool LSE, bool PEN, int HT>
-__device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 * cand, float pres, float freq, int nx0) {
+template <int TL, bool TOPK, bool FULL, bool LSE, int HT>
+__device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 * cand, bool pen, float pres, float freq,
+                                       int nx0) {
     static_assert(!LSE || TL == 1, "LSE: one row");
-    static_assert(!(PEN && FULL), "no penalty when scoring");
+    if constexpr (FULL) pen = false; // no penalty when scoring (the FULL instances keep no penalty code)
     uint8_t * const sm = smem;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SX sx = make_sx(sm, U_D);
@@ -4313,8 +4314,8 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
     // MK_DRAFT_Q4 (draft head only: its calls are the LSE ones): rows [0, nq4) from the Q4_K copy cW.dq4
     int nq4 = 0;
     if constexpr (LSE) nq4 = draft ? cW.dq4_n : 0;
-    int xt[MAXT - 1]; // PEN: the drafts tok[1..MAXT - 1] (only the first nx0 + t count for row t)
-    if constexpr (PEN) {
+    int xt[MAXT - 1]; // pen: the drafts tok[1..MAXT - 1] (only the first nx0 + t count for row t)
+    if (pen) {
 #pragma unroll
         for (int i = 0; i < MAXT - 1; i++) xt[i] = ((volatile Ctl *) cB.ctl)->tok[1 + i];
     }
@@ -4340,7 +4341,7 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
             }
         }
         wsum_acc<TL, 2>(a);
-        if constexpr (PEN) { // a[k][t] <- the penalised true logit
+        if (pen) { // a[k][t] <- the penalised true logit
             const int c0 = __ldcg(cB.pcnt + p0), c1 = __ldcg(cB.pcnt + p1);
 #pragma unroll
             for (int t = 0; t < TL; t++) {
@@ -4355,9 +4356,10 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
                 a[1][t] = pen_logit(a[1][t], m[t], e1, pres, freq);
             }
         }
-        // (below, PEN ? a : a * m = the true logits: PEN's a already are)
+        // (below, pen ? a : a * m = the true logits: pen's a already are. LSE: __fmul_rn keeps v - mx a separate
+        // multiply and subtract, as without the select (no contraction))
         if constexpr (LSE) {
-            const float v0 = PEN ? a[0][0] : a[0][0] * m[0], v1 = PEN ? a[1][0] : a[1][0] * m[0];
+            const float v0 = pen ? a[0][0] : __fmul_rn(a[0][0], m[0]), v1 = pen ? a[1][0] : __fmul_rn(a[1][0], m[0]);
             const float mx = fmaxf(lm_m, fmaxf(v0, v1));
             lm_s = lm_s * __expf(lm_m - mx) + __expf(v0 - mx) + __expf(v1 - mx);
             lm_m = mx;
@@ -4374,8 +4376,8 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
 #pragma unroll
         for (int t = 0; t < TL; t++) {
             if constexpr (TOPK) { // true logits: apply the final RMS norm scale (irrelevant to the argmax)
-                topk_insert(bv[t], bi[t], PEN ? a[0][t] : a[0][t] * m[t], r);
-                topk_insert(bv[t], bi[t], PEN ? a[1][t] : a[1][t] * m[t], r + 1);
+                topk_insert(bv[t], bi[t], pen ? a[0][t] : a[0][t] * m[t], r);
+                topk_insert(bv[t], bi[t], pen ? a[1][t] : a[1][t] * m[t], r + 1);
             } else {
                 if (a[0][t] > bv[t]) { bv[t] = a[0][t]; bi[t] = r; }
                 if (a[1][t] > bv[t]) { bv[t] = a[1][t]; bi[t] = r + 1; }
@@ -4500,7 +4502,7 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
         }
         if (lane == 0) {
             s_tok[warp] = (draft && cW.draft_ids) ? cW.draft_ids[ix] : ix;
-            if (LSE) m[LM_BEST] = PEN ? b : b * m[0];
+            if (LSE) m[LM_BEST] = pen ? b : b * m[0];
             if (!draft && !(b > -INFINITY)) cB.err[0] = 1;
         }
     }
@@ -4510,11 +4512,11 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
 }
 // lm_head on the file's output.weight type: a thin out-of-line wrapper, so the callers (mk_cycle, mtp_pass) are unchanged
 // and each type's body is its own function (both bodies inline in one function would raise register pressure)
-template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false, bool PEN = false>
+template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false>
 __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr,
-                                     float pres = 0.f, float freq = 0.f, int nx0 = 0) {
-    if (cW.head.type == T_Q8_0) return lm_head_t<TL, TOPK, FULL, LSE, PEN, T_Q8_0>(t0, draft, s_tok, cand, pres, freq, nx0);
-    return lm_head_t<TL, TOPK, FULL, LSE, PEN, T_Q6K>(t0, draft, s_tok, cand, pres, freq, nx0);
+                                     bool pen = false, float pres = 0.f, float freq = 0.f, int nx0 = 0) {
+    if (cW.head.type == T_Q8_0) return lm_head_t<TL, TOPK, FULL, LSE, T_Q8_0>(t0, draft, s_tok, cand, pen, pres, freq, nx0);
+    return lm_head_t<TL, TOPK, FULL, LSE, T_Q6K>(t0, draft, s_tok, cand, pen, pres, freq, nx0);
 }
 
 // ---- sampling (single thread) ----
@@ -4834,13 +4836,11 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     constexpr int Tr = T;
 #endif
     if (P.mode == MODE_DECODE || P.score) {
-        if (sampling) am_last = pen ? lm_head<T, true, false, false, true>(0, false, sm, s_tok, nullptr, P.pres, P.freq, 0)
-                                    : lm_head<T, true>(0, false, sm, s_tok);
+        if (sampling) am_last = lm_head<T, true>(0, false, sm, s_tok, nullptr, pen, P.pres, P.freq, 0);
         else if (P.score == 2) {
             if constexpr (T <= 5) am_last = lm_head<T, false, true>(0, false, sm, s_tok);
             else am_last = false;
-        } else am_last = pen ? lm_head<T, false, false, false, true>(0, false, sm, s_tok, nullptr, P.pres, P.freq, 0)
-                             : lm_head<T>(0, false, sm, s_tok);
+        } else am_last = lm_head<T>(0, false, sm, s_tok, nullptr, pen, P.pres, P.freq, 0);
         tl = Tr;
     } else if (P.last) {
         am_last = sampling ? lm_head<1, true>(T - 1, false, sm, s_tok) : lm_head<1>(T - 1, false, sm, s_tok);
@@ -4933,10 +4933,8 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
         float2 * const tl = cB.dq + k * TOPK_MAX;
         // presence / frequency penalty: draft k + 1 has the committed tokens and drafts 1..k in its context
         const bool pen = P.pres != 0.f || P.freq != 0.f;
-        const bool lastb = P.spec_smp ? (pen ? lm_head<1, true, false, true, true>(R - 1, true, sm, s_tok, tl, P.pres, P.freq, k)
-                                             : lm_head<1, true, false, true>(R - 1, true, sm, s_tok, tl))
-                                      : (pen ? lm_head<1, false, false, true, true>(R - 1, true, sm, s_tok, nullptr, P.pres, P.freq, k)
-                                             : lm_head<1, false, false, true>(R - 1, true, sm, s_tok));
+        const bool lastb = P.spec_smp ? lm_head<1, true, false, true>(R - 1, true, sm, s_tok, tl, pen, P.pres, P.freq, k)
+                                      : lm_head<1, false, false, true>(R - 1, true, sm, s_tok, nullptr, pen, P.pres, P.freq, k);
 #endif
         if (lastb && threadIdx.x == 0) {
             Ctl * c = cB.ctl;
@@ -5530,10 +5528,8 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
             float2 * const tl = cB.dq + k * TOPK_MAX;
             // presence / frequency penalty: draft k + 1 has the committed tokens and drafts 1..k in its context
             const bool pen = Q.pres != 0.f || Q.freq != 0.f;
-            const bool lastb = Q.spec_smp ? (pen ? lm_head<1, true, false, true, true>(0, true, sm, s_tok, tl, Q.pres, Q.freq, k)
-                                                 : lm_head<1, true, false, true>(0, true, sm, s_tok, tl))
-                                          : (pen ? lm_head<1, false, false, true, true>(0, true, sm, s_tok, nullptr, Q.pres, Q.freq, k)
-                                                 : lm_head<1, false, false, true>(0, true, sm, s_tok));
+            const bool lastb = Q.spec_smp ? lm_head<1, true, false, true>(0, true, sm, s_tok, tl, pen, Q.pres, Q.freq, k)
+                                          : lm_head<1, false, false, true>(0, true, sm, s_tok, nullptr, pen, Q.pres, Q.freq, k);
     #endif
             if (lastb && threadIdx.x == 0) {
                 Ctl * c = cB.ctl;
