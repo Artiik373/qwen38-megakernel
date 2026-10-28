@@ -491,9 +491,6 @@ struct Launch {
     // position (Bufs::pcnt: the committed ones; a verify row adds the drafts in its own context). Applied to the main
     // decode rows and to the MTP draft head before the argmax / top-k; 0 / 0: off (the kernels without the penalty).
     float pres, freq;
-#if MK_MAXT > 5
-    int spec_blk; // sampled drafts: block verification of the verify rows (policy blk=1, sample_targets_blk)
-#endif
     // batched launch (MKEngine::slots_step; 0: a solo launch): nl lanes, lane i = ln[i].lane (views view_main / view_full)
     // with its rows r0 .. r0 + T - 1 of the pass (Launch::T = the pass's rows, at least their sum), the drafts its MTP
     // passes produce for the next launch, and its sampling
@@ -525,9 +522,6 @@ __device__ __forceinline__ Launch lane_launch(const Launch & P, int i) {
     Q.top_p = l.top_p;
     Q.min_p = l.min_p;
     Q.seed = l.seed;
-#if MK_MAXT > 5
-    Q.spec_blk = P.spec_blk && l.spec_smp;
-#endif
     Q.nl = 0;
     return Q;
 }
@@ -4534,11 +4528,7 @@ __device__ __forceinline__ float urand(unsigned long long seed, unsigned long lo
 }
 // Keys: a row's acceptance / residual uniforms by its position, a draft's by its absolute position. The per-token rule
 // uses each once (a position is decided once), and a draft drawn again at a position (after a rejection before it) is
-// independent of everything that decided its prefix: exact as is. Block verification (policy blk=1) reads every row's
-// eta, past its tau too, and the next launch verifies those positions again with drafts drawn again there: keyed by
-// position alone, those draws repeat, conditioned on the previous block (eta_i >= h_i past tau), a bias
-// (tests/spec_rng_sim.py). blk=1 salts its etas and the drafts by the launch's start position (fresh per launch).
-__device__ __forceinline__ unsigned long long launch_salt(unsigned long long n) { return (n + 1) * 0xD6E8FEB86659FD93ull; }
+// independent of everything that decided its prefix: exact as is.
 
 // sampling distribution over one row's candidates (descending), llama.cpp order: top_k, top_p, min_p,
 // temperature; returns the number kept, p[0..K) normalised
@@ -4598,11 +4588,11 @@ __device__ __forceinline__ float dq_prob(const float2 * q, int id) {
 
 // Sampled draft (single thread): q' = the sampling distribution (top_k, top_p, min_p, temp) of the draft
 // head's top logits src; writes q' to dst as (prob, token id) terminated by (0, -1) (dst may alias src) and
-// draws the draft from it with its own random stream, keyed by the draft's absolute position (and salt: blk=1).
-__device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos, unsigned long long salt = 0) {
+// draws the draft from it with its own random stream, keyed by the draft's absolute position.
+__device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos) {
     float p[TOPK_MAX];
     const int K = cand_probs(src, P, p);
-    float x = urand(P.seed ^ 0xD1B54A32D192ED03ull ^ salt, pos);
+    float x = urand(P.seed ^ 0xD1B54A32D192ED03ull, pos);
     int pick = -1, last = __float_as_int(src[0].y);
     for (int j = 0; j < K; j++) {
         const float2 e = src[j];
@@ -4617,84 +4607,6 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
     return pick >= 0 ? pick : last;
 }
 
-#if MK_MAXT > 5
-// Block verification (Sun et al. 2024, arXiv 2403.10444, Alg. 2) of the g = T - 1 sampled drafts (Ctl::dsmp; policy blk=1,
-// Launch::spec_blk). Same output distribution as the per-token rule, at least as many accepted drafts in expectation (it
-// judges the drafts as a block: a draft the token rule rejects can still be kept when the ones before it had weight
-// to spare). Row i verifies draft d_i = tok[i + 1] (target p_i, draft distribution q_i). Weights w_0 = 1, w_i = min(1,
-// w_(i-1) p_(i-1)(d_(i-1)) / q_(i-1)(d_(i-1))); h_i = r_i / (r_i + 1 - w_i) with r_i = sum_x max(0, w_i p_i(x) - q_i(x))
-// for i < g, h_g = w_g; tau = the largest i with eta_i < h_i (0 if none; eta_i = row i - 1's acceptance uniform).
-// Rows < tau keep their drafts; row tau draws from max(0, w_tau p_tau - q_tau) (tau < g; never d_tau, see notes/
-// agent_mtp.md) or from p_g (tau = g). A later row is drawn fresh from its p only while every row before it emitted its
-// draft (main_control then reads it; its prefix is the drafts, so its p is the target conditional): a fallback only.
-// Single thread (the last lm_head block's thread 0), out of line, one pass over the rows with the caller's probability
-// array p (no arrays of its own: a local array here raised mk_cycle's cumulative stack 1104 -> 1360 B, ~31 MiB of VRAM).
-// tau is found in the same forward pass (the last i with eta_i < h_i); the residual is drawn in two passes over row tau.
-__device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl, int * tg, const float2 * cand,
-                                                const float2 * dq, float (&p)[TOPK_MAX]) {
-    const Ctl * c = cB.ctl;
-    const unsigned long long n = (unsigned long long) c->n;
-    const unsigned long long es = P.seed ^ launch_salt(n); // the etas: fresh per launch (launch_salt)
-    const int g = T - 1;
-    float w = 1.f, wt = 1.f; // w_i; w_tau
-    int tau = 0;
-    for (int i = 0; i < g; i++) { // row i: h_i (i >= 1) from p_i, q_i and w_i, then w_(i + 1) from the draft d_i
-        const float2 * cd = cand + i * TOPK_MAX;
-        const float2 * q = dq + i * TOPK_MAX;
-        const int K = cand_probs(cd, P, p);
-        if (i >= 1) {
-            float r = 0.f; // (q_i's mass outside p_i's candidates adds nothing: max(0, 0 - q) = 0)
-            for (int j = 0; j < K; j++) r += fmaxf(0.f, w * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
-            const float den = r + 1.f - w;
-            const float h = den > 0.f ? r / den : 1.f;
-            if (urand(es, 2 * (n + i - 1)) < h) {
-                tau = i;
-                wt = w;
-            }
-        }
-        const int d = c->tok[i + 1];
-        float pd = 0.f;
-        for (int j = 0; j < K; j++)
-            if (__float_as_int(cd[j].y) == d) pd += p[j];
-        const float qd = dq_prob(q, d);
-        w = qd > 0.f ? fminf(w * pd / qd, 1.f) : 0.f;
-    }
-    if (urand(es, 2 * (n + g - 1)) < w) { // h_g = w_g
-        tau = g;
-        wt = w;
-    }
-    for (int i = 0; i < tau; i++) tg[i] = c->tok[i + 1];
-    {
-        const float2 * cd = cand + tau * TOPK_MAX;
-        const int K = cand_probs(cd, P, p);
-        const float u = urand(P.seed, 2 * (n + tau) + 1);
-        const float2 * q = dq + tau * TOPK_MAX;
-        float rs = 0.f;
-        if (tau < g)
-            for (int j = 0; j < K; j++) rs += fmaxf(0.f, wt * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
-        if (!(rs > 0.f)) { // tau = g: p_g; else rounding only
-            tg[tau] = cand_draw(cd, p, K, -1, u);
-        } else {
-            float x = u * rs;
-            int pick = -1;
-            for (int j = 0; j < K; j++) {
-                const float rj = fmaxf(0.f, wt * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
-                if (rj <= 0.f) continue;
-                pick = __float_as_int(cd[j].y);
-                x -= rj;
-                if (x < 0.f) break;
-            }
-            tg[tau] = pick;
-        }
-    }
-    for (int i = tau + 1; i < tl && tg[i - 1] == c->tok[i]; i++) {
-        const float2 * cd = cand + i * TOPK_MAX;
-        const int K = cand_probs(cd, P, p);
-        tg[i] = cand_draw(cd, p, K, -1, urand(P.seed, 2 * (n + i) + 1));
-    }
-}
-#endif
-
 // Sampled targets for the verified rows.  Point-mass drafts (argmax of the MTP): draft token d at row
 // i is accepted with probability p_i(d); on rejection the row's token is drawn from p_i without d.
 // Sampled drafts (Ctl::dsmp, d ~ q'_i): accepted with probability min(1, p_i(d) / q'_i(d)); on
@@ -4705,17 +4617,8 @@ __device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl,
 // SM_CAND), dq: the drafts' proposals (cB.dq, staged at SM_DQ): single-thread code, so every load is latency.
 __device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
     const Ctl * c = cB.ctl;
-#if MK_MAXT > 5
-    float p[TOPK_MAX];
-    if (P.spec_blk && P.mode == MODE_DECODE && c->dsmp && T >= 2 && tl == T) {
-        sample_targets_blk(P, T, tl, tg, cand, dq, p);
-        return;
-    }
-    const unsigned long long n = (unsigned long long) c->n;
-#else
     const unsigned long long n = (unsigned long long) c->n;
     float p[TOPK_MAX];
-#endif
     for (int i = 0; i < tl; i++) {
         const float2 * cd = cand + i * TOPK_MAX;
         const int K = cand_probs(cd, P, p);
@@ -5045,7 +4948,7 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
 #endif
             // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
             const int dt = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                     (unsigned long long) c->mtp_P + 1 + k, P.spec_blk ? launch_salt(c->mtp_P) : 0ull)
+                                                     (unsigned long long) c->mtp_P + 1 + k)
                                       : s_tok[0];
             c->tok[1 + k] = dt;
             // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -5642,7 +5545,7 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
     #endif
                 // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
                 const int dt = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                         (unsigned long long) c->mtp_P + 1 + k, Q.spec_blk ? launch_salt(c->mtp_P) : 0ull)
+                                                         (unsigned long long) c->mtp_P + 1 + k)
                                           : s_tok[0];
                 c->tok[1 + k] = dt;
                 // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -6326,9 +6229,6 @@ struct MKEngine::Impl {
 #endif
         int gate_chain = 1;
         int h1 = 1; // sampling: sampled drafts (Launch::spec_smp)
-#if MK_MAXT > 5
-        int blk = 0; // sampled drafts: block verification (Launch::spec_blk)
-#endif
     } pol;
     // the policy's draft depth at position pos: n_draft, or (MK_MAXT > 5) at most 4 from Policy::dctx on
 #if MK_MAXT > 5
@@ -8643,9 +8543,6 @@ struct MKEngine::Impl {
         // pick which drafts get verified by their value (biased output: tests/spec_rng_sim.py); stop gates only
         if (L.gate_chain == 2 && L.spec_smp)
             for (int k = 0; k < MAXT - 1; k++) L.gate_drop[k] = 0.f;
-#if MK_MAXT > 5
-        L.spec_blk = L.spec_smp && pol.blk;
-#endif
         if (!score && (pen_pres != 0.f || pen_freq != 0.f)) {
             L.pres = pen_pres;
             L.freq = pen_freq;
@@ -10858,7 +10755,6 @@ struct MKEngine::Impl {
         for (int i = 0; i < L.nl; i++) L.spec_smp |= L.ln[i].spec_smp;
         if (L.gate_chain == 2 && L.spec_smp)
             for (int k = 0; k < MAXT - 1; k++) L.gate_drop[k] = 0.f;
-        L.spec_blk = 0;
         for (int i = 0; i < nl; i++) {
             if (li[i] < 0) continue;
             Lane & l = lanes[ks[i]];
@@ -10956,7 +10852,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 // dq4=0|1 (MK_DRAFT_Q4=1 only: the draft head reads lm_head / its Q4_K copy; kept until changed);
 // MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
 // chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);
-// blk=0|1 (sampled drafts: block verification, sample_targets_blk); g7=0|1 (the depth > 5 gates, Impl::Policy);
+// g7=0|1 (the depth > 5 gates, Impl::Policy); blk=0 only (blk=1, block verification of sampled drafts, was removed);
 // "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
@@ -10991,7 +10887,9 @@ void MKEngine::set_policy(const std::string & spec) {
         else if (k == "chain") pol.gate_chain = std::stoi(v);
         else if (k == "h1") pol.h1 = std::stoi(v);
 #if MK_MAXT > 5
-        else if (k == "blk") pol.blk = std::stoi(v);
+        else if (k == "blk") {
+            if (std::stoi(v)) throw std::runtime_error("policy blk=" + v + " was removed (block verification of sampled drafts; blk=0 is the only value)");
+        }
 #endif
 #if DP4A_NARROW
         else if (k == "mtpq") throw std::runtime_error("policy mtpq was removed from this build: the MTP block is always re-quantised to Q4_K");
