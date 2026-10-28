@@ -8005,6 +8005,34 @@ struct MKEngine::Impl {
             hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
             hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
         }
+#if MK_WV && MK_MAXT > 5
+        // every main-layer matrix outside the wv layout is a hybrid type (Q3_K / IQ3_S; Q6_K without MK_WV_Q6F): the dp4a
+        // dispatch of the main layers has no other case (wv.cuh gemv_pairs_dp). Refused rather than mis-read.
+        {
+            auto dp4a_need = [&](const std::string & name, const Mat & m) {
+                const int t = m.type;
+                if (!m.fm && t != T_Q3K && t != T_IQ3S && (MK_WV_Q6F || t != T_Q6K))
+                    throw std::runtime_error(name + " is " + tname(t) + " outside the wv layout: this build's dp4a kernels do not read it");
+            };
+            for (int i = 0; i < NL; i++) {
+                const LayerW & L = hw.L[i];
+                auto chk = [&](const char * r, const Mat & m) { dp4a_need(blk(i, r), m); };
+                if (L.attn) {
+                    chk("attn_q.weight", L.q);
+                    chk("attn_k.weight", L.k);
+                    chk("attn_v.weight", L.v);
+                    chk("attn_output.weight", L.o);
+                } else {
+                    chk("attn_qkv.weight", L.qkv);
+                    chk("attn_gate.weight", L.gate);
+                    chk("ssm_out.weight", L.sout);
+                }
+                chk("ffn_gate.weight", L.fg);
+                chk("ffn_up.weight", L.fu);
+                chk("ffn_down.weight", L.fd);
+            }
+        }
+#endif
         hw.onorm = up_f32("output_norm.weight", D);
         hw.head = up_mat("output.weight", D, VOCAB);
         // Q8_0: lm_head_t<.., T_Q8_0> (some fine-tunes; ~0.3 GB more than Q6_K)

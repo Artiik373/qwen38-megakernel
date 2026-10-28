@@ -809,11 +809,14 @@ __device__ __forceinline__ WvAcc<WvCfg<T, true>::NG> wv_tile_off(const Mat & m, 
 
 constexpr int WV_S = 4; // split-K chunks of out / ffn_down (fixed for every T)
 
-// the hybrid's dp4a matrices on the wv fill (rows_* XP = 2)
+// the hybrid's dp4a matrices on the wv fill (rows_* XP = 2). MK_WV_Q6F: no Q6_K case here or in resid_dp / rows16_dp_g
+// (every main-layer Q6_K is FM: the loader places it and refuses anything else outside the wv layout)
 template <int T, int IT, class Out>
 __device__ __forceinline__ void gemv_pairs_dp(const Mat & m, int lo, int hi, Out out) {
     switch (m.type) {
+#if !MK_WV_Q6F
         case T_Q6K: gemv_pairs<T, IT, T_Q6K, 2>(m, lo, hi, out); break;
+#endif
         case T_Q3K: gemv_pairs<T, IT, T_Q3K, 2>(m, lo, hi, out); break;
         default: gemv_pairs<T, IT, T_IQ3S, 2>(m, lo, hi, out); break;
     }
@@ -821,7 +824,9 @@ __device__ __forceinline__ void gemv_pairs_dp(const Mat & m, int lo, int hi, Out
 template <int T>
 __device__ __forceinline__ LaneT<T> rows16_dp(const Mat & m, int j) {
     switch (m.type) {
+#if !MK_WV_Q6F
         case T_Q6K: return rows16<T, T_Q6K, 2>(m, j);
+#endif
         case T_Q3K: return rows16<T, T_Q3K, 2>(m, j);
         default: return rows16<T, T_IQ3S, 2>(m, j);
     }
@@ -834,7 +839,9 @@ __device__ __forceinline__ void resid_dp(const Mat & W, const QBuf & in, float *
         resid_any<T, IT>(W, in, x, add, wnext, sm);
     } else {
         switch (W.type) {
+#if !MK_WV_Q6F
             case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm); break;
+#endif
             case T_Q3K: resid32<T, IT, T_Q3K>(W, in, x, add, wnext, sm); break;
             default: resid32<T, IT, T_IQ3S>(W, in, x, add, wnext, sm); break;
         }
@@ -1689,7 +1696,9 @@ __device__ __noinline__ LaneT<8> rows16_g(const Mat m, int j, int grp) {
 }
 __device__ __forceinline__ LaneT<8> rows16_dp_g(const Mat & m, int j, int grp) {
     switch (m.type) {
+#if !MK_WV_Q6F
         case T_Q6K: return rows16_g<T_Q6K>(m, j, grp);
+#endif
         case T_Q3K: return rows16_g<T_Q3K>(m, j, grp);
         default: return rows16_g<T_IQ3S>(m, j, grp);
     }
