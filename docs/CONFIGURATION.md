@@ -70,7 +70,7 @@ on when the vision projector is found. These are the settings worth knowing:
 | Prefill chunk | `MK_PF_CAP` | (engine) | 2048; the launchers set 1024 above 96k context, `serve.bat` 512 above 240k with your own `MK_KV` | 1024 frees ~0.34 GB of VRAM (2026-10-11) |
 | Thinking off by default | `MK_CHAT_TEMPLATE_KWARGS` | `--chat-template-kwargs` | thinking on | `{"enable_thinking": false}` |
 | Python | `MK_PYTHON` | - | `python3` (Windows: `python`) | a virtual environment with jinja2 |
-| Lean build | `make MKFLAGS=` / `build.ps1 -MkFlags ""` | - | the served build | less RAM to compile (~19 GB instead of up to ~34 GB); at most 4 drafts |
+| Lean build | `make MKFLAGS=` / `build.ps1 -MkFlags ""` | - | the served build | less RAM to compile (~19 GB on 2026-10-17; the served build now peaks at ~21 GB); at most 4 drafts |
 
 Running `server/mk_server.py` directly instead of a launcher: its own defaults are more conservative (port 18080,
 context 32768, 4 drafts, `--kv auto`, exact reuse off, no images unless `--mmproj`). More than 4 drafts needs the q8_0
@@ -476,10 +476,10 @@ MKFLAGS = -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1
 
 - **Served build** (the default): wide verify (`MK_WV=1`: the verify pass on int8 tensor cores), up to 7 drafts
   (`MK_MAXT=8`), every Q6_K matrix on the tensor-core path (`MK_WV_Q6F=1`) and the split DeltaNet barrier (`MK_K5=1`).
-  `MK_C1` and `MK_EGRESS` follow `MK_WV`, so they are on too. ptxas peaked at 28-34 GB of RAM for it
-  ([BUILDING.md](BUILDING.md#requirements)); the Makefile's comment still says ~28 GB.
+  `MK_C1` and `MK_EGRESS` follow `MK_WV`, so they are on too. ptxas peaked at 21.2 GB of RAM for it on
+  Linux (2026-10-28, [BUILDING.md](BUILDING.md#requirements)).
 - **Lean build** (`make MKFLAGS=`, `.\build.ps1 -MkFlags ""`): every flag at its default, so the dp4a verify path and
-  at most 4 drafts (run it with `MK_DRAFT=4` / `-d 4`). ptxas needs ~19 GB.
+  at most 4 drafts (run it with `MK_DRAFT=4` / `-d 4`). ptxas needed ~19 GB (2026-10-17).
 
 Both builds give the same output at every draft depth, but not the same output as each other: the tensor-core verify
 sums in another order than the dp4a path. When the wide-verify flags were first served (2026-10-13, 72a58cd, 7 drafts)
@@ -534,7 +534,7 @@ before them at 4 drafts (999fc68). A running server reports its flags in `/props
 | `-Targets` (build.ps1) | `all` | any of `all`, `engine` (DLL + CLI), `vision`, `tools` | fdad907, 2026-10-16 |
 | `GLIBC_TUNABLES` (make, exported) | `glibc.malloc.hugetlb=1` | lets ptxas's malloc use transparent huge pages: the Linux build runs ~20% faster, same machine code (needs THP in `madvise` or `always` mode; glibc 2.35+) | 66ce8cf, 2026-10-17 |
 
-`build.ps1` skips the engine's 20-minute compile when its object is newer than every engine source and was built
+`build.ps1` skips the engine's compile when its object is newer than every engine source and was built
 with the same flags. Make targets: `all` (the default: CLI, engine library, tools, and the vision library when
 llama.cpp's build has libmtmd), `vision`, `tools/vit_check`, `tests/gguf_fuzz`, `clean`. `NVFLAGS`, `VISION_INC`,
 `VISION_LIBS`, `VIT_OBJ` and `VIT_DEF` are the Makefile's internal variables (`VIT_DEF` is `-DMKV_NO_VIT` on CPUs

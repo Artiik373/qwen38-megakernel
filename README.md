@@ -167,7 +167,7 @@ library):
 git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout b10246
 cmake -S ../llama.cpp -B ../llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
 cmake --build ../llama.cpp/build -j
-make -j2                          # the served configuration: about 20 minutes, up to ~34 GB of RAM in ptxas
+make -j2                          # the served configuration: about 13 minutes, up to ~21 GB of RAM in ptxas
 pip install -r requirements.txt
 hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.gguf --local-dir ~/models
 scripts/serve.sh                  # http://127.0.0.1:8080: 120k context, 7 drafts, exact reuse, images on
