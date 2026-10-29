@@ -42,7 +42,7 @@ size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint
     }
 #endif
     if (wv_fm(type)) {
-        const int BS = type == T_Q4K ? 144 : type == T_Q5K ? 176 : 136;
+        const int BS = type == T_Q4K ? 144 : type == T_Q5K ? 176 : type == T_Q5_1 ? 192 : 136;
         parallel_rows(N / 16, [&](int64_t tile) {
             for (int rr = 0; rr < 16; rr++) {
                 const int r = (int) tile * 16 + rr, g = rr & 7, half = rr >> 3;
@@ -58,11 +58,15 @@ size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint
                                 memcpy(u + 128 + 512 * p + 16 * (4 * g + tq) + 8 * half, pr + 16 + 128 * odd + 32 * p + 8 * tq, 8);
                     } else {
                         const uint8_t * blk = row + (size_t) sb * BS;
-                        memcpy(u + 32 * g + 16 * half, blk, 16);
-                        const int qs = type == T_Q4K ? 16 : 48, qo = type == T_Q4K ? 256 : 768;
+                        // Q5_1: 32-B headers (rows g / g + 8 at 64 g / 64 g + 32), qh at 512, qs at 1024
+                        const bool q51 = type == T_Q5_1, hq = type == T_Q5K || q51;
+                        if (q51) memcpy(u + 64 * g + 32 * half, blk, 32);
+                        else memcpy(u + 32 * g + 16 * half, blk, 16);
+                        const int qs = type == T_Q4K ? 16 : q51 ? 64 : 48, qo = type == T_Q4K ? 256 : q51 ? 1024 : 768;
+                        const int hs = q51 ? 32 : 16, ho = q51 ? 512 : 256;
                         for (int tq = 0; tq < 4; tq++) {
                             const int l = 4 * g + tq;
-                            if (type == T_Q5K) memcpy(u + 256 + 16 * l + 8 * half, blk + 16 + 8 * tq, 8);
+                            if (hq) memcpy(u + ho + 16 * l + 8 * half, blk + hs + 8 * tq, 8);
                             for (int p = 0; p < 4; p++) memcpy(u + qo + 512 * p + 16 * l + 8 * half, blk + qs + 32 * p + 8 * tq, 8);
                         }
                     }
@@ -80,9 +84,9 @@ size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint
                     memcpy(dst + (((size_t) tile * nbk + i) * 16 + rr) * BS, src + ((size_t) tile * 16 + rr) * rowb + (size_t) i * BS, BS);
         });
     };
-    // Q4_K / IQ4_NL 144, Q5_K 176, Q8_0 256 (+ 16-B scale entries); MK_MAXT > 5 ffn_down: Q6_K 192 / Q3_K 96 (+ 36-B meta
-    // pairs), IQ3_S 96 (+ 16-B meta per block)
-    const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
+    // Q4_K / IQ4_NL 144, Q5_K 176, Q5_1 192, Q8_0 256 (+ 16-B scale entries); MK_MAXT > 5 ffn_down: Q6_K 192 / Q3_K 96 (+ 36-B
+    // meta pairs), IQ3_S 96 (+ 16-B meta per block)
+    const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q5_1 ? 192 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
     const int MB = type == T_Q6K || type == T_Q3K ? 2 * Q6_META : 16;
     tm(w, out, rb, BS);
     if (meta_n) tm(meta, out_meta, (int) (meta_n / N), MB);
@@ -105,7 +109,7 @@ struct WvProbe {
 };
 inline bool wv_probe(int type, WvProbe & p) {
     if (!wv_fm(type)) return false;
-    const int BS = type == T_Q4K ? 144 : type == T_Q5K ? 176 : 136;
+    const int BS = type == T_Q4K ? 144 : type == T_Q5K ? 176 : type == T_Q5_1 ? 192 : 136;
     p.G = type == T_IQ4X ? 2 : 1;
     p.seg = p.G * BS;
     if (p.seg % 8) return false;
@@ -199,7 +203,7 @@ inline bool wv_dev_ok(int type, int N, int K, int rb, size_t meta_n, std::map<in
         }
         return nb % it->second.G == 0 && rb % 8 == 0 && rb == nb / it->second.G * it->second.seg;
     }
-    const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
+    const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q5_1 ? 192 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
     const int MB = type == T_Q6K || type == T_Q3K ? 2 * Q6_META : 16;
     const size_t mrow = meta_n ? meta_n / N : 0;
     return rb % BS == 0 && BS % 4 == 0 && rb % 4 == 0 && (!meta_n || (meta_n % N == 0 && mrow % MB == 0 && MB % 4 == 0 && mrow % 4 == 0));
@@ -224,7 +228,7 @@ inline cudaError_t wv_dev_launch(int type, int N, int K, int rb, const uint8_t *
                                                rb / 8, p.seg / 8, total);
         return cudaGetLastError();
     }
-    const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
+    const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q5_1 ? 192 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
     const int MB = type == T_Q6K || type == T_Q3K ? 2 * Q6_META : 16;
     const int64_t tw = (int64_t) N * rb / 4;
     wv_tm_dev<<<grid(tw), TPB, 0, st>>>(reinterpret_cast<const uint32_t *>(sw), reinterpret_cast<uint32_t *>(out), rb / 4, BS / 4, rb / BS, tw);

@@ -31,8 +31,8 @@
 namespace gguf {
 
 enum GType : uint32_t {
-    F32 = 0, F16 = 1, Q4_0 = 2, Q8_0 = 8, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23,
-    BF16 = 30
+    F32 = 0, F16 = 1, Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14,
+    IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23, BF16 = 30
 };
 
 struct Tensor {
@@ -49,6 +49,9 @@ inline uint64_t type_row_bytes(uint32_t type, uint64_t n) {
         case F32: return n * 4;
         case F16: case BF16: return n * 2;
         case Q4_0: return n / 32 * 18;
+        case Q4_1: return n / 32 * 20;
+        case Q5_0: return n / 32 * 22;
+        case Q5_1: return n / 32 * 24;
         case Q8_0: return n / 32 * 34;
         case Q4_K: return n / 256 * 144;
         case Q5_K: return n / 256 * 176;
@@ -65,7 +68,7 @@ inline uint64_t type_row_bytes(uint32_t type, uint64_t n) {
 inline uint64_t type_block(uint32_t type) {
     switch (type) {
         case F32: case F16: case BF16: return 1;
-        case Q4_0: case Q8_0: case IQ4_NL: return 32;
+        case Q4_0: case Q4_1: case Q5_0: case Q5_1: case Q8_0: case IQ4_NL: return 32;
         case Q4_K: case Q5_K: case Q6_K: case Q3_K: case IQ3_S: case IQ4_XS: return 256;
         default: return 0;
     }

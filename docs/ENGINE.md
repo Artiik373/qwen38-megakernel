@@ -133,6 +133,7 @@ any of:
 | IQ4_XS | re-laid-out at load in pairs of 256-weight blocks, 272 B per pair (both block headers, then each block's index bytes in Q4_K order); 4-bit indices mapped to int8 weights with `__byte_perm` |
 | Q3_K, IQ3_S | re-laid-out at load (values + scales streams, 114 / 112 B per 256 weights); the GEMV and the prefill GEMM feed exactly the integers and scales of the Q6_K re-encode they replace (`MK_REENC3=1`): bit-identical results at ~0.54x the bytes |
 | IQ4_NL | re-laid-out at load into 144-byte blocks of 256 weights (the eight fp16 scales, then the index bytes); bit-identical to the Q8_0 re-encode it replaces (`MK_IQ4NL_Q8=1`) at 0.53x the bytes |
+| Q5_1 | re-laid-out at load into 192-byte blocks of 256 weights, the same bytes per weight (the eight fp16 `d` / `m` pairs, then the high bits and the low nibbles in Q5_K's order); every weight `d q + m` exactly, read by the Q5_K code paths with `d` / `-m` as the sub-block scale / minimum. Input projections only (q / k / v, `attn_qkv`, `attn_gate`, FFN gate / up; rows of a multiple of 256 values): `attn_output`, `ssm_out`, `ffn_down` and `eh_proj` in Q5_1 are refused (one kernel instance less per decode width, for ptxas' memory). Seen in community Q5_K_M mixes (one `attn_v`) |
 
 `token_embd` can be Q4_K, Q5_K, Q6_K or Q8_0: it stays in mapped pinned host memory (not in VRAM) as stored, and each lookup
 (the decode embed phase, the MTP block's input, the prefill embed kernels) stages the token's row and dequantizes it the

@@ -307,7 +307,7 @@ constexpr int SM_ATTN_MAX = SM_ATTN > SM_ATTN_Q8 ? SM_ATTN : SM_ATTN_Q8;
 constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN_MAX ? SM_MISC + 2048 : SM_ATTN_MAX);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
 
-enum { T_F32 = 0, T_Q8_0 = 8, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ4NL = 20, T_IQ3S = 21, T_IQ4X = 23 };
+enum { T_F32 = 0, T_Q5_1 = 7, T_Q8_0 = 8, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ4NL = 20, T_IQ3S = 21, T_IQ4X = 23 };
 enum { MODE_PREFILL = 0, MODE_DECODE = 1, MODE_BENCH = 2 };
 
 struct Mat {
@@ -1171,6 +1171,47 @@ __device__ __forceinline__ void rows_iq4nl(const uint8_t * const (&rp)[R], const
     }
 }
 
+// Q5_1 re-laid-out at load into Q51_BLK = 192-byte blocks of 256 weights (repack_q51, the same 24 B per 32 weights as the
+// GGUF): the (d, m) fp16 pairs of the eight 32-weight blocks, then their high bits in Q5_K's qh order (byte l, bit j:
+// element l of block j), then the 128 low-nibble bytes in Q4_K order. A weight is d q + m, q = low | high << 4 (0..31):
+// accR's fA q - gA with gA = -m.
+constexpr int Q51_BLK = 192;
+template <int T, int IT, int R, int XP = 0>
+__device__ __forceinline__ void rows_q51(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
+    for (int i = 0; i < IT; i++) {
+        const int u = lane + 32 * i, b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
+        int2 dm[R];
+        int4 qh[R], q[R];
+#pragma unroll
+        for (int k = 0; k < R; k++) {
+            const uint8_t * blk = rp[k] + b * Q51_BLK;
+            dm[k] = ldw2(blk + 8 * p);
+            qh[k] = ldw4(blk + 32 + 16 * hh);
+            q[k] = ldw4(blk + 64 + 32 * p + 16 * hh);
+        }
+        int A[R][4], B[R][4];
+        float fA[R], gA[R], fB[R], gB[R];
+        const int s0 = 2 * p, s1 = 2 * p + 1;
+#pragma unroll
+        for (int k = 0; k < R; k++) {
+            const float2 a = __half22float2(*reinterpret_cast<const __half2 *>(&dm[k].x));
+            const float2 c = __half22float2(*reinterpret_cast<const __half2 *>(&dm[k].y));
+            fA[k] = a.x; gA[k] = -a.y; fB[k] = c.x; gB[k] = -c.y;
+            A[k][0] = (q[k].x & M4) | (((qh[k].x >> s0) & 0x01010101) << 4);
+            A[k][1] = (q[k].y & M4) | (((qh[k].y >> s0) & 0x01010101) << 4);
+            A[k][2] = (q[k].z & M4) | (((qh[k].z >> s0) & 0x01010101) << 4);
+            A[k][3] = (q[k].w & M4) | (((qh[k].w >> s0) & 0x01010101) << 4);
+            B[k][0] = ((q[k].x >> 4) & M4) | (((qh[k].x >> s1) & 0x01010101) << 4);
+            B[k][1] = ((q[k].y >> 4) & M4) | (((qh[k].y >> s1) & 0x01010101) << 4);
+            B[k][2] = ((q[k].z >> 4) & M4) | (((qh[k].z >> s1) & 0x01010101) << 4);
+            B[k][3] = ((q[k].w >> 4) & M4) | (((qh[k].w >> s1) & 0x01010101) << 4);
+        }
+        accR<T, R, 32 * IT + XP>(s, u, A, B, fA, gA, fB, gB, acc);
+    }
+}
+
 // Native Q3_K (repack_q3k): per row a value stream of Q3_BLK = 96 B per 256-block, unit u' = 2p + hh at 8 u' (the 2-bit
 // lows: A's 16 in the first word, B's in the second, element 4j + m at bits 2j of byte m) and its high bits at 64 + 4 u'
 // (byte m: bit j = A element 4j + m, bit 4 + j = B), plus the Q6_K meta stream (sc - 32 as int8, d; Mat::d). A weight is
@@ -1284,6 +1325,7 @@ __device__ __forceinline__ int unit_bytes(int u0) {
          : TYPE == T_Q5K                  ? (u0 >> 3) * 176
          : TYPE == T_Q6K                  ? (u0 >> 3) * Q6_BLK
          : TYPE == T_Q3K || TYPE == T_IQ3S ? (u0 >> 3) * Q3_BLK
+         : TYPE == T_Q5_1                 ? (u0 >> 3) * Q51_BLK
                                           : 32 * u0;
 }
 // R rows of one weight type given their row pointers (and, for Q8_0, their scale rows)
@@ -1297,6 +1339,7 @@ __device__ __forceinline__ void rows_t(const uint8_t * const (&rp)[R], const __h
     else if constexpr (TYPE == T_IQ4NL) rows_iq4nl<T, IT, R, XP>(rp, s, acc);
     else if constexpr (TYPE == T_Q3K) rows_q3k<T, IT, R, XP>(rp, dp, s, acc);
     else if constexpr (TYPE == T_IQ3S) rows_iq3s<T, IT, R, XP>(rp, dp, s, acc);
+    else if constexpr (TYPE == T_Q5_1) rows_q51<T, IT, R, XP>(rp, s, acc);
     else rows_q80<T, IT, R, XP>(rp, dp, s, acc);
 }
 template <int T, int IT, int R, int TYPE, int XP = 0>
@@ -1349,6 +1392,7 @@ __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Ou
         case T_IQ4NL: gemv_pairs<T, IT, T_IQ4NL>(m, lo, hi, out); break;
         case T_Q3K: gemv_pairs<T, IT, T_Q3K>(m, lo, hi, out); break;
         case T_IQ3S: gemv_pairs<T, IT, T_IQ3S>(m, lo, hi, out); break;
+        case T_Q5_1: gemv_pairs<T, IT, T_Q5_1>(m, lo, hi, out); break;
         default: gemv_pairs<T, IT, T_IQ4X>(m, lo, hi, out); break;
     }
 }
@@ -1788,6 +1832,7 @@ __device__ __forceinline__ LaneT<T> rows16_any(const Mat & m, int j) {
         case T_IQ4NL: return rows16<T, T_IQ4NL>(m, j);
         case T_Q3K: return rows16<T, T_Q3K>(m, j);
         case T_IQ3S: return rows16<T, T_IQ3S>(m, j);
+        case T_Q5_1: return rows16<T, T_Q5_1>(m, j);
         default: return rows16<T, T_IQ4X>(m, j);
     }
 }
@@ -6164,6 +6209,31 @@ void repack_iq4nl(const uint8_t * src, uint8_t * dst, size_t nblocks) {
     }
 }
 
+// GGUF Q5_1 (8 blocks of 24 B: fp16 d, fp16 m, u32 qh, u8 qs[16]) per 256 weights -> Q51_BLK = 192 B (rows_q51, wv
+// WV<T_Q5_1>, prefill TQ51): the eight (d, m) pairs, qh[32] (bit j of byte l: the high bit of element l of block j), then
+// the 128 low-nibble bytes in the order of repack_iq4xs. The same bytes per weight; every value kept.
+void repack_q51(const uint8_t * src, uint8_t * dst, size_t nblocks) {
+    for (size_t i = 0; i < nblocks; i++) {
+        const uint8_t * s = src + i * 192;
+        uint8_t * o = dst + i * Q51_BLK;
+        memset(o + 32, 0, 32);
+        for (int ib = 0; ib < 8; ib++) {
+            const uint8_t * b = s + 24 * ib;
+            memcpy(o + 4 * ib, b, 4);
+            uint32_t qh;
+            memcpy(&qh, b + 4, 4);
+            for (int l = 0; l < 32; l++) o[32 + l] |= (uint8_t) (((qh >> l) & 1u) << ib);
+        }
+        auto lo = [&](int v) {
+            const uint8_t * qs = s + 24 * (v >> 5) + 8;
+            const int j = v & 31;
+            return j < 16 ? qs[j] & 0xf : qs[j - 16] >> 4;
+        };
+        for (int p = 0; p < 4; p++)
+            for (int l = 0; l < 32; l++) o[64 + 32 * p + l] = (uint8_t) (lo(64 * p + l) | (lo(64 * p + 32 + l) << 4));
+    }
+}
+
 // Q3_K's 12 bytes of packed 6-bit scales -> sc - 32 (ggml's unpacking)
 void q3k_scales(const uint8_t * packed, int8_t (&sc)[16]) {
     uint32_t aux[4];
@@ -7562,6 +7632,27 @@ struct MKEngine::Impl {
             else
 #endif
             m.w = dput<uint8_t>(qd, qn, &S);
+        } else if (t.type == gguf::Q5_1) {
+            // native (rows_q51, WV<T_Q5_1>, prefill TQ51): re-laid-out, same size. Input projections only: the residual
+            // outputs (resid32 / X16 wv tiles) have no Q5_1 instance (ptxas memory of mk_cycle)
+            for (const char * r : {"attn_output.weight", "ssm_out.weight", "ffn_down.weight", "eh_proj.weight"})
+                if (name.size() >= strlen(r) && !name.compare(name.size() - strlen(r), std::string::npos, r))
+                    throw std::runtime_error(name + " is Q5_1: supported for the input projections only (q / k / v, qkv, gate, ffn gate / up)");
+            if (K % 256) throw std::runtime_error(name + ": Q5_1 rows need a multiple of 256 values");
+            m.type = T_Q5_1;
+            m.rb = nb * Q51_BLK;
+            HSet & S = hset();
+            const size_t qn = (size_t) N * m.rb;
+            uint8_t * qd = S.q.get(qn);
+            {
+                auto _ = lc.scope("repack Q5_1");
+                parallel_rows(N, [&](int64_t r) { repack_q51(t.data + (size_t) r * nb * 192, qd + (size_t) r * m.rb, nb); });
+            }
+#if MK_WV
+            if (wv_lay) wv_place(m, qd, qn, nullptr, 0, S);
+            else
+#endif
+            m.w = dput<uint8_t>(qd, qn, &S);
         } else if (t.type == gguf::Q8_0) {
             const int nb32 = K / 32;
             if (K % 256) throw std::runtime_error(name + ": Q8_0 rows need a multiple of 256 values");
@@ -7872,6 +7963,8 @@ struct MKEngine::Impl {
                 case gguf::IQ4_NL: return "IQ4_NL";
                 case gguf::IQ3_S: return "IQ3_S";
                 case gguf::IQ4_XS: return "IQ4_XS";
+                case gguf::Q5_1: return "Q5_1";
+                case gguf::BF16: return "BF16";
                 default: return "type " + std::to_string(t);
             }
         };
@@ -7884,7 +7977,7 @@ struct MKEngine::Impl {
                                      " (see README: the GGUF)");
         };
         auto needq = [&](const std::string & name, int got) {
-            need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL, T_Q3K, T_IQ3S});
+            need(name, got, {T_Q4K, T_Q5K, T_Q5_1, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL, T_Q3K, T_IQ3S});
         };
         if (const char * e = getenv("MK_MTP_Q4")) {
             if (!strcmp(e, "ab")) mtp_q4 = 2;
@@ -8906,6 +8999,7 @@ struct MKEngine::Impl {
         CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
         mmh_attr<pf::TQ4K, false>();
         mmh_attr<pf::TQ5K, false>();
+        mmh_attr<pf::TQ51, false>();
         mmh_attr<pf::TQ6K, false>();
         mmh_attr<pf::TQ80, false>();
         mmh_attr<pf::TIQ4, false>();
@@ -8918,6 +9012,7 @@ struct MKEngine::Impl {
 #if MK_WV
         mmh_attr<pf::TQ4K, false, 1>();
         mmh_attr<pf::TQ5K, false, 1>();
+        mmh_attr<pf::TQ51, false, 1>();
         mmh_attr<pf::TQ80, false, 1>();
         mmh_attr<pf::TIQ4, false, 1>();
         mmh_attr<pf::TIQ4NL, false, 1>();
@@ -9243,6 +9338,7 @@ struct MKEngine::Impl {
             switch (m.type) {
                 case T_Q4K: mmh_launch<pf::TQ4K, false, 1>(nrt, W, X, ntok, O); return;
                 case T_Q5K: mmh_launch<pf::TQ5K, false, 1>(nrt, W, X, ntok, O); return;
+                case T_Q5_1: mmh_launch<pf::TQ51, false, 1>(nrt, W, X, ntok, O); return;
                 case T_Q8_0: mmh_launch<pf::TQ80, false, 1>(nrt, W, X, ntok, O); return;
                 case T_IQ4X: mmh_launch<pf::TIQ4, false, 1>(nrt, W, X, ntok, O); return;
                 case T_IQ4NL: mmh_launch<pf::TIQ4NL, false, 1>(nrt, W, X, ntok, O); return;
@@ -9258,6 +9354,7 @@ struct MKEngine::Impl {
         switch (m.type) {
             case T_Q4K: mmh_launch<pf::TQ4K, false>(nrt, W, X, ntok, O); break;
             case T_Q5K: mmh_launch<pf::TQ5K, false>(nrt, W, X, ntok, O); break;
+            case T_Q5_1: mmh_launch<pf::TQ51, false>(nrt, W, X, ntok, O); break;
             case T_Q6K: mmh_launch<pf::TQ6K, false>(nrt, W, X, ntok, O); break;
             case T_Q8_0: mmh_launch<pf::TQ80, false>(nrt, W, X, ntok, O); break;
             case T_IQ4X: mmh_launch<pf::TIQ4, false>(nrt, W, X, ntok, O); break;

@@ -35,11 +35,13 @@ __device__ __forceinline__ void mma16832(int (&d)[4], const int (&a)[4], int b0,
 __device__ __forceinline__ float mag23(unsigned w, int k) { return __int_as_float(__byte_perm(w, 0x4b000000u, 0x7540u | k)); }
 
 // the weight types the wv path serves (the others stay on dp4a at every T: per tensor T-invariant)
-__host__ __device__ constexpr bool wv_type(int t) { return t == T_Q4K || t == T_Q5K || t == T_IQ4X || t == T_IQ4NL || t == T_Q8_0; }
+__host__ __device__ constexpr bool wv_type(int t) {
+    return t == T_Q4K || t == T_Q5K || t == T_IQ4X || t == T_IQ4NL || t == T_Q8_0 || t == T_Q5_1;
+}
 // fragment-ordered (FM) types; the other wv types are tile-major whole blocks
 // (MK_WV_FMK=0: Q4_K / Q5_K tile-major whole blocks instead: their prefill GEMMs read whole 16-B chunks, but the
 // decode GEMMs lose most of the wv gain (8-B loads at stride 32); notes/agent_wvplumb.md "wvplumb3")
-__host__ __device__ constexpr bool wv_fm(int t) { return t == T_IQ4X || (MK_WV_FMK && (t == T_Q4K || t == T_Q5K)); }
+__host__ __device__ constexpr bool wv_fm(int t) { return t == T_IQ4X || (MK_WV_FMK && (t == T_Q4K || t == T_Q5K || t == T_Q5_1)); }
 // per-16 weight scales (MK_MAXT > 5 ffn_down types): split MMAs only
 __host__ __device__ constexpr bool wv_s16(int t) { return t == T_Q6K || t == T_Q3K; }
 
@@ -108,6 +110,39 @@ template <> struct WV<T_Q5K> { // 176 B: d, dmin | scales[12] | qh[32] | qs[128]
         WV<T_Q4K>::scales(t, s);
     }
     static __device__ __forceinline__ void wsc(const Sc & s, int k, float & fA, float & gA) { WV<T_Q4K>::wsc(s, k, fA, gA); }
+    static __device__ __forceinline__ void frag(const Raw & r, int k, int & w0, int & w1) {
+        const int sh = 4 * (k & 1);
+        w0 = ((r.q[k >> 1].x >> sh) & M4) | ((((unsigned) r.qh.x >> k) & 0x01010101u) << 4);
+        w1 = ((r.q[k >> 1].y >> sh) & M4) | ((((unsigned) r.qh.y >> k) & 0x01010101u) << 4);
+    }
+};
+
+// Q5_1 as repacked by the loader (repack_q51), 192 B: (d, m) fp16 pairs of the 8 natural 32-blocks | qh[32] | qs[128] (Q5_K's
+// qh / qs order). Weight = d q + m: MIN 1 with fA = d, gA = -m (exact fp16 values; no scale products to round). FM units of
+// 16 rows: headers at 64 g + 32 half (2 chunks per row), qh at 512 + 16 l, qs at 1024 + 512 p + 16 l (wv_relayout).
+template <> struct WV<T_Q5_1> {
+    static constexpr int MIN = 1, BS = 192;
+    struct Raw { int4 h; int4 h2; int2 qh; int2 q[4]; };
+    struct Sc { int4 h; int4 h2; };
+    static __device__ __forceinline__ void load(Raw & r, const Mat & m, int tile, int row, int sb, int tq) { // (MK_WV_FMK=0)
+        const uint8_t * blk = wv_tblk(m, tile, row, sb, 192);
+        r.h = ldw4(blk);
+        r.h2 = ldw4(blk + 16);
+        r.qh = ldw2(blk + 32 + 8 * tq);
+#pragma unroll
+        for (int p = 0; p < 4; p++) r.q[p] = ldw2(blk + 64 + 32 * p + 8 * tq);
+    }
+    static __device__ __forceinline__ void scales(const Raw & r, Sc & s) {
+        s.h = r.h;
+        s.h2 = r.h2;
+    }
+    static __device__ __forceinline__ void wsc(const Sc & s, int k, float & fA, float & gA) {
+        const int4 & h = k < 4 ? s.h : s.h2;
+        const int w = (k & 3) == 0 ? h.x : (k & 3) == 1 ? h.y : (k & 3) == 2 ? h.z : h.w;
+        const float2 dm = __half22float2(*reinterpret_cast<const __half2 *>(&w));
+        fA = dm.x;
+        gA = -dm.y;
+    }
     static __device__ __forceinline__ void frag(const Raw & r, int k, int & w0, int & w1) {
         const int sh = 4 * (k & 1);
         w0 = ((r.q[k >> 1].x >> sh) & M4) | ((((unsigned) r.qh.x >> k) & 0x01010101u) << 4);
@@ -403,16 +438,22 @@ __device__ __forceinline__ void wv_load2(typename WV<TYPE>::Raw & r0, typename W
             r0.h = make_int2(h.x, h.y);
             r1.h = make_int2(h.z, h.w);
             qo = 128;
+        } else if constexpr (TYPE == T_Q5_1) { // rows g / g + 8: 32-B headers at 64 g, 64 g + 32
+            r0.h = ldw4(u + 64 * g);
+            r0.h2 = ldw4(u + 64 * g + 16);
+            r1.h = ldw4(u + 64 * g + 32);
+            r1.h2 = ldw4(u + 64 * g + 48);
+            qo = 512;
         } else {
             r0.h = ldw4(u + 32 * g);
             r1.h = ldw4(u + 32 * g + 16);
             qo = 256;
         }
-        if constexpr (TYPE == T_Q5K) {
-            const int4 v = ldw4(u + 256 + 16 * l);
+        if constexpr (TYPE == T_Q5K || TYPE == T_Q5_1) {
+            const int4 v = ldw4(u + qo + 16 * l);
             r0.qh = make_int2(v.x, v.y);
             r1.qh = make_int2(v.z, v.w);
-            qo = 768;
+            qo += 512;
         }
 #pragma unroll
         for (int p = 0; p < 4; p++) {
@@ -782,6 +823,9 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
     switch (m.type) {
         case T_Q4K: return wv_tile<T_Q4K, T, X16>(m, tile, sb0, nsb, xs);
         case T_Q5K: return wv_tile<T_Q5K, T, X16>(m, tile, sb0, nsb, xs);
+        case T_Q5_1: // (input projections only: the loader refuses Q5_1 for out / ssm_out / ffn_down, the X16 roles)
+            if constexpr (!X16) return wv_tile<T_Q5_1, T, X16>(m, tile, sb0, nsb, xs);
+            __trap();
         case T_IQ4NL: return wv_tile<T_IQ4NL, T, X16>(m, tile, sb0, nsb, xs);
         case T_Q8_0: return wv_tile<T_Q8_0, T, X16>(m, tile, sb0, nsb, xs);
         default: return wv_tile<T_IQ4X, T, X16>(m, tile, sb0, nsb, xs);
@@ -1581,6 +1625,9 @@ __device__ __forceinline__ WvSt<T, X16> wv_tile_any_st(const Mat & m, int tile, 
     switch (m.type) {
         case T_Q4K: return wv_tile_st<T_Q4K, T, X16>(m, tile, sb0, nsb, xs, st);
         case T_Q5K: return wv_tile_st<T_Q5K, T, X16>(m, tile, sb0, nsb, xs, st);
+        case T_Q5_1: // (input projections only, as wv_tile_any)
+            if constexpr (!X16) return wv_tile_st<T_Q5_1, T, X16>(m, tile, sb0, nsb, xs, st);
+            __trap();
         case T_IQ4NL: return wv_tile_st<T_IQ4NL, T, X16>(m, tile, sb0, nsb, xs, st);
         case T_Q8_0: return wv_tile_st<T_Q8_0, T, X16>(m, tile, sb0, nsb, xs, st);
         default: return wv_tile_st<T_IQ4X, T, X16>(m, tile, sb0, nsb, xs, st);
