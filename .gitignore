@@ -22,7 +22,7 @@ bench/resid_bench
 bench/*_tmp/
 # benchmark suite downloads (bench/suite/fetch.py)
 bench/suite/data/
-# experimental draft vocabulary (the engine uses draft_vocab_32k.bin)
+# experimental draft vocabulary (the engine uses draft_vocab_56k.bin)
 draft_vocab_48k.bin
 # python
 __pycache__/

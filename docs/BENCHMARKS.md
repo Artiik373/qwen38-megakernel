@@ -611,7 +611,7 @@ proposed, so a sampled reply with a fixed seed can differ from the one before it
 - **Parallel agents:** the parallel step of [bench/suite](../bench/suite/README.md) (`parallel_client.py`, its context
   fetched by `fetch.py`); without a server, `python3 bench/slots_bench.py <gguf> all` checks the engine's slots against
   each conversation alone and times them.
-- **Speed, CLI:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_32k.bin --model <gguf>` (the four
+- **Speed, CLI:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_56k.bin --model <gguf>` (the four
   chat prompts through the CLI; it runs the CLI's default KV cache, so at most 4 drafts); `bench/code_bench.py` and
   `bench/think_bench.py` are upstream's scripts; `bench/*.cu` are kernel microbenchmarks.
 - **Accuracy against llama.cpp:**
@@ -626,7 +626,7 @@ proposed, so a sampled reply with a fixed seed can differ from the one before it
   MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 ./qwen38_mk -m model.gguf --kld long.ref --score-path mixed --kv q8   # preset F
   ```
 
-- **Draft-depth independence:** `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_32k.bin
+- **Draft-depth independence:** `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_56k.bin
   --ids`, then the same with `-d 4` and `-d 0`: the ids must be identical.
 
 More on each check: [BUILDING.md](BUILDING.md#checking-a-build).

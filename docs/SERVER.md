@@ -85,7 +85,7 @@ what they do.
 | topic | options (environment twin) |
 |---|---|
 | several agents at once | `--agents N` [0] (`MK_AGENTS`), `--parallel N` / `-np N`: [several agents at once](#several-agents-at-once---agents) |
-| model and engine | `-m` / `--model` (required), `-c` / `--ctx` [32768], `-d` / `--draft` [4], `--kv auto\|f16\|q8` [auto], `--draft-vocab` [draft_vocab_32k.bin], `--mtp FILE` (`MK_MTP`), `--no-mtp` (`MK_NO_MTP=1`), `--lib` |
+| model and engine | `-m` / `--model` (required), `-c` / `--ctx` [32768], `-d` / `--draft` [4], `--kv auto\|f16\|q8` [auto], `--draft-vocab` [draft_vocab_56k.bin], `--mtp FILE` (`MK_MTP`), `--no-mtp` (`MK_NO_MTP=1`), `--lib` |
 | network | `--host` [127.0.0.1], `--port` [18080], `--allow-host NAME` (`MK_ALLOW_HOSTS`), `--cors-origin ORIGIN` (`MK_CORS_ORIGINS`): [Security](#security) |
 | conversation cache | `--exact-reuse` (`MK_EXACT=1`), `--ck-every` [4096], `--ck-msgs` [1], `--ck-pin` [1], `--side-max` [8192] (`MK_SIDE_MAX`), `--park-mib` [8192] (`MK_PARK_MIB`), `--park-min` [1024], `--park-cks` [2]: [the conversation cache](#the-conversation-cache) |
 | templates and output | `--chat-template-file PATH`, `--chat-template TEMPLATE`, `--chat-template-kwargs JSON` (`MK_CHAT_TEMPLATE_KWARGS`), `--reasoning-format` [auto] (`MK_REASONING_FORMAT`), `--content-specials` [text] (`MK_CONTENT_SPECIALS`) |

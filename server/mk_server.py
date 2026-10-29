@@ -5066,7 +5066,7 @@ def main():
                     help="context positions (default 32768; with --agents: per slot, 0 = the most that fit, the default "
                          "there)")
     ap.add_argument("-d", "--draft", type=int, default=4)
-    ap.add_argument("--draft-vocab", default=os.path.join(os.path.dirname(HERE), "draft_vocab_32k.bin"))
+    ap.add_argument("--draft-vocab", default=os.path.join(os.path.dirname(HERE), "draft_vocab_56k.bin"))
     ap.add_argument("--mtp", default=None,
                     help="the MTP draft layer from another GGUF of the same model (default: the model file's; env MK_MTP)")
     ap.add_argument("--no-mtp", action="store_true", help="no MTP layer: plain decoding, depth 0 (env MK_NO_MTP=1)")

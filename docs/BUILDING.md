@@ -183,13 +183,13 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 - **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed and randomly corrupted files under
   AddressSanitizer and UBSan (CPU only, Linux).
 - **Draft-depth independence:** the same prompt at `-d 0`, `-d 4` and `-d 7` must give identical ids:
-  `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_32k.bin --ids`
+  `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_56k.bin --ids`
 - **Accuracy against llama.cpp:** `tools/llama_ref` writes a reference file, and
   `./qwen38_mk -m <gguf> --kld <ref> --score-path mixed --kv q8` scores the engine against it
   ([BENCHMARKS.md](BENCHMARKS.md#against-llamacpp) has the full recipe and the expected numbers).
 - **Images:** `tools/mkv_cli` encodes images and writes their rows. `tools/vision_ref` writes llama.cpp's reference for
   an image prompt plus the rows it fed, and `qwen38_mk --kld <ref> --kld-images <rows>` scores it.
-- **Speed:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_32k.bin --model <gguf>` (4 chat
+- **Speed:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_56k.bin --model <gguf>` (4 chat
   prompts through the CLI; it uses the CLI's default KV cache, so at most 4 drafts). `bench/*.cu` are kernel
   microbenchmarks.
 - **Windows against Linux:** the ids of the depth check, the `--kld` report and server replies to the same requests
@@ -208,5 +208,5 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 - `tools/`: llama.cpp reference tools and the draft-vocabulary builder
 - `bench/`: benchmarks (upstream's scripts and kernel microbenchmarks)
 - `tests/`: server tests, the GGUF fuzzer, the sampling replica (`spec_rng_sim.py`) and chat templates
-- `draft_vocab_32k.bin`: the MTP draft head's token subset
+- `draft_vocab_56k.bin`: the MTP draft head's token subset
 - `docs/`: this documentation

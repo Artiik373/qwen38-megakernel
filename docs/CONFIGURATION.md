@@ -272,7 +272,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--cors-origin`, `--cors-origins ORIGIN` | `MK_CORS_ORIGINS` | none | web origins (`scheme://host[:port]`) whose pages may call the server (CORS headers, preflights; `*` is refused); pages of other origins get a 403. Clients that are not web pages send no Origin and are not affected | - | 5aab531, 2026-10-19 |
 | `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens (the model's full context is 262,144); with `--agents` each slot's, 0 = the most that fits | - | upstream (4d92fd2) |
 | `-d`, `--draft` | - | `4` (launchers 7) | MTP drafts per cycle: 0-7 with the served build, 0-4 with the lean build; more than 4 needs the q8_0 cache | drafts only | upstream (4d92fd2) |
-| `--draft-vocab` | - | `draft_vocab_32k.bin` in the repo | the draft head's vocabulary (the 32k most frequent tokens; tokens of the current conversation are added) | drafts only | upstream (4d92fd2) |
+| `--draft-vocab` | - | `draft_vocab_56k.bin` in the repo | the draft head's vocabulary (56k frequent tokens, [ENGINE.md](ENGINE.md); tokens of the current conversation are added; `draft_vocab_32k.bin` until 2026-10-29: 3.7% slower on average) | drafts only | upstream (4d92fd2) |
 | `--mtp FILE` | `MK_MTP` (engine) | the model file's MTP layer | the MTP draft layer from another GGUF of the same model (checked against it) | drafts only | f334fd0, 2026-10-18 |
 | `--no-mtp` | `MK_NO_MTP=1` (engine) | off | no MTP layer: plain decoding at depth 0, no MTP weights or KV slot | drafts only | f334fd0, 2026-10-18 |
 | `--lib` | - | `libqwen38mk.so` / `qwen38mk.dll` in the repo root | the engine library | - | upstream (4d92fd2) |
@@ -563,7 +563,7 @@ Model and engine (one per process; in `--batch` mode these stay the command line
 | `-m FILE` | required | the GGUF | upstream (4d92fd2) |
 | `-c N` | `8192` | context (KV capacity) in tokens | upstream (4d92fd2) |
 | `--kv f16\|q8\|auto` | `auto` | KV cache format; `auto`: q8_0 when fp16 does not fit, or when `MK_KV` is set | upstream (4d92fd2) |
-| `--draft-vocab FILE` | none: the full lm_head | the draft head's vocabulary (`draft_vocab_32k.bin`) | upstream (4d92fd2) |
+| `--draft-vocab FILE` | none: the full lm_head | the draft head's vocabulary (`draft_vocab_56k.bin`) | upstream (4d92fd2) |
 | `--mtp FILE`, `--no-mtp` | the model file's MTP layer | as the server's options (env `MK_MTP`, `MK_NO_MTP=1`) | f334fd0, 2026-10-18 |
 | `--batch FILE` | - | one job per line (the job options below plus `-o <prefix>`: stdout to `<prefix>.out`, stderr to `<prefix>.err`), one model load, the engine reset between jobs: each job's output equals a separate run's; `#` lines are comments | c2c7f3d, 2026-10-14 |
 

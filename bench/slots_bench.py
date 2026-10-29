@@ -176,7 +176,7 @@ def main():
     ap.add_argument("model")
     ap.add_argument("what", nargs="?", default="speed", choices=["speed", "exact", "stagger", "all"])
     ap.add_argument("--lib", default=os.path.join(REPO, "libqwen38mk.so"))
-    ap.add_argument("--draft-vocab", default=os.path.join(REPO, "draft_vocab_32k.bin"), help="'' = none")
+    ap.add_argument("--draft-vocab", default=os.path.join(REPO, "draft_vocab_56k.bin"), help="'' = none")
     ap.add_argument("--n", type=int, default=4, help="slots (speed: the largest count)")
     ap.add_argument("--nmin", type=int, default=1, help="speed: the smallest slot count")
     ap.add_argument("--gen", type=int, default=256, help="tokens per slot")

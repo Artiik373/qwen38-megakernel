@@ -109,7 +109,7 @@ The CLI:
 
 ```sh
 ./qwen38_mk -m ~/models/Qwen3.8-27B-UD-Q4_K_XL.gguf -p "Write quicksort in C" -n 512 \
-            -d 7 --kv q8 --draft-vocab draft_vocab_32k.bin --think --temp 1.0 --top-p 0.95 --top-k 20
+            -d 7 --kv q8 --draft-vocab draft_vocab_56k.bin --think --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
 Its flags, the environment variables the engine reads at load (KV presets, prefill chunk, exact reuse, checkpoint
@@ -346,10 +346,14 @@ frame or frame pair is an image (the same M-RoPE positions, so the engine needs 
   (2026-10-12) decode gained 18.7% at 101.6K depth and 7.3% at 38K. Chunks of a single tile (context <= 640) keep the
   simple loop, which has no pipeline to fill; low-bit `MK_KV` slots run the pipelined kernel too (`attn_core_q8m`).
   At T > 5 (up to 48 query rows) one pass over K / V serves all rows (`attn_core_w48`).
-- **MTP drafting on device**, with the draft lm_head restricted to the 32,768 most frequent tokens
-  (`draft_vocab_32k.bin`, built by `tools/vocab_freq` from local code + docs; covers ~99.4% of tokens), plus the tokens
-  of the current sequence that are missing from it, added on the fly (identifiers of pasted code). Verification always
-  uses the full vocabulary, so this affects only the acceptance rate, never the output.
+- **MTP drafting on device**, with the draft lm_head restricted to a token subset (`draft_vocab_56k.bin`, 56,321 ids:
+  the union of the earlier `draft_vocab_32k.bin` (`tools/vocab_freq` over local code + docs, ~99.4% coverage), the 32k
+  list of HauhauCS's FastMTP sidecar (`d2t`) and `tools/vocab_freq` 40,960 over llama.cpp docs / sources, Python 3.12's
+  standard library, benchmark answers and a held-out prose corpus), plus the tokens of the current sequence that are
+  missing from it, added on the fly (identifiers of pasted code). Verification always uses the full vocabulary, so this
+  affects only the acceptance rate, never the output. Against the 32k list (NIKI Q5_K_M, 12 prompts, 512 tokens, greedy
+  ids identical, 2026-10-29): +3.7% tok/s on average (prose +6%, Chinese +14%, code +2-3%, edit tasks within ±0.8%),
+  ~68 MiB more VRAM for the draft head's Q4_K copy.
 - **n-gram drafts** (policy `ng`, default 24): before a solo decode launch the host looks for the latest earlier
   occurrence of the sequence's last 24 tokens (`MKEngine::Impl::ng_lookup`, a backward scan: ~34 us at 131k tokens).
   When the tokens after it start with the MTP's first draft, they replace the MTP drafts in `Ctl::tok` (as fixed drafts
@@ -429,7 +433,7 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
 - `server/mk_server.py` - the HTTP server ([SERVER.md](SERVER.md)); `scripts/serve.sh` / `scripts/serve.bat` - the launchers
 - `main.cu` - CLI (tokenization via libllama)
 - `compat_win32.h` / `.cpp`, `vision/win32.h` / `.cpp`, `build.ps1` - the native Windows build
-- `draft_vocab_32k.bin` - MTP draft-head token subset (int32 ids)
+- `draft_vocab_56k.bin` - MTP draft-head token subset (int32 ids, the default); `draft_vocab_32k.bin` - the earlier one
 - `tools/vocab_freq.cpp` - builds a draft vocabulary from a list of text files
 - `tools/llama_ref.cpp` / `logit_stats.h` - llama.cpp's next-token distributions and the comparison with them (KL
   divergence, perplexity, top-token agreement)

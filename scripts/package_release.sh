@@ -46,7 +46,7 @@ for f in "${ELF_TOOLS[@]}"; do patchelf --set-rpath '$ORIGIN/..' "$STAGE/$f"; do
 cp server/*.py "$STAGE/server/"
 cp scripts/serve.sh "$STAGE/scripts/"
 cp -r docs "$STAGE/"
-cp README.md LICENSE THIRD_PARTY_NOTICES.md requirements.txt draft_vocab_32k.bin "$STAGE/"
+cp README.md LICENSE THIRD_PARTY_NOTICES.md requirements.txt draft_vocab_56k.bin "$STAGE/"
 cp "$LLAMA/LICENSE" "$STAGE/licenses/llama.cpp-LICENSE"
 for f in "$LLAMA"/licenses/*; do [ -f "$f" ] && cp "$f" "$STAGE/licenses/llama.cpp-$(basename "$f")"; done
 sed -n '/^This software is available under 2 licenses/,$p' "$LLAMA/vendor/stb/stb_image.h" > "$STAGE/licenses/stb_image-LICENSE"
