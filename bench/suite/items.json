@@ -65,6 +65,38 @@
      "sha256": "20fbed5d68e121b01e0234643ef41572f2a9607eda7a49dfa957348526ff89b7"
     }
    }
+  },
+  "open-jet": {
+   "type": "files",
+   "base": "https://raw.githubusercontent.com/L-Forster/open-jet/f246ff08d3d9a522cd5583446fcc0f05396c0ddd/",
+   "dir": "raw/open-jet-f246ff0",
+   "files": {
+    "src/__init__.py": {
+     "bytes": 316,
+     "sha256": "af21406a8db39bd237eba2bf9689f74c76229e969bc68355e02ec40ee568e603"
+    },
+    "src/agent.py": {
+     "bytes": 42791,
+     "sha256": "032bbe40326dacfb215c0697751d135aec1e138e1990fd382c8662cf9fdd7759"
+    },
+    "src/agent_setup.py": {
+     "bytes": 12451,
+     "sha256": "150ab6cc273bf0993bc97c40156cc389d0579eb24b7094bdd9230341eabe1b57"
+    },
+    "src/airgap.py": {
+     "bytes": 5070,
+     "sha256": "c789c96305e798b28b410f8e7d8c0280ffed82a293e7612230d027b447aa094d"
+    },
+    "src/api_auth.py": {
+     "bytes": 5957,
+     "sha256": "9c070d97b1f3502f1a2ec7cd67d629d5c8462786c418f00b23decfd8b0ebd61f"
+    },
+    "src/app.py": {
+     "bytes": 186187,
+     "sha256": "82a3800edcbe4951e7589b0e08f9d8e7a483ec1c30fea34ba03e463422d9c52e"
+    }
+   },
+   "note": "open-jet at f246ff0: the first files of src/**/*.py in sorted order, the context of its megakernel/bench/parallel_bench.py"
   }
  },
  "prompts": {
@@ -82,6 +114,15 @@
    "sha256": "d8d46665f80195af05765708238867d77febc6db251f2b205c64ddbb397ff517",
    "parts": ["repo:prompts/pf38k.txt", "llama.cpp:src/llama-model.cpp", "llama.cpp:src/llama-vocab.cpp"],
    "note": "pf38k.txt followed by llama.cpp b10246's src/llama-model.cpp and src/llama-vocab.cpp, cut to 325,100 bytes: ~101.6k tokens"
+  },
+  "oj100k": {
+   "where": "data",
+   "file": "prompts/oj100k.txt",
+   "chars": 100000,
+   "bytes": 100584,
+   "sha256": "b5500e3e2d08788294aad456f60cd02c4db9d3a798521ec8c46cec6da730fd54",
+   "parts": ["open-jet:src/__init__.py", "open-jet:src/agent.py", "open-jet:src/agent_setup.py", "open-jet:src/airgap.py", "open-jet:src/api_auth.py", "open-jet:src/app.py"],
+   "note": "open-jet f246ff0's src/**/*.py concatenated in sorted order (as its parallel_bench.py reads them), cut to 100,000 characters: parallel_client.py's ctx test, ~23k tokens; its stagger test sends the first 88,000 characters, ~20k tokens"
   }
  },
  "sets": {

@@ -17,6 +17,7 @@ No dataset is part of this repository. `fetch.py` downloads them on your machine
 | `qa_client.py` | the 282 questions |
 | `scratch_client.py` | the ~101.6k-token prompt read from scratch |
 | `maxctx_client.py` | speed and accuracy at the largest context (262,144 tokens with preset D) |
+| `parallel_client.py` | several agents at once: decode per request, first token on long contexts, a long prompt arriving while another request decodes (a port of open-jet's `bench/parallel_bench.py`) |
 | `score.py` | scores the answers offline (HumanEval only with `--exec-humaneval`) |
 | `summarize.py` | the tables |
 | `prompts/pf38k.txt` | the 38k-token prompt: the first 100,000 bytes of an earlier version of this engine's `qwen38_mk.cu` |
@@ -47,6 +48,7 @@ you need the space.
 | needle in a haystack | 9 at ~32k / 64k / 100k tokens; 6 at ~190k / 248k / 261k | built from Project Gutenberg #2600 (War and Peace) |
 | LongBench v2 | 12 that fit a 120k context; 6 at 125k-258k tokens | `THUDM/LongBench-v2` at revision `2b48e49`, `data.json` |
 | `pf101k.txt` | the ~101.6k-token prompt | `prompts/pf38k.txt` followed by llama.cpp b10246's `src/llama-model.cpp` and `src/llama-vocab.cpp`, cut to 325,100 bytes |
+| `oj100k.txt` | the parallel client's ~23k-token context | open-jet f246ff0's `src/**/*.py` in sorted order (the text its `parallel_bench.py` sends), cut to 100,000 characters |
 
 The five small sets come from the Hugging Face dataset viewer's rows API, by row number. Each dataset is under its own
 license and terms (see its page). The items were chosen once by seeded sampling, on 2026-10-13 (the full-context sets
@@ -94,6 +96,12 @@ llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj mmproj-BF16.gguf --no-mmpro
 llama-server honours `cache_prompt: false`, so the speed client's own from-scratch request is valid there and no
 separate step is needed.
 
+The parallel step serves several agents at once, on unsloth's plain `Qwen3.8-27B-Q4_K_M.gguf` (upstream open-jet's
+model). This engine: `python3 server/mk_server.py -m Qwen3.8-27B-Q4_K_M.gguf --agents 4 -d 7 --port 8080`. Upstream,
+from an open-jet checkout at f246ff0 with its megakernel built: `python3 megakernel/server/mk_server.py -m
+Qwen3.8-27B-Q4_K_M.gguf --agents 4 --port 8080`, and with `--lib <this engine's libqwen38mk.so> -d 7` added, open-jet's
+server driving this engine. llama-server: `--parallel 4`, with the context it needs for four 23k-token conversations.
+
 ## 3. Run the steps
 
 All clients take `--url` (default `http://127.0.0.1:8080`), `--label` (a name for the configuration, written into
@@ -105,8 +113,9 @@ every record) and `--out` (a JSON-lines file; records are appended). Times are f
 | questions | the same server, after the speed step | `python -I bench/suite/qa_client.py --label q8 --out qa.jsonl` | ~28 min |
 | from-scratch prefill | 120k, side requests and parking off | `python -I bench/suite/scratch_client.py --label q8 --out scratch.jsonl` | ~2 min |
 | full context | preset D at 262,144 | `python -I bench/suite/maxctx_client.py --label max_d --ctx 262144 --out max.jsonl` | ~45 min |
+| parallel agents | `--agents 4`, Q4_K_M | `python -I bench/suite/parallel_client.py --label agents --n 4 --out parallel.jsonl`, then the same with `--n 1 --tests short,ctx` | ~3 min |
 | scores | none | `python -I bench/suite/score.py qa.jsonl max.jsonl --exec-humaneval --out scores.json` | seconds |
-| tables | none | `python bench/suite/summarize.py speed.jsonl scratch.jsonl max.jsonl --scores scores.json` | seconds |
+| tables | none | `python bench/suite/summarize.py speed.jsonl scratch.jsonl max.jsonl parallel.jsonl --scores scores.json` | seconds |
 
 Repeat the speed, questions and from-scratch steps for each configuration with its own label (the published table:
 q8_0 and preset D). Use the same label for a configuration's speed and from-scratch runs: the summary takes the
@@ -145,6 +154,14 @@ the question totals and the full-context table, and writes them as JSON with `--
   conversation of the speed step.
 - **Preset D's long-context decode rows** are not like-for-like with q8_0's: the replies differ from 2,048 tokens on,
   and with them the share of accepted drafts (see BENCHMARKS.md).
+- **Parallel agents.** Totals are the sums of the per-request decode rates; the short test runs twice and the table
+  shows the better pass. The ctx test's first tokens show whether the server kept each conversation (a server that keeps
+  four 23k-token conversations answers each in a fraction of a second). In the stagger test the other request's rate
+  counts its streamed chunks while the long prompt is processed, as open-jet's script does: one chunk per token on
+  servers that stream token by token. Each request's header carries the run's start time, so nothing is reused across
+  runs.
 
 The accuracy against llama.cpp's own distributions (KL divergence) is measured with the CLI, not the server: see
-[BENCHMARKS.md](../../docs/BENCHMARKS.md#reproducing).
+[BENCHMARKS.md](../../docs/BENCHMARKS.md#reproducing). The engine's parallel slots can also be checked and timed without
+a server: `python3 bench/slots_bench.py <gguf> all` (batched output against each conversation alone, then decode speed
+with 1 to 4 slots).

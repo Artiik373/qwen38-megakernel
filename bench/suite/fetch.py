@@ -1,13 +1,13 @@
 """Download the benchmark items into a data directory and check every item against the manifest (items.json).
 usage: python -I bench/suite/fetch.py [--data DIR] [--sets NAME ...] [--check]
   --data   where the items go (default bench/suite/data, ignored by git); downloads are kept under DIR/raw
-  --sets   only these (default: every set and the pf101k prompt): gsm8k mmlu_pro arc_c math500 math500_think humaneval
-           niah niah_max longbench_v2 longbench_max pf101k
+  --sets   only these (default: every set and the built prompts): gsm8k mmlu_pro arc_c math500 math500_think humaneval
+           niah niah_max longbench_v2 longbench_max pf101k oj100k
   --check  download nothing: check the files already in DIR against the manifest
-The items are selected by the manifest's ids and row numbers (no re-sampling); the NIAH prompts and pf101k.txt are
-built from the manifest's construction parameters. An item whose content differs from the manifest's hash is an error
-that names it (the dataset changed upstream). Downloads are untrusted data: nothing in them is executed here (run with
-python -I, so no module is imported from the current directory)."""
+The items are selected by the manifest's ids and row numbers (no re-sampling); the NIAH prompts, pf101k.txt and
+oj100k.txt are built from the manifest's construction parameters. An item whose content differs from the manifest's
+hash is an error that names it (the dataset changed upstream). Downloads are untrusted data: nothing in them is executed
+here (run with python -I, so no module is imported from the current directory)."""
 import argparse
 import hashlib
 import json
@@ -179,7 +179,8 @@ def main():
     ap.add_argument("--check", action="store_true")
     a = ap.parse_args()
     m = C.load_manifest()
-    names = list(m["sets"]) + ["pf101k"]
+    built = [k for k, v in m["prompts"].items() if v["where"] == "data"]
+    names = list(m["sets"]) + built
     want = a.sets or names
     bad = [s for s in want if s not in names]
     if bad:
@@ -191,8 +192,8 @@ def main():
     if a.check:
         for s in want:
             try:
-                if s == "pf101k":
-                    C.load_prompt(data, "pf101k", m)
+                if s in built:
+                    C.load_prompt(data, s, m)
                 else:
                     C.load_set(data, s, m)
                 print(f"{s}: ok", flush=True)
@@ -262,33 +263,46 @@ def main():
                 items.append(it if it is not None and C.text_sha(it["prompt"]) == e["prompt_sha256"] else None)
             finish(s, items, "the built prompt differs from the manifest's (the haystack text changed upstream)")
 
-    # pf101k.txt: pf38k.txt followed by llama.cpp sources at a pinned tag, cut to the manifest's length
-    if "pf101k" in want:
-        spec, src = m["prompts"]["pf101k"], m["sources"]["llama.cpp"]
-        buf = b""
+    # built prompts: files of this repository and of pinned upstream sources, concatenated and cut. pf101k.txt (pf38k.txt +
+    # llama.cpp sources) is cut by bytes; oj100k.txt (open-jet's src/**/*.py, read as its parallel_bench.py reads them:
+    # UTF-8 with replacement, universal newlines) by characters
+    for name in [s for s in built if s in want]:
+        spec = m["prompts"][name]
+        chars = "chars" in spec
+        buf = "" if chars else b""
         for part in spec["parts"]:
             kind, rel = part.split(":", 1)
             if kind == "repo":
-                with open(os.path.join(C.HERE, *rel.split("/")), "rb") as f:
-                    buf += f.read().replace(b"\r\n", b"\n")
+                p = os.path.join(C.HERE, *rel.split("/"))
             else:
+                src = m["sources"][kind]
                 fs = src["files"][rel]
                 p, ok, sha = fetch_file(data, src, rel=f"{src['dir']}/{rel}", url=src["base"] + rel,
                                         want=(fs["bytes"], fs["sha256"]))
                 if not ok:
-                    errors.append(f"pf101k: {rel} at {src['base']} has sha256 {sha}, not the manifest's")
-                with open(p, "rb") as f:
+                    errors.append(f"{name}: {rel} at {src['base']} has sha256 {sha}, not the manifest's")
+            if chars:
+                with open(p, encoding="utf-8", errors="replace") as f:
                     buf += f.read()
-        buf = buf[:spec["bytes"]]
+            else:
+                with open(p, "rb") as f:
+                    b = f.read()
+                buf += b.replace(b"\r\n", b"\n") if kind == "repo" else b
+        buf = buf[:spec["chars"]] if chars else buf[:spec["bytes"]]
         out = os.path.join(data, *spec["file"].split("/"))
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        with open(out, "wb") as f:
-            f.write(buf)
+        if chars:
+            with open(out, "w", encoding="utf-8", newline="") as f:
+                f.write(buf)
+        else:
+            with open(out, "wb") as f:
+                f.write(buf)
         try:
-            C.load_prompt(data, "pf101k", m)
-            print(f"pf101k: {len(buf)} bytes, equal to the manifest -> {spec['file']}", flush=True)
+            C.load_prompt(data, name, m)
+            print(f"{name}: {len(buf)} {'characters' if chars else 'bytes'}, equal to the manifest -> {spec['file']}",
+                  flush=True)
         except SystemExit as e:
-            errors.append(f"pf101k: {e}")
+            errors.append(f"{name}: {e}")
 
     for e in errors:
         print("ERROR", e)

@@ -17,7 +17,7 @@ How to read them:
 
 Contents: [the current release](#the-current-release) - [full run 2026-10-20](#full-run-2026-10-20) -
 [exactness](#exactness) - [KV cache presets](#kv-cache-presets) - [the conversation cache](#the-conversation-cache) -
-[keep-warm](#keep-warm) - [Q4_K_M and upstream's scripts](#q4_k_m-and-upstreams-scripts) - [images and
+[keep-warm](#keep-warm) - [Q4_K_M and upstream's scripts](#q4_k_m-and-upstreams-scripts) - [parallel agents](#parallel-agents) - [images and
 video](#images-and-video) - [earlier full runs](#earlier-full-runs) - [reproducing](#reproducing).
 
 ## The current release
@@ -500,6 +500,30 @@ comparison, against open-jet 2993f47 (2026-10-13) with this engine at b3be928 an
 1,527 / 1,811 tok/s prefill. Upstream's numbers in the two sessions are within 1% of each other except in reasoning
 mode, where its sampled drafts (open-jet #21) raised its acceptance.
 
+## Parallel agents
+
+`--agents N` serves up to four requests at once, each in a parallel slot of the engine with its own context; every slot
+that is decoding runs in the same batched launch ([SERVER.md](SERVER.md#several-agents-at-once---agents)). Measured
+with [bench/suite/parallel_client.py](../bench/suite/README.md) (the prompts, sampling, context text and measurements
+of open-jet's `bench/parallel_bench.py`) on unsloth's plain `Qwen3.8-27B-Q4_K_M.gguf`, one session on 2026-10-28
+(WSL2), this server at d823dca (`--agents 4 -d 7`: q8_0 KV cache, exact mode).
+
+| test | result |
+|---|---|
+| 4 agents, short coding prompts: total decode (better of 2 runs) | 353.3 tok/s |
+| 4 agents, each with its own ~23k-token context: total decode | 295.7 tok/s |
+| the same: the slowest first token | 0.54 s |
+| a ~20k-token prompt sent while another request decodes: its first token | 13.8 s |
+| the other request meanwhile | 10.8 tok/s |
+| 1 agent, short prompts | 190.3 tok/s |
+| 1 agent, ~23k-token context | 178.1 tok/s |
+| VRAM at ready, whole card | 22.7 GB |
+
+A total adds the requests' decode rates (512 tokens each, temperature 0.6). The "other request" row counts that
+request's streamed chunks while the long prompt is read; it moved between sessions that day (10.8-12.9 tok/s). Each
+slot's greedy reply is the one the request gets alone, also when its prompt arrives while others decode; seeded sampling
+keeps its distribution beside other slots, not its tokens ([SERVER.md](SERVER.md#several-agents-at-once---agents)).
+
 ## Images and video
 
 On the Ryzen 9 5900XT (32 threads):
@@ -584,6 +608,9 @@ proposed, so a sampled reply with a fixed seed can differ from the one before it
   the items these runs used (`bench/suite/items.json`). HumanEval answers are executed only with `score.py
   --exec-humaneval`. Re-scoring the saved 2026-10-20 answers with the suite's scorer gives the same 230 right answers
   for q8_0 and preset D, item for item, and its summary script gives the same table.
+- **Parallel agents:** the parallel step of [bench/suite](../bench/suite/README.md) (`parallel_client.py`, its context
+  fetched by `fetch.py`); without a server, `python3 bench/slots_bench.py <gguf> all` checks the engine's slots against
+  each conversation alone and times them.
 - **Speed, CLI:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_32k.bin --model <gguf>` (the four
   chat prompts through the CLI; it runs the CLI's default KV cache, so at most 4 drafts); `bench/code_bench.py` and
   `bench/think_bench.py` are upstream's scripts; `bench/*.cu` are kernel microbenchmarks.

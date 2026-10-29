@@ -18,7 +18,8 @@ POST /v1/messages (+ /v1/messages/count_tokens): the Anthropic Messages API over
 POST /v1/responses (+ /v1/responses/input_tokens): the OpenAI Responses API over the same chat path, stateless (the client
 sends the whole conversation each time, as Codex CLI does).
 GET /health (503 "Loading model" until the model is loaded), /v1/models, /props, /slots, /metrics; POST /tokenize,
-/detokenize, /apply-template, /v1/chat/completions/input_tokens (llama-server's shapes).  One request at a time.
+/detokenize, /apply-template, /v1/chat/completions/input_tokens (llama-server's shapes).  One request at a time; with
+--agents N up to N at once, each in a parallel slot of the engine (its reply as when it runs alone; docs/SERVER.md).
 After each request the engine keeps the GPU's clocks up for MK_KEEP_WARM_S seconds (default 120, 0 = off), so a
 reply after a pause starts at full speed.
 Limits (environment): MK_MAX_BODY_MB (request body, Content-Length or chunked, default 128), MK_MAX_IMAGES (images per
@@ -42,6 +43,7 @@ import ipaddress
 import itertools
 import json
 import os
+import queue
 import random
 import re
 import select
@@ -290,6 +292,17 @@ class Engine:
         if self.ck_pins:
             L.mk_ck_pin.restype, L.mk_ck_pin.argtypes = ctypes.c_int, [vp, ip, ctypes.c_int]
             L.mk_ck_pinned.restype, L.mk_ck_pinned.argtypes = ctypes.c_int, [vp, ip, ctypes.c_int]
+        # parallel slots (--agents: SlotScheduler; open-jet's slot API, MKEngine::slots_open; libraries before them: none)
+        self.slots = all(hasattr(L, n) for n in ("mk_slots_open2", "mk_slot_begin2", "mk_slot_prefill", "mk_slots_step",
+                                                 "mk_slots_step_mixed"))
+        if self.slots:
+            ci, cf = ctypes.c_int, ctypes.c_float
+            for name, args in (("mk_slots_open2", [vp, ci, ci, ci]),
+                               ("mk_slot_begin2", [vp, ci, ip, ci, cf, cf, ci, cf, ctypes.c_ulonglong, ci, ci]),
+                               ("mk_slot_prefill", [vp, ci, ci]), ("mk_slots_step", [vp, ip, ci, ip, ci, ip]),
+                               ("mk_slots_step_mixed", [vp, ci, ci, ip, ci, ip, ci, ip, ip])):
+                f = getattr(L, name)
+                f.restype, f.argtypes = ci, args
         self.n_vocab = 0  # (libraries before mk_n_vocab: unknown)
         if hasattr(L, "mk_n_vocab"):
             L.mk_n_vocab.restype, L.mk_n_vocab.argtypes = ctypes.c_int, [vp]
@@ -579,6 +592,57 @@ class Engine:
 
     def park_need(self, max_cks):
         return self.L.mk_park_need(self.h, max_cks)
+
+    # ---- parallel slots (--agents: SlotScheduler drives them from its thread) ----
+    SLOT_PER = 16  # tokens a slot can emit in one cycle that the output arrays hold (1 + its drafts, at most MAXT)
+
+    def slots_open(self, n, ctx):
+        """opens n slots of ctx positions each (0: the most that fit, leaving MK_SLOT_RESERVE_MIB of the device memory
+        free); returns a slot's positions"""
+        r = self.L.mk_slots_open2(self.h, n, ctx, 0)
+        if r < 0:
+            raise self._err("parallel slots")
+        return r
+
+    def slot_begin(self, slot, toks, temp, top_p, top_k, min_p, seed):
+        """slot <- the prompt and its sampling, reusing what the slot's sequence has (truncated at the divergence, else
+        back to its newest checkpoint before it, else from scratch); returns the reused tokens: slot_prefill feeds the
+        rest"""
+        arr = (ctypes.c_int * len(toks))(*toks)
+        r = self.L.mk_slot_begin2(self.h, slot, arr, len(toks), temp, top_p, top_k, min_p, seed, 0, 0)
+        if r < 0:
+            raise self._err("slot prompt")
+        return r
+
+    def slot_prefill(self, slot, budget):
+        """feeds up to `budget` of the slot's prompt tokens; returns how many are left (0: the slot decodes from the next
+        cycle on, which emits its first token). Budget 0: the rest is abandoned (the slot keeps what was fed)"""
+        r = self.L.mk_slot_prefill(self.h, slot, budget)
+        if r < 0:
+            raise self._err("slot prefill")
+        return r
+
+    def _slot_tokens(self, n, out, cnt):
+        return [list(out[i * self.SLOT_PER:i * self.SLOT_PER + cnt[i]]) for i in range(n)]
+
+    def slots_step(self, slots):
+        """one engine cycle of the slots (one batched launch; a lone slot: the solo megakernel): the tokens each one
+        emitted ([]: its context is full)"""
+        n = len(slots)
+        sa, out, cnt = (ctypes.c_int * n)(*slots), (ctypes.c_int * (n * self.SLOT_PER))(), (ctypes.c_int * n)()
+        if self.L.mk_slots_step(self.h, sa, n, out, self.SLOT_PER, cnt) < 0:
+            raise self._err("decode")
+        return self._slot_tokens(n, out, cnt)
+
+    def slots_step_mixed(self, pslot, budget, slots):
+        """slots_step with the next `budget` tokens of slot pslot's prompt in the same pass: (the slots' tokens, the
+        prompt tokens left)"""
+        n = len(slots)
+        sa, out, cnt = (ctypes.c_int * n)(*slots), (ctypes.c_int * (n * self.SLOT_PER))(), (ctypes.c_int * n)()
+        rem = ctypes.c_int()
+        if self.L.mk_slots_step_mixed(self.h, pslot, budget, sa, n, out, self.SLOT_PER, cnt, ctypes.byref(rem)) < 0:
+            raise self._err("decode")
+        return self._slot_tokens(n, out, cnt), rem.value
 
 
 class Vision:
@@ -2306,6 +2370,295 @@ def mib(n):
     return f"{n / 2**20:,.0f} MiB"
 
 
+SLOT_OWN_CTX = 1024  # --agents: the positions of the engine's own sequence (the warm-up's; the slots have their own)
+
+
+def common_prefix(a, b):
+    """the length of the common prefix of two token lists"""
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+class SlotJob:
+    """a request in the slot scheduler (--agents): its prompt, sampling and token limit go in; each engine cycle's tokens
+    come out through q (a list per cycle; []: the reply cannot go on, its slot's context is full; an exception: the
+    engine failed). state: queued (waiting for a free slot), prefill, decode, done"""
+
+    POLL_S = 0.05  # how often a request waiting for its tokens asks whether its client is still there
+
+    def __init__(self, sched, toks, sp, max_new, rid=0):
+        self.sched, self.toks, self.sp, self.max_new, self.rid = sched, toks, sp, max_new, rid
+        self.q = queue.Queue()
+        self.state, self.slot, self.reused, self.left, self.n = "queued", None, 0, len(toks), 0
+        self.closed = False
+        self.t_submit, self.t_begin = time.time(), None
+        self.gone, self.rest = (lambda: False), []
+
+    def close(self):
+        """the request is done with the job (its reply ended, it failed, or its client left): the scheduler drops it
+        from the queue, abandons its prefill, or takes its slot out of the next cycle"""
+        if not self.closed:
+            self.closed = True
+            self.sched.wake()
+
+    def _get(self, tick=None):
+        """the next item of q; None once gone() is True (the job is closed)"""
+        while True:
+            try:
+                item = self.q.get(timeout=self.POLL_S)
+            except queue.Empty:
+                if self.gone():
+                    self.close()
+                    return None
+                if tick is not None:
+                    tick()
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+    def prompt(self, gone, progress=None):
+        """waits until the prompt is processed: (the reply's first token, the prompt tokens the slot reused). gone() (the
+        client left) is asked every POLL_S meanwhile: PrefillCancelled once it is True. progress(cached, processed,
+        total): a request's return_progress (Server.prompt_progress's events), called when the prefill starts, as it
+        goes (every 0.5 s at most) and when it is done"""
+        self.gone = gone
+        total, seen = len(self.toks), [None, 0.0]
+
+        def tick():
+            if progress is None or self.state != "prefill":
+                return
+            done, now = total - self.left, time.monotonic()
+            if seen[0] is None or (done > seen[0] and now - seen[1] >= 0.5):
+                seen[:] = [done, now]
+                progress(self.reused, done, total)
+        first = self._get(tick)
+        if first is None:
+            raise PrefillCancelled("while it waited for a free slot" if self.state == "queued" else
+                                   f"at {total - self.left:,} of {total:,} tok")
+        if not first:  # (Server._generate leaves the reply room in the context before it submits)
+            raise RuntimeError("the slot had no room for the reply")
+        if progress is not None:
+            if seen[0] is None:
+                progress(self.reused, self.reused, total)
+            progress(self.reused, total, total)
+        self.rest = first[1:]
+        return first[0], self.reused
+
+    def step(self):
+        """the tokens of the job's next engine cycle; None: the client left meanwhile (the job is closed); []: the slot's
+        context is full"""
+        if self.rest:
+            out, self.rest = self.rest, []
+            return out
+        return self._get()
+
+
+class SlotScheduler:
+    """--agents N: one thread owns the engine's parallel slots (MKEngine::slots_open: up to N conversations, each with
+    its own KV cache and recurrent state) and decodes every admitted request together, one engine cycle for all of them
+    (mk_slots_step: one batched launch; a lone slot runs the solo megakernel); each request thread (Server._generate) gets
+    the tokens of its cycles through its SlotJob. Requests wait for a free slot in arrival order and take the one whose
+    sequence shares the most with the prompt, less what that discards of the slot's last prompt (a conversation's next
+    turn goes back to its own slot and prefills only its new tokens; an empty slot goes before another conversation's).
+    While slots decode, a waiting prompt is fed in chunks, one per cycle in the same pass as their step
+    (mk_slots_step_mixed, MK_PF_MIX rows, default 256; MK_PF_MIX=0: MK_PF_CHUNK tokens between the cycles, default 512,
+    0: the whole prompt), so they keep decoding while a long prompt is read; while none decodes, MK_PF_SOLO tokens per call
+    (default 0: the whole prompt). With MK_EXACT the chunks change no row (the engine feeds every chunk but a prompt's
+    last as batched rows), so a prompt that arrives while others decode gets the reply it gets alone. A closed job is dropped from the queue, its prefill abandoned at the next chunk, or its slot left out of the
+    next cycle. Open-jet's SlotScheduler (--parallel / --agents), with jobs that can be closed at any point.
+
+    With MK_EXACT (exact reuse; --agents sets it), a prompt never reuses the rows a slot decoded: those depend on how many
+    drafts each cycle verified, which depends on the slots decoding beside it. A prompt that reaches into the slot's last
+    reply first takes the slot back to a checkpoint inside its last prompt (slot_begin with that prompt's tokens), as
+    Server.load_prompt restores a checkpoint with --exact-reuse.
+
+    The engine's keep-warm load (MK_KEEP_WARM_S) is armed when the scheduler goes idle and stopped before its next GPU
+    work: the slot calls do not stop it themselves."""
+
+    def __init__(self, eng, n, ctx):
+        self.eng, self.n, self.ctx = eng, n, ctx
+        self.exact = bool(getattr(eng, "exact", False))
+        self.mix = env_int("MK_PF_MIX", 256, 0)
+        self.chunk = env_int("MK_PF_CHUNK", 512, 0)
+        self.solo = env_int("MK_PF_SOLO", 0, 0)
+        self.cv = threading.Condition()
+        self.pending = collections.deque()  # jobs waiting for a slot (under cv)
+        self.free = list(range(n))
+        self.filling, self.active = {}, {}  # slot -> job: its prompt is fed (the oldest first) / it decodes
+        self.seq = [[] for _ in range(n)]  # each slot's tokens as the engine holds them (prompt, reply): the slot choice
+        self.held = [0] * n  # the length of each slot's last prompt (what another conversation's prompt would discard)
+        self.last = [None] * n  # each slot's latest job (GET /slots)
+        self.warm = False  # the keep-warm load is armed
+        self.cycles = 0
+        threading.Thread(target=self.run, name="mk-slots", daemon=True).start()
+
+    def submit(self, toks, sp, max_new, rid=0):
+        """a request: toks, sp = (temp, top_p, top_k, min_p, seed), at most max_new tokens; returns its SlotJob"""
+        job = SlotJob(self, toks, sp, max_new, rid)
+        with self.cv:
+            self.pending.append(job)
+            self.cv.notify()
+        return job
+
+    def wake(self):
+        with self.cv:
+            self.cv.notify()
+
+    def counts(self):
+        """(requests waiting for a slot, requests in a slot)"""
+        return len(self.pending), len(self.filling) + len(self.active)
+
+    def full(self):
+        """a request sent now would wait for a slot"""
+        return len(self.pending) >= len(self.free)
+
+    def snapshot(self):
+        """each slot's state for GET /slots (read from the HTTP threads while the scheduler runs)"""
+        out = []
+        for s in range(self.n):
+            j = self.last[s]
+            st = j.state if j is not None and j.state in ("prefill", "decode") else "idle"
+            out.append({"state": st, "id_task": j.rid if j else -1, "n_prompt_tokens": len(j.toks) if j else 0,
+                        "n_cached": j.reused if j else 0, "prefill_left": j.left if st == "prefill" else 0,
+                        "n_decoded": j.n if j else 0, "n_past": len(self.seq[s])})
+        return out
+
+    def _end(self, job):
+        job.state = "done"
+        job.q.put([])  # (a request still waiting for tokens: the reply ends here)
+
+    def _finish(self, slot):
+        job = self.active.pop(slot)
+        self.free.append(slot)
+        self._end(job)
+
+    def _fail(self, slot, job, e):
+        """the engine failed on the job's slot: the request gets the error; the slot's state is unknown (its next prompt
+        is matched against nothing)"""
+        job.state = "done"
+        job.q.put(e)
+        self.seq[slot], self.held[slot] = [], 0
+        self.free.append(slot)
+
+    def _prefilled(self, slot, job):
+        """the job's prompt is in: it decodes from the next cycle on"""
+        del self.filling[slot]
+        job.max_new = min(job.max_new, self.ctx - len(job.toks) - ContextOverflow.RESERVE)
+        if job.max_new <= 0:
+            self.free.append(slot)
+            self._end(job)
+        else:
+            job.state = "decode"
+            self.active[slot] = job
+
+    def run(self):
+        while True:
+            try:
+                self.cycle()
+            except Exception as e:  # (a fault of the scheduler's own: its requests get it, the next ones are served)
+                log(f"slot scheduler: {e!r}")
+                traceback.print_exc()
+                for s in list(self.filling):
+                    self._fail(s, self.filling.pop(s), e)
+                for s in list(self.active):
+                    self._fail(s, self.active.pop(s), e)
+
+    def cycle(self):
+        """admits waiting requests to free slots, feeds one prompt chunk, runs one engine cycle of the decoding slots"""
+        eng = self.eng
+        with self.cv:
+            while True:
+                for job in [j for j in self.pending if j.closed]:  # (its client left while it waited)
+                    self.pending.remove(job)
+                    self._end(job)
+                if self.pending or self.filling or self.active:
+                    break
+                if not self.warm:  # idle: the GPU's clocks stay up for MK_KEEP_WARM_S, as after a request one at a time
+                    self.warm = True
+                    eng.keep_warm(True)
+                self.cv.wait()
+            admit = []
+            while self.pending and self.free:
+                job = self.pending.popleft()
+                # the slot holding this conversation; else the one whose loss costs least (an empty one before evicting
+                # another conversation for the few template tokens it shares): reused - discarded tokens of the slot's
+                # last prompt (open-jet counts its reply too, which the conversation's own next turn re-renders: then a
+                # long reply could send that turn to another conversation's slot)
+                slot = max(self.free, key=lambda s: 2 * common_prefix(self.seq[s], job.toks) - self.held[s])
+                self.free.remove(slot)
+                admit.append((slot, job))
+        if self.warm:
+            self.warm = False
+            eng.keep_warm(False)
+        for slot, job in admit:
+            try:
+                p = self.held[slot]
+                if self.exact and p and common_prefix(self.seq[slot], job.toks) >= p:  # (exact reuse: see the class)
+                    eng.slot_begin(slot, job.toks[:p], *job.sp)
+                job.reused = eng.slot_begin(slot, job.toks, *job.sp)
+            except Exception as e:  # (reported to the request; the others go on)
+                self._fail(slot, job, e)
+                continue
+            job.slot, job.left, job.t_begin, job.state = slot, len(job.toks) - job.reused, time.time(), "prefill"
+            self.seq[slot], self.held[slot], self.last[slot] = list(job.toks), len(job.toks), job
+            self.filling[slot] = job
+        for slot in [s for s, j in self.active.items() if j.closed]:
+            self._finish(slot)
+        stepped = None  # (slots, their tokens) of this cycle
+        if self.filling:  # one chunk of the oldest admitted prompt
+            slot = next(iter(self.filling))
+            job = self.filling[slot]
+            try:
+                if job.closed:  # (the slot keeps what was fed)
+                    eng.slot_prefill(slot, 0)
+                    del self.filling[slot]
+                    self.seq[slot] = job.toks[:len(job.toks) - job.left]
+                    self.held[slot] = len(self.seq[slot])
+                    self.free.append(slot)
+                    self._end(job)
+                else:
+                    if self.active and self.mix > 0:
+                        slots = sorted(self.active)
+                        out, job.left = eng.slots_step_mixed(slot, self.mix, slots)
+                        stepped = (slots, out)
+                    else:
+                        job.left = eng.slot_prefill(slot, (self.chunk if self.active else self.solo) or 1 << 30)
+                    if job.left == 0:
+                        self._prefilled(slot, job)
+            except Exception as e:
+                self.filling.pop(slot, None)
+                self._fail(slot, job, e)
+                if stepped is None and self.active and self.mix > 0:  # (the cycle failed with it)
+                    for s in sorted(self.active):
+                        self._fail(s, self.active.pop(s), e)
+        if stepped is None:
+            if not self.active:
+                return
+            slots = sorted(self.active)
+            try:
+                stepped = (slots, eng.slots_step(slots))
+            except Exception as e:
+                for s in slots:
+                    self._fail(s, self.active.pop(s), e)
+                return
+        self.cycles += 1
+        for s, toks in zip(*stepped):
+            job = self.active[s]
+            if not toks:  # (its context is full: the reply ends at its length)
+                self._finish(s)
+                continue
+            self.seq[s] += toks
+            job.n += len(toks)
+            job.q.put(toks)
+            if job.n >= job.max_new or any(eng.is_eog(t) for t in toks):
+                self._finish(s)
+
+
 class Server:
     vision = None   # Vision (--mmproj), else text only
     decoder = None  # VideoDecoder (an ffmpeg was found): video input with the vision encoder
@@ -2341,11 +2694,19 @@ class Server:
     # priority): /metrics and /props read it
     store_gauge = (0, 0, 0, (), 0, 0)
     cache_pre = ""  # what the host cache did for the running request (before cache_note on the prompt line)
+    tick = (0, 0.0, 0.0, 0)  # the running reply's (prompt tokens, prompt ms, its start, generated tokens): timings_now
+    # --agents (SlotServer): the slot scheduler (None: one request at a time on the engine's own sequence); the running
+    # request's return_progress callback (its handler sets it), slot job, slot sampling and wait for a free slot (seconds)
+    sched = None
+    on_progress = None
+    job = None
+    slot_sp = None
+    queued_s = 0.0
 
     def __init__(self, args):
         self.args = args
         t0 = time.time()
-        self.eng = Engine(args.lib, args.model, args.ctx, args.draft, args.draft_vocab,
+        self.eng = Engine(args.lib, args.model, self.engine_ctx(args), args.draft, args.draft_vocab,
                           {"f16": 0, "q8": 1, "auto": -1}[args.kv], "none" if args.no_mtp else args.mtp)
         if not self.eng.has_mtp:
             log("no MTP layer: plain decoding (depth 0)")
@@ -2383,6 +2744,7 @@ class Server:
         self.model_id = os.path.basename(args.model)
         self.lock = FifoLock()
         self.warned = set()
+        self.setup_slots(args)
         vis = (f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.backend}, {self.vision.n_threads} threads)"
                if self.vision else "")
         self.t_start = time.time()
@@ -2421,6 +2783,13 @@ class Server:
         self.eng.reset()
         if self.vision:
             self.vision.warm_up()
+
+    def engine_ctx(self, args):
+        """the positions of the engine's own sequence (SlotServer: the slots have their own)"""
+        return args.ctx
+
+    def setup_slots(self, args):
+        """(SlotServer: opens the engine's parallel slots and starts their scheduler)"""
 
     def setup_store(self, args):
         """host memory for side requests and parked conversations (--side-max, --park-mib; an engine without the host
@@ -2798,6 +3167,10 @@ class Server:
     def busy(self):
         return self.lock.locked()
 
+    def processing(self):
+        """requests the engine works on (/metrics)"""
+        return int(self.busy())
+
     def n_vocab(self):
         return getattr(self.eng, "n_vocab", 0)
 
@@ -2898,7 +3271,7 @@ class Server:
              m["prompt_tokens"] / m["prompt_seconds"] if m["prompt_seconds"] else 0.0),
             ("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s.",
              m["tokens_predicted"] / m["predicted_seconds"] if m["predicted_seconds"] else 0.0),
-            ("llamacpp:requests_processing", "gauge", "Number of requests processing.", int(self.busy())),
+            ("llamacpp:requests_processing", "gauge", "Number of requests processing.", self.processing()),
             ("llamacpp:requests_deferred", "gauge", "Number of requests deferred.", m["deferred"]),
             ("megakernel:prompt_tokens_reused_total", "counter", "Prompt tokens reused from the engine's sequence.",
              m["prompt_tokens_reused"]),
@@ -3242,7 +3615,15 @@ class Server:
         return r
 
     def sampling(self, body):
-        """sets the request's sampling on the engine; returns it as text for the console.
+        """sets the request's sampling on the engine (sampling_params); returns it as text for the console"""
+        temp, top_p, top_k, min_p, seed, pen, desc = self.sampling_params(body)
+        self.eng.set_penalty(*pen)
+        self.eng.set_sampling(temp, top_p, top_k, min_p, seed)
+        return desc
+
+    def sampling_params(self, body):
+        """the request's sampling: (temp, top_p, top_k, min_p, seed, (presence, frequency penalty), text for the
+        console), greedy (temperature <= 0) as the engine takes it.
         top_k: absent -> DEF_TOP_K; <= 0 ("off" for llama.cpp / OpenAI-style clients) -> TOPK_MAX, the engine's
         maximum; above TOPK_MAX -> TOPK_MAX with a one-time warning"""
         try:
@@ -3269,20 +3650,38 @@ class Server:
             if not -2.0 <= v <= 2.0:
                 raise BadRequest(f"{k} must be in [-2, 2]")
             pen.append(v)
-        self.eng.set_penalty(*pen)
         if float(body.get("repetition_penalty") or body.get("repeat_penalty") or 1.0) != 1.0:
             self.warn_once("rep", "repetition_penalty is not supported by the megakernel and is ignored")
         if temp <= 0:
-            self.eng.set_sampling(0.0, 1.0, TOPK_MAX, 0.0, seed)
+            temp, top_p, top_k, min_p = 0.0, 1.0, TOPK_MAX, 0.0
             desc = "greedy"
         else:
-            self.eng.set_sampling(temp, top_p, top_k, min_p, seed)
             desc = f"temp {temp:g} top_p {top_p:g} top_k {top_k} min_p {min_p:g}"
             if body.get("seed") is not None and int(body["seed"]) >= 0:
                 desc += f" seed {seed}"
         if any(pen):
             desc += f" presence {pen[0]:g} frequency {pen[1]:g}"
-        return desc
+        return temp, top_p, top_k, min_p, seed, tuple(pen), desc
+
+    def start_reply(self, toks, max_new, images, gone, first_turn, asked, tools):
+        """processes the prompt (load_prompt): (the reply's first token, the prompt tokens reused, the engine cycle: a
+        function returning the next tokens). SlotServer: in a slot, by the slot scheduler's thread"""
+        tok, reused = self.load_prompt(toks, images, gone, first_turn, asked, tools)
+        return tok, reused, self.eng.step
+
+    def eng_stats(self):
+        """the engine's (decode cycles, drafted, accepted) counters, or None. They move in its decode cycles only and
+        restart at a reset (a full re-prefill in load_prompt): read after the prompt, the difference is the reply's"""
+        return self.eng.stats() if getattr(self.eng, "stats", None) is not None else None
+
+    def status(self, text):
+        """the console's status line for the running request (SlotServer: none, its requests run at once)"""
+        CON.status(text)
+
+    def request_done(self):
+        """after each generation request (the handler): the status line goes, the keep-warm window restarts"""
+        CON.status("")
+        self.eng.keep_warm()  # (MK_KEEP_WARM_S: the window restarts after every request)
 
     def generate(self, body, emit, gone=lambda: False):
         """runs one chat completion; emit(kind, payload) is called with ('reasoning'|'content', text) deltas, and in a
@@ -3292,7 +3691,7 @@ class Server:
         chunk) and before each engine cycle) stops it with ClientGone."""
         check_params(body)
         self.answer_tokens = 0
-        CON.status(f"#{self.rid} preparing the prompt (template, tokens, media)")
+        self.status(f"#{self.rid} preparing the prompt (template, tokens, media)")
         text, thinking, media = self.render(body)
         toks, images = self.tokenize_prompt(text, media)
         replied = False
@@ -3305,6 +3704,9 @@ class Server:
                 self.vision.release([im for _, im in images])
             self.side_finish()  # (a side request: the cached sequence comes back, also after an error or a disconnect)
             self.debris_finish(replied)
+            if self.job is not None:  # (--agents: its slot leaves the next cycle, if the reply did not end there)
+                self.job.close()
+                self.job = None
 
     def _generate(self, body, emit, gone, thinking, toks, images, media=()):
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
@@ -3339,20 +3741,19 @@ class Server:
         if gone():  # (it left while the request waited for the engine)
             log(f"#{rid} the client disconnected before its prompt was processed")
             raise ClientGone()
-        CON.status(f"#{rid} prefill")
+        self.status(f"#{rid} prefill")
         t0 = time.time()
         enc0 = [im.encode_s for _, im in images]
         first_turn = not any(isinstance(m, dict) and m.get("role") == "assistant" for m in body.get("messages") or [])
         try:
-            tok, reused = self.load_prompt(toks, images, gone, first_turn, asked, bool(tools))
+            tok, reused, step = self.start_reply(toks, max_new, images, gone, first_turn, asked, bool(tools))
         except PrefillCancelled as e:  # (the engine kept nothing of it)
             log(f"#{rid} the client disconnected during the prefill of {len(toks):,} tok: stopped after "
                 f"{secs(time.time() - t0)} ({e})")
             raise ClientGone()
         t1 = time.time()
-        # the engine's (cycles, drafted, accepted) counters move in its decode cycles only and restart at a reset (a full
-        # re-prefill in load_prompt): read from here, the difference is this reply's
-        st0 = self.eng.stats() if getattr(self.eng, "stats", None) is not None else None
+        t0 += self.queued_s  # (--agents: the wait for a free slot is not prompt time)
+        st0 = self.eng_stats()
 
         def spent():
             st1 = self.eng.stats() if st0 is not None else None
@@ -3369,7 +3770,7 @@ class Server:
             grids = sorted({f"{im.nx}x{im.ny}" for _, im in images})
             line += (f" | images: {len(images)} ({', '.join(grids[:3])}{', ...' if len(grids) > 3 else ''} tok grids), "
                      f"{len(enc)} encoded on the CPU in {secs(enc_s)}")
-        CON.status(f"#{rid} decoding")
+        self.status(f"#{rid} decoding")
         log(line)
         # a stream gets the tool calls as they are generated (ToolCallParser's events). reasoning_format (OpenAI route; an
         # Anthropic reply has its thinking blocks): none -> the thinking stays in the content, deepseek-legacy -> both
@@ -3390,12 +3791,15 @@ class Server:
                 if gone():  # once per engine cycle: a closed connection stops the GPU work here
                     aborted = True
                     break
-                pending = self.eng.step()
+                pending = step()
+                if not pending:  # (--agents: the client left during the cycle (None), or the slot's context is full)
+                    aborted = pending is None
+                    break
                 steps += 1
                 stepped += len(pending)
                 if live and time.monotonic() - shown >= 0.25:
                     shown = time.monotonic()
-                    CON.status(self.decode_text(n_gen, phase, steps, stepped, time.time() - t1))
+                    self.status(self.decode_text(n_gen, phase, steps, stepped, time.time() - t1))
             t = pending.pop(0)
             n_gen += 1
             if self.eng.is_eog(t):
@@ -3463,6 +3867,151 @@ class Server:
         timings = {"prompt_n": len(toks) - reused, "prompt_ms": (t1 - t0) * 1e3, "predicted_n": n_gen,
                    "predicted_ms": (t2 - t1) * 1e3, "predicted_per_second": n_gen / max(t2 - t1, 1e-9)}
         return finish, calls, usage, timings
+
+
+class PerRequest:
+    """a Server attribute that belongs to the running request: in a SlotServer each request thread has its own (Server's
+    class value until the thread sets one)"""
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, srv, owner=None):
+        if srv is None:
+            return self
+        return getattr(srv.local, self.name, getattr(Server, self.name))
+
+    def __set__(self, srv, value):
+        setattr(srv.local, self.name, value)
+
+
+class NoLock(contextlib.nullcontext):
+    """SlotServer.lock: requests do not take turns on the engine (the slot scheduler's thread runs it)"""
+
+    @staticmethod
+    def locked():
+        return False
+
+
+class SlotServer(Server):
+    """--agents N: up to N requests are served at once, each in a parallel slot of the engine (SlotScheduler), with the
+    reply it gets when it runs alone. Everything above the engine is Server's: the request threads render, tokenize,
+    parse, stream and report as a request running alone does, with their per-request state of their own (PerRequest).
+    What the slots cannot serve is refused with a 400 (images and video: slot prompts are token ids; the presence /
+    frequency penalties: slots sample with temperature, top_p, top_k, min_p and seed); the features of the engine's
+    one sequence (side requests, parked conversations, pinned checkpoints) are off."""
+
+    stop_word = PerRequest()
+    last_prompt = PerRequest()
+    reasoning_tokens = PerRequest()
+    answer_tokens = PerRequest()
+    rid = PerRequest()
+    req = PerRequest()
+    tick = PerRequest()
+    cache_note = PerRequest()
+    cache_pre = PerRequest()
+    on_progress = PerRequest()
+    job = PerRequest()
+    slot_sp = PerRequest()
+    queued_s = PerRequest()
+
+    def __init__(self, args):
+        self.local = threading.local()
+        if args.mmproj:
+            log("--mmproj ignored: --agents serves text only (images and video need the server without --agents)")
+            args.mmproj = None
+        super().__init__(args)
+
+    def engine_ctx(self, args):
+        return SLOT_OWN_CTX
+
+    def setup_store(self, args):
+        """(no host cache: side requests and parked conversations move the engine's one sequence aside)"""
+
+    def setup_slots(self, args):
+        if not getattr(self.eng, "slots", False):
+            raise RuntimeError(f"--agents needs parallel slots: {os.path.basename(args.lib)} has no mk_slots_open2 "
+                               f"(rebuild it)")
+        args.ctx = self.eng.slots_open(args.agents, args.ctx)
+        self.lock = NoLock()
+        self.sched = SlotScheduler(self.eng, args.agents, args.ctx)
+        s = self.sched
+        kv = " ".join(f"{k}={os.environ[k]}" for k in ("MK_KV", "MK_KV_WIN") if os.environ.get(k))
+        if s.mix:
+            feed = f"{s.mix} rows of a waiting prompt ride along with each decode cycle"
+        elif s.chunk:
+            feed = f"a waiting prompt is fed {s.chunk} tokens at a time between the decode cycles"
+        else:
+            feed = "a waiting prompt is fed whole between two decode cycles (the other slots wait meanwhile)"
+        if s.solo:
+            feed += f", {s.solo} tokens at a time while no slot decodes"
+        log(f"--agents {args.agents}: {plural(args.agents, 'slot')} of {args.ctx:,} positions each (q8_0 KV{', ' + kv if kv else ''}"
+            f"{', MK_EXACT: prefill rows independent of the chunking' if self.eng.exact else ''}); {feed}; side requests, "
+            f"parked conversations, pinned checkpoints and images are off; presence / frequency penalties are refused")
+
+    def status(self, text):
+        pass
+
+    def request_done(self):
+        """(the keep-warm window is the slot scheduler's: armed when it goes idle)"""
+
+    def busy(self):
+        return self.sched.full()
+
+    def processing(self):
+        return self.sched.counts()[1]
+
+    def counters(self):
+        m = super().counters()
+        m["deferred"] = self.sched.counts()[0]  # (requests waiting for a free slot)
+        m["decode_cycles"] = self.sched.cycles  # (engine cycles of all slots together; drafts are not counted per slot)
+        return m
+
+    def eng_stats(self):
+        return None  # (the engine counts the cycles of every slot together)
+
+    def props(self):
+        p = super().props()
+        p["total_slots"] = self.sched.n
+        return p
+
+    def engine_info(self):
+        info = super().engine_info()
+        waiting, running = self.sched.counts()
+        s = self.sched
+        info["agents"] = {"slots": s.n, "slot_ctx": self.args.ctx, "running": running, "waiting": waiting,
+                          "prefill_mix_rows": s.mix, "prefill_chunk": s.chunk, "prefill_solo": s.solo, "cycles": s.cycles}
+        return info
+
+    def slots(self):
+        """GET /slots: llama-server's fields for each slot, and its state in the scheduler"""
+        spec = bool(getattr(self.eng, "has_mtp", True)) and bool(getattr(self.args, "draft", 0))
+        return [{"id": k, "n_ctx": self.args.ctx, "is_processing": d["state"] != "idle", "speculative": spec, **d}
+                for k, d in enumerate(self.sched.snapshot())]
+
+    def render(self, body):
+        for m in body.get("messages") or []:
+            c = m.get("content") if isinstance(m, dict) else None
+            if isinstance(c, list) and any(isinstance(p, dict) and p.get("type") in ("image_url", *VIDEO_PARTS) for p in c):
+                raise BadRequest("image and video input are not available with --agents: the parallel slots take text "
+                                 "prompts only (run the server without --agents for them)")
+        return super().render(body)
+
+    def sampling(self, body):
+        temp, top_p, top_k, min_p, seed, pen, desc = self.sampling_params(body)
+        for k, v in zip(("presence_penalty", "frequency_penalty"), pen):
+            if v:
+                raise BadRequest(f"{k} is not available with --agents: the parallel slots sample with temperature, "
+                                 f"top_p, top_k, min_p and seed only")
+        self.slot_sp = (temp, top_p, top_k, min_p, seed)
+        return desc
+
+    def start_reply(self, toks, max_new, images, gone, first_turn, asked, tools):
+        job = self.job = self.sched.submit(toks, self.slot_sp, max_new, self.rid)
+        tok, reused = job.prompt(gone, self.on_progress)
+        self.queued_s = job.t_begin - job.t_submit
+        self.cache_note = f"slot {job.slot}" + (f" (after {secs(self.queued_s)} in the queue)" if self.queued_s >= 0.01 else "")
+        return tok, reused, job.step
 
 
 POST_ROUTES = {"/v1/chat/completions": "chat", "/chat/completions": "chat", "/v1/messages": "messages",
@@ -3832,7 +4381,7 @@ def make_handler(srv):
                     self._bad(e, anth)
                 return
             rid = next(srv.rids)
-            if srv.busy():
+            if srv.sched is None and srv.busy():
                 log(f"#{rid} {route}: waiting for #{srv.rid} (the engine runs one request at a time)")
             srv.count(requests=1, deferred=1)  # (deferred: waiting for the engine)
             with srv.lock:
@@ -3863,8 +4412,7 @@ def make_handler(srv):
                     except Exception:
                         pass
                 finally:
-                    CON.status("")
-                    srv.eng.keep_warm()  # (MK_KEEP_WARM_S: the window restarts after every request)
+                    srv.request_done()
 
         def _error(self, code, message, anthropic=False, rid=None, kind=None, extra=None):
             """answers with an error (OpenAI / llama-server's shape with its code, Anthropic's, or with anthropic
@@ -4514,7 +5062,9 @@ def main():
                          "headers (repeatable or comma-separated; env MK_CORS_ORIGINS); requests from pages of other origins "
                          "get a 403 (default: none, only the server's own origin; clients that are not web pages send no "
                          "Origin and are not affected)")
-    ap.add_argument("-c", "--ctx", type=int, default=32768)
+    ap.add_argument("-c", "--ctx", type=int, default=None,
+                    help="context positions (default 32768; with --agents: per slot, 0 = the most that fit, the default "
+                         "there)")
     ap.add_argument("-d", "--draft", type=int, default=4)
     ap.add_argument("--draft-vocab", default=os.path.join(os.path.dirname(HERE), "draft_vocab_32k.bin"))
     ap.add_argument("--mtp", default=None,
@@ -4522,7 +5072,15 @@ def main():
     ap.add_argument("--no-mtp", action="store_true", help="no MTP layer: plain decoding, depth 0 (env MK_NO_MTP=1)")
     ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), LIB_MK))
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
-                    help="KV cache format (auto: q8_0 only when the fp16 cache does not fit)")
+                    help="KV cache format (auto: q8_0 only when the fp16 cache does not fit; with --agents: q8_0)")
+    ap.add_argument("--agents", type=int, default=env_int("MK_AGENTS", 0, 0), metavar="N",
+                    help="serve up to N requests at once (e.g. several coding agents), each in a parallel slot of the "
+                         "engine with its own context of --ctx positions, decoded together in one batched launch per "
+                         "cycle; each reply is the one the request gets alone. Text only; no presence / frequency "
+                         "penalties, side requests, parked conversations or pinned checkpoints (0: one request at a "
+                         "time; env MK_AGENTS)")
+    ap.add_argument("--parallel", "-np", type=int, default=0, metavar="N",
+                    help="--agents N with -c the context of each slot, default 32768 (llama-server's and open-jet's option)")
     ap.add_argument("--ck-every", type=int, default=4096,
                     help="DeltaNet checkpoint every N prompt tokens (0: off); see MK_CK_SLOTS for the pool size")
     ap.add_argument("--ck-msgs", type=int, default=1, help="DeltaNet checkpoint at each message start (1/0)")
@@ -4604,6 +5162,25 @@ def main():
                     help="ffmpeg executable (or its directory) for video input (env MK_FFMPEG; default: ffmpeg on PATH, "
                          "else the imageio-ffmpeg package's)")
     args = ap.parse_args()
+    if args.parallel < 0 or args.agents < 0:
+        ap.error("--agents / --parallel: expected a number of slots >= 0")
+    if args.ctx is None:  # (--agents: the most that fits in each slot; --parallel, as open-jet's: 32768 each)
+        args.ctx = 0 if args.agents > 0 and not args.parallel else 32768
+    if args.parallel:
+        args.agents = args.parallel
+    if args.agents > 0:
+        if args.kv == "f16":
+            ap.error("--agents: the parallel slots need the q8_0 KV cache (--kv q8 or auto)")
+        if args.ctx < 0:
+            ap.error("--ctx: expected positions per slot >= 0 (0: the most that fit)")
+        args.kv = "q8"
+        # prefill chunks of 1024 (half the scratch of the default: more context for the slots, same prefill speed), and
+        # prefill rows independent of how a prompt is cut into chunks (MK_EXACT): a prompt fed beside other slots'
+        # cycles computes what it computes alone
+        os.environ.setdefault("MK_PF_CAP", "1024")
+        os.environ.setdefault("MK_EXACT", "1")
+        for k in ("MK_PF_MIX", "MK_PF_CHUNK", "MK_PF_SOLO"):  # (the slot scheduler's: checked before the model loads)
+            env_int(k, 0, 0)
     if not 0 < args.video_fps <= 30:
         ap.error("--video-fps: expected a rate in (0, 30]")
     if args.video_max_tokens and args.video_max_tokens < max(8, args.image_min_tokens):
@@ -4677,8 +5254,8 @@ def main():
 
     def load():
         try:
-            srv = Server(args)
-            if srv.eng.exact:
+            srv = (SlotServer if args.agents > 0 else Server)(args)
+            if srv.eng.exact and not args.agents:
                 log("exact reuse: on (MK_EXACT)")
             box["srv"] = srv
             httpd.RequestHandlerClass = make_handler(srv)

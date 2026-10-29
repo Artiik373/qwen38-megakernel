@@ -60,7 +60,7 @@ def load_set(data, name, manifest=None):
 
 
 def load_prompt(data, name, manifest=None):
-    """pf38k (committed under prompts/) or pf101k (built by fetch.py in the data directory), hash-checked."""
+    """pf38k (committed under prompts/) or pf101k / oj100k (built by fetch.py in the data directory), hash-checked."""
     m = manifest or load_manifest()
     spec = m["prompts"][name]
     p = os.path.join(HERE if spec["where"] == "repo" else data, *spec["file"].split("/"))
