@@ -134,13 +134,14 @@ any of:
 | Q3_K, IQ3_S | re-laid-out at load (values + scales streams, 114 / 112 B per 256 weights); the GEMV and the prefill GEMM feed exactly the integers and scales of the Q6_K re-encode they replace (`MK_REENC3=1`): bit-identical results at ~0.54x the bytes |
 | IQ4_NL | re-laid-out at load into 144-byte blocks of 256 weights (the eight fp16 scales, then the index bytes); bit-identical to the Q8_0 re-encode it replaces (`MK_IQ4NL_Q8=1`) at 0.53x the bytes |
 
-`token_embd` can be Q4_K, Q6_K or Q8_0: it stays in mapped pinned host memory (not in VRAM) as stored, and each lookup
+`token_embd` can be Q4_K, Q5_K, Q6_K or Q8_0: it stays in mapped pinned host memory (not in VRAM) as stored, and each lookup
 (the decode embed phase, the MTP block's input, the prefill embed kernels) stages the token's row and dequantizes it the
 way ggml does. `output` can be Q6_K or Q8_0 (Q8_0: ~0.3 GB more VRAM; lm_head and the draft head have an instance per
 type). Q8_0 `ssm_alpha` /
-`ssm_beta` (UD) stay int8 with their block scales and the kernels apply the norm weight on the fly; other types are
-dequantized to F32 at load and folded with the norm weight into fp32 rows (the same values; `MK_AB_F32=1` forces this
-path). The exact re-encodes keep every weight's value (both formats store a small integer times the same fp16 `d` and an
+`ssm_beta` (UD) stay int8 with their block scales and the kernels apply the norm weight on the fly; other types (F32,
+BF16, F16, the quantized ones) are dequantized to F32 at load and folded with the norm weight into fp32 rows (the same
+values; `MK_AB_F32=1` forces this path); BF16 is accepted only for these two. The exact re-encodes keep every weight's
+value (both formats store a small integer times the same fp16 `d` and an
 integer sub-block scale), and the loader checks each re-encoded or re-laid-out row bit for bit against ggml's
 dequantization of the original. A file with any other type is refused, naming the first tensor that does not match.
 Which files that covers: [Model files](#model-files).

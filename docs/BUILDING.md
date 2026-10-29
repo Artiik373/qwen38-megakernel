@@ -157,8 +157,8 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 | any other quantization | refused at load, naming the first tensor it cannot read (use llama.cpp) |
 
 - **Tensor types:** every projection of the trunk and the MTP layer can be Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS, Q3_K, IQ3_S
-  or IQ4_NL; `token_embd` Q4_K, Q6_K or Q8_0; `output` Q6_K or Q8_0. How each is read, and the few other cases:
-  [ENGINE.md](ENGINE.md#the-gguf).
+  or IQ4_NL; `token_embd` Q4_K, Q5_K, Q6_K or Q8_0; `output` Q6_K or Q8_0; `ssm_alpha` / `ssm_beta` also F32, F16 or
+  BF16. How each is read, and the few other cases: [ENGINE.md](ENGINE.md#the-gguf).
 - **The MTP layer** (`blk.64`) is what the engine drafts with. Some conversions drop it. Without one the engine loads
   with a notice and decodes without drafting (depth 0, about a third of the drafted speed), with no MTP weights and no
   MTP KV slot; `--no-mtp` (`MK_NO_MTP=1`) does the same for a file that has one. `--mtp FILE` (`MK_MTP=FILE` in the

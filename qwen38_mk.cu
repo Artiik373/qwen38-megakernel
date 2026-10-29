@@ -336,7 +336,7 @@ struct ModelW {
     // draft head reads instead; 0 rows: off. Rows past it (tokens dv_add appended) come from lm_head as before.
     const uint8_t * dq4;
     int dq4_n;
-    int embd_t; // token_embd's type: T_Q4K, T_Q6K or T_Q8_0 (ggml rows, embd_rb<type>() bytes)
+    int embd_t; // token_embd's type: T_Q4K, T_Q5K, T_Q6K or T_Q8_0 (ggml rows, embd_rb<type>() bytes)
 };
 
 // Quantised activation vector(s) in the "unit" layout consumed by the GEMV:
@@ -1346,11 +1346,31 @@ __device__ __forceinline__ float dequant_q4k(const uint8_t * row, int e) {
 
 constexpr int EMBD_RB = D / 256 * 144; // bytes of one Q4_K token_embd row
 
-// token_embd of another type (ModelW::embd_t; files whose token_embd is Q6_K or Q8_0): ggml's rows as stored, element e
-// dequantised as ggml does (every product here is exact in fp32: d * sc has at most 18 significant bits, times a 6-bit q)
+// token_embd of another type (ModelW::embd_t; files whose token_embd is Q5_K, Q6_K or Q8_0): ggml's rows as stored,
+// element e dequantised as ggml does (every product here is exact in fp32: d * sc has at most 18 significant bits, times
+// a 6-bit q)
 template <int ET>
 __host__ __device__ constexpr int embd_rb() {
-    return ET == T_Q4K ? D / 256 * 144 : ET == T_Q6K ? D / 256 * 210 : D / 32 * 34;
+    return ET == T_Q4K ? D / 256 * 144 : ET == T_Q5K ? D / 256 * 176 : ET == T_Q6K ? D / 256 * 210 : D / 32 * 34;
+}
+// ggml block_q5_K: d, dmin, scales[12] (Q4_K's 6-bit packing), qh[32] (bit sb of qh[l]: element 32 sb + l's 5th bit), qs[128]
+__device__ __forceinline__ float dequant_q5k_e(const uint8_t * row, int e) {
+    const int b = e >> 8, w = e & 255, sb = w >> 5, l = w & 31;
+    const uint8_t * blk = row + b * 176;
+    const float d = __half2float(*reinterpret_cast<const __half *>(blk));
+    const float dmin = __half2float(*reinterpret_cast<const __half *>(blk + 2));
+    const uint8_t * sc = blk + 4;
+    int s, m;
+    if (sb < 4) {
+        s = sc[sb] & 63;
+        m = sc[sb + 4] & 63;
+    } else {
+        s = (sc[sb + 4] & 0xF) | ((sc[sb - 4] >> 6) << 4);
+        m = (sc[sb + 4] >> 4) | ((sc[sb] >> 6) << 4);
+    }
+    const uint8_t qb = blk[48 + 32 * (sb >> 1) + l];
+    const int qv = ((sb & 1) ? (qb >> 4) : (qb & 0xF)) | (((blk[16 + l] >> sb) & 1) << 4);
+    return d * (float) s * (float) qv - dmin * (float) m;
 }
 __device__ __forceinline__ float dequant_q6k_e(const uint8_t * row, int e) { // ggml block_q6_K: ql[128] qh[64] sc[16] d
     const int b = e >> 8, w = e & 255, n = w >> 7, r = w & 127, qq = r >> 5, l = r & 31;
@@ -1368,6 +1388,7 @@ __device__ __forceinline__ float dequant_q80_e(const uint8_t * row, int e) { // 
 template <int ET>
 __device__ __forceinline__ float dequant_embd(const uint8_t * row, int e) {
     if constexpr (ET == T_Q4K) return dequant_q4k(row, e);
+    else if constexpr (ET == T_Q5K) return dequant_q5k_e(row, e);
     else if constexpr (ET == T_Q6K) return dequant_q6k_e(row, e);
     else return dequant_q80_e(row, e);
 }
@@ -1378,8 +1399,12 @@ __device__ __forceinline__ void stage_embd_bytes(size_t off, int nbytes, uint8_t
         reinterpret_cast<unsigned *>(dst)[i] = reinterpret_cast<const unsigned *>(cW.embd + off)[i];
     __syncthreads();
 }
-// embed_prologue's element e (block s: elements [512 s, 512 s + 512)) for a Q6_K / Q8_0 table, out of line
+// embed_prologue's element e (block s: elements [512 s, 512 s + 512)) for a Q5_K / Q6_K / Q8_0 table, out of line
 __device__ __noinline__ float embed_elem_other(int tok, int s, int e) {
+    if (cW.embd_t == T_Q5K) {
+        stage_embd_bytes((size_t) tok * embd_rb<T_Q5K>() + 2 * s * 176, 2 * 176, smem);
+        return dequant_q5k_e(smem, e - 512 * s);
+    }
     if (cW.embd_t == T_Q6K) {
         stage_embd_bytes((size_t) tok * embd_rb<T_Q6K>() + 2 * s * 210, 2 * 210, smem);
         return dequant_q6k_e(smem, e - 512 * s);
@@ -1387,11 +1412,14 @@ __device__ __noinline__ float embed_elem_other(int tok, int s, int e) {
     stage_embd_bytes((size_t) tok * embd_rb<T_Q8_0>() + 16 * s * 34, 16 * 34, smem);
     return dequant_q80_e(smem, e - 512 * s);
 }
-// a whole Q6_K / Q8_0 token_embd row dequantised into se[0 .. D) (the MTP M0 phases; staged at stage, out of line);
-// each thread writes the elements e = threadIdx.x + k NT it reads back
+// a whole Q5_K / Q6_K / Q8_0 token_embd row dequantised into se[0 .. D) (the MTP M0 phases; staged at stage, out of
+// line); each thread writes the elements e = threadIdx.x + k NT it reads back
 static_assert(2 * D * 4 + 32 * 4 + embd_rb<T_Q8_0>() <= SM_TOTAL, "MTP M0: se, sh, red and a staged token_embd row");
 __device__ __noinline__ void embed_row_other(int tok, float * se, uint8_t * stage) {
-    if (cW.embd_t == T_Q6K) {
+    if (cW.embd_t == T_Q5K) {
+        stage_embd_bytes((size_t) tok * embd_rb<T_Q5K>(), embd_rb<T_Q5K>(), stage);
+        for (int e = threadIdx.x; e < D; e += NT) se[e] = dequant_q5k_e(stage, e);
+    } else if (cW.embd_t == T_Q6K) {
         stage_embd_bytes((size_t) tok * embd_rb<T_Q6K>(), embd_rb<T_Q6K>(), stage);
         for (int e = threadIdx.x; e < D; e += NT) se[e] = dequant_q6k_e(stage, e);
     } else {
@@ -7407,10 +7435,10 @@ struct MKEngine::Impl {
         {
             const auto & t = tget("token_embd.weight");
             // the embedding lookups dequantise each type (embed_prologue, the MTP M0 phases, pk_embed*, pk_mtp_in)
-            if (t.type != gguf::Q4_K && t.type != gguf::Q6_K && t.type != gguf::Q8_0)
-                throw std::runtime_error("token_embd.weight is " + tname((int) t.type) + ", the engine reads Q4_K, Q6_K or Q8_0 (see README: the GGUF)");
+            if (t.type != gguf::Q4_K && t.type != gguf::Q5_K && t.type != gguf::Q6_K && t.type != gguf::Q8_0)
+                throw std::runtime_error("token_embd.weight is " + tname((int) t.type) + ", the engine reads Q4_K, Q5_K, Q6_K or Q8_0 (see README: the GGUF)");
             if (!shape2(t.ne, D, VOCAB)) throw std::runtime_error("token_embd.weight bad shape");
-            hw.embd_t = (int) t.type; // (gguf::Q4_K / Q6_K / Q8_0 == T_Q4K / T_Q6K / T_Q8_0)
+            hw.embd_t = (int) t.type; // (gguf::Q4_K / Q5_K / Q6_K / Q8_0 == T_Q4K / T_Q5K / T_Q6K / T_Q8_0)
             // mapped pinned host memory: a cycle reads only a few 2.8 KB rows over PCIe, saves 0.7 GB of VRAM
             auto _ = lc.scope("token_embd (pinned table)");
             if (!embd_dev) {
@@ -8801,7 +8829,10 @@ struct MKEngine::Impl {
             if (rsnap) ring_snap_begin(sn, ss);
             gap_mark(ci, 0); // (after the token upload: MK_PF_SYNC's idle is before it)
             pf_time("embed", [&] { // (token_embd's type)
-                if (hw.embd_t == T_Q6K) {
+                if (hw.embd_t == T_Q5K) {
+                    if (img) pk_embed_img<T_Q5K><<<T, 256>>>(T);
+                    else pk_embed<T_Q5K><<<T, 256>>>(T);
+                } else if (hw.embd_t == T_Q6K) {
                     if (img) pk_embed_img<T_Q6K><<<T, 256>>>(T);
                     else pk_embed<T_Q6K><<<T, 256>>>(T);
                 } else if (hw.embd_t == T_Q8_0) {
@@ -8954,7 +8985,10 @@ struct MKEngine::Impl {
 #if MK_PF_INFCHK
                 chk_set(NL, -1);
 #endif
-                if (hw.embd_t == T_Q6K) {
+                if (hw.embd_t == T_Q5K) {
+                    if (img) pk_mtp_in<true, T_Q5K><<<T, 256>>>();
+                    else pk_mtp_in<false, T_Q5K><<<T, 256>>>();
+                } else if (hw.embd_t == T_Q6K) {
                     if (img) pk_mtp_in<true, T_Q6K><<<T, 256>>>();
                     else pk_mtp_in<false, T_Q6K><<<T, 256>>>();
                 } else if (hw.embd_t == T_Q8_0) {
