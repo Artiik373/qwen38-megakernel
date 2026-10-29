@@ -477,7 +477,7 @@ MKFLAGS = -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1
 - **Served build** (the default): wide verify (`MK_WV=1`: the verify pass on int8 tensor cores), up to 7 drafts
   (`MK_MAXT=8`), every Q6_K matrix on the tensor-core path (`MK_WV_Q6F=1`) and the split DeltaNet barrier (`MK_K5=1`).
   `MK_C1` and `MK_EGRESS` follow `MK_WV`, so they are on too. ptxas peaked at 21.2 GB of RAM for it on
-  Linux (2026-10-28, [BUILDING.md](BUILDING.md#requirements)).
+  Linux (2026-10-28) and at 20.2 GB natively on Windows (2026-10-29; [BUILDING.md](BUILDING.md#requirements)).
 - **Lean build** (`make MKFLAGS=`, `.\build.ps1 -MkFlags ""`): every flag at its default, so the dp4a verify path and
   at most 4 drafts (run it with `MK_DRAFT=4` / `-d 4`). ptxas needed ~19 GB (2026-10-17).
 

@@ -45,11 +45,11 @@ folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Vis
   CUDA 13.2; it links the CUDA runtime statically, so at run time only the driver is needed.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64.
 - **RAM to compile:** most of the build is ptxas on the megakernel, one thread with a large heap. For the served
-  configuration it peaked at 21.2 GB on Linux / WSL2 in a 13-minute build (2026-10-28), after the code that no served
-  setting reaches was dropped and lm_head's variants were merged; the build just before that peaked at 37.7 GB and
-  took 28.5 minutes. Natively on Windows the peak was 27-30 GB before that change (2026-10-18; native builds took
-  19-21 minutes from 2026-10-18 to 10-21), not re-measured since. The lean build (`MKFLAGS=`, up to 4 drafts) needed
-  about 19 GB (2026-10-17).
+  configuration it peaked at 21.2 GB on Linux / WSL2 in a 13-minute build (2026-10-28) and at 20.2 GB natively on
+  Windows in a 14-minute build (2026-10-29), after the code that no served setting reaches was dropped and lm_head's
+  variants were merged. Before that change: 37.7 GB and 28.5 minutes on Linux (2026-10-28); natively 27-30 GB
+  (2026-10-18) and up to 30 minutes (2026-10-28). The lean build (`MKFLAGS=`, up to 4 drafts) needed about 19 GB
+  (2026-10-17).
 - **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `--park-mib` /
   `MK_PARK_MIB` (default 8192 MiB; 1024 MiB for side requests alone when parking is off), allocated as it is needed and
   kept until the server exits. The token embedding table also stays in page-locked host memory instead of VRAM.
