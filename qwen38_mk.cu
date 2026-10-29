@@ -548,6 +548,9 @@ struct Launch {
 #if MK_MAXT > 5
     int spec_blk; // sampled drafts: block verification of the verify rows (policy blk=1, sample_targets_blk)
 #endif
+    // policy ng: this launch verifies ng host n-gram drafts (MKEngine::Impl::ng_lookup); when it accepts all of them, the
+    // MTP draft steps after the first are skipped (the next launch takes n-gram drafts again). 0: MTP drafts
+    int ng;
     // batched launch (MKEngine::slots_step; 0: a solo launch): nl lanes, lane i = ln[i].lane (views view_main / view_full)
     // with its rows r0 .. r0 + T - 1 of the pass (Launch::T = the pass's rows, at least their sum), the drafts its MTP
     // passes produce for the next launch, and its sampling
@@ -5308,7 +5311,10 @@ __device__ __noinline__ void mtp_tail(const Launch & P, unsigned & epoch) {
     }
     if (lg) {
         // nd_stop is written before the PH_MTP_LMHEAD barrier, so every block takes the same exit
-        for (int i = 1; i < P.ndraft && !vc->nd_stop; i++) mtp_pass<1>(P, 0, true, i, true, sm, epoch);
+        // (n-gram drafts all accepted: draft 1 only, from the catch-up pass; Launch::ng. n_acc is written before the
+        // main-model barriers the MTP passes follow, so every block takes the same branch)
+        if (!(P.ng > 0 && vc->n_acc >= P.ng))
+            for (int i = 1; i < P.ndraft && !vc->nd_stop; i++) mtp_pass<1>(P, 0, true, i, true, sm, epoch);
     }
 }
 
@@ -6465,6 +6471,10 @@ struct MKEngine::Impl {
 #if MK_MAXT > 5
         int blk = 0; // sampled drafts: block verification (Launch::spec_blk)
 #endif
+        // ng = N (0: off): when the sequence's last N tokens occurred before and the tokens after their latest earlier
+        // occurrence start with the MTP's first draft, verify those tokens instead of the MTP drafts (MKEngine::Impl::
+        // step_live). 24: +10..13% on edit / rename tasks, the other 10 prompts within noise (NIKI, greedy, 2026-10-29)
+        int ng = 24;
     } pol;
     // the policy's draft depth at position pos: n_draft, or (MK_MAXT > 5) at most 4 from Policy::dctx on
 #if MK_MAXT > 5
@@ -6472,6 +6482,21 @@ struct MKEngine::Impl {
 #else
     int depth_top(int) const { return n_draft_max; }
 #endif
+    // policy ng: up to nmax tokens after the latest earlier occurrence of seq's last pol.ng tokens into d; their count
+    int ng_lookup(int * d, int nmax) const {
+        const int N = pol.ng, L = (int) seq.size();
+        if (N <= 0 || L <= N) return 0;
+        const int * s = seq.data(), * key = s + L - N;
+        for (int j = L - N - 1; j >= 0; j--) {
+            if (s[j + N - 1] != key[N - 1] || memcmp(s + j, key, (size_t) N * sizeof(int)) != 0) continue;
+            const int k = std::min(nmax, L - (j + N));
+            for (int i = 0; i < k; i++) d[i] = s[j + N + i];
+            return k;
+        }
+        return 0;
+    }
+    int ng_launch = 0; // Launch::ng of the next decode launch (step_live)
+    int ng_tok[MAXT];  // (the n-gram drafts' host copy for the async upload)
 #if MK_SPEC_LOG
     FILE * slog = nullptr;               // MK_SPEC_LOG_FILE: one JSON line per decode cycle
     std::vector<float2> slog_q;          // dlog of the drafts the next cycle verifies
@@ -8781,6 +8806,7 @@ struct MKEngine::Impl {
 #if MK_MAXT > 5
         L.spec_blk = L.spec_smp && pol.blk;
 #endif
+        L.ng = mode == MODE_DECODE ? ng_launch : 0;
         if (!score && (pen_pres != 0.f || pen_freq != 0.f)) {
             L.pres = pen_pres;
             L.freq = pen_freq;
@@ -11105,7 +11131,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 // MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
 // chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);
 // blk=0|1 (sampled drafts: block verification, sample_targets_blk); g7=0|1 (the depth > 5 gates, Impl::Policy);
-// "" = defaults
+// ng=N (n-gram drafts after a match of the sequence's last N tokens, 0: off); "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
     float dk[MAXT - 1], sk[MAXT - 1]; // per-draft overrides
@@ -11137,6 +11163,7 @@ void MKEngine::set_policy(const std::string & spec) {
         else if (k == "dctx") pol.dctx = std::stoi(v); // from position dctx on: at most 4 drafts
 #endif
         else if (k == "chain") pol.gate_chain = std::stoi(v);
+        else if (k == "ng") pol.ng = std::stoi(v);
         else if (k == "h1") pol.h1 = std::stoi(v);
 #if MK_MAXT > 5
         else if (k == "blk") pol.blk = std::stoi(v);
@@ -11969,6 +11996,25 @@ std::vector<float> MKEngine::slot_h(int slot) {
 int MKEngine::Impl::step_live(std::vector<int> & out) {
     Ctl & c = hctl;
     if (c.n + MAXT + 2 >= ctx) throw std::runtime_error("context full"); // (rows past ctx: KV_PAD)
+    // policy ng: the n-gram continuation replaces the MTP drafts when it starts with the MTP's first draft. Sampling: they
+    // are verified as fixed drafts (Ctl::dsmp 0: accepted with probability p(d), the residual otherwise; exact, and the
+    // choice reads only the draft head's random stream, not the verify rows')
+    ng_launch = 0;
+    int ngk = 0;
+    if (pol.ng > 0 && nd_avail >= 1 && (int) seq.size() == c.n + 1 && seq.back() == c.tok[0]) {
+        ngk = ng_lookup(ng_tok, depth_top(c.n));
+        if (ngk < 1 || ng_tok[0] != c.tok[1]) ngk = 0;
+        else {
+            for (int i = 0; i < ngk; i++) c.tok[1 + i] = ng_tok[i];
+            char * dc = reinterpret_cast<char *>(hb.ctl);
+            CK(cudaMemcpyAsync(dc + offsetof(Ctl, tok) + sizeof(int), ng_tok, (size_t) ngk * sizeof(int), cudaMemcpyHostToDevice, 0));
+            if (c.dsmp) {
+                c.dsmp = 0;
+                CK(cudaMemcpyAsync(dc + offsetof(Ctl, dsmp), &c.dsmp, sizeof(int), cudaMemcpyHostToDevice, 0));
+            }
+            nd_avail = ngk;
+        }
+    }
     // verify the previous launch's drafts, minus any that would put this launch's rows across an
     // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
 #if MK_MAXT > 5
@@ -11978,6 +12024,7 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
 #else
     const int T = att_cap_T(c.n, 1 + nd_avail);
 #endif
+    if (ngk > 0) ng_launch = T - 1;
     // Draft depth (an upper bound: the on-device gate may stop drafting earlier). Default (depth 0):
     // after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper draft
     // is then unlikely to be accepted; the full depth again after a fully accepted cycle.

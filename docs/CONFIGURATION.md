@@ -391,6 +391,7 @@ keeps its distribution). The defaults were tuned on replayed logs and live A/B r
 | `blk` | `0` | (builds with more than 4 drafts) `1`: block verification of sampled drafts (opt-in; within noise live, 2026-10-14) | 455017a, 2026-10-14 |
 | `mtpq` | - | with `MK_MTP_Q4=ab`: `1` the re-quantized MTP layer, `0` the stored one (from the next prefill) | 8d4c18b, 2026-10-12 |
 | `dq4` | - | with the draft head's Q4_K copy (`MK_DRAFT_Q4`, on by default): `1` the copy, `0` lm_head (from the next launch) | d40a48b, 2026-10-17 |
+| `ng` | `24` | n-gram drafts: when the sequence's last N tokens occurred earlier (prompt or output) and the tokens that followed their latest occurrence start with the MTP's first draft, the next launch verifies up to `-d` of those tokens instead of the MTP drafts; a launch that accepts all of them skips MTP draft steps 2 and up (~3.4 of 31 ms). Solo decoding only (not the batched launches of several agents); sampled output is verified as fixed drafts (distribution unchanged). `0`: off. NIKI, 512 tokens: greedy +12.9% adding docstrings to code, +10.2% renaming variables, the 10 other prompts (code, prose, rewrite, Chinese, SQL, math) within ±1.4%, greedy ids identical; temperature 0.7: +16.5% / +10.5% on the same two, code and prose unchanged | 2026-10-29 |
 
 The policy before the gates was `depth=0,drop=0,stop=0,chain=0,h1=0`. On the lean build the defaults are
 `stop` 0.4 after drafts 2-4 and `drop` 0.4 for the 4th draft.

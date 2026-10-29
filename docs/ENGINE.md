@@ -350,6 +350,12 @@ frame or frame pair is an image (the same M-RoPE positions, so the engine needs 
   (`draft_vocab_32k.bin`, built by `tools/vocab_freq` from local code + docs; covers ~99.4% of tokens), plus the tokens
   of the current sequence that are missing from it, added on the fly (identifiers of pasted code). Verification always
   uses the full vocabulary, so this affects only the acceptance rate, never the output.
+- **n-gram drafts** (policy `ng`, default 24): before a solo decode launch the host looks for the latest earlier
+  occurrence of the sequence's last 24 tokens (`MKEngine::Impl::ng_lookup`, a backward scan: ~34 us at 131k tokens).
+  When the tokens after it start with the MTP's first draft, they replace the MTP drafts in `Ctl::tok` (as fixed drafts
+  when sampling), and `Launch::ng` tells the launch to skip MTP draft steps 2 and up if it accepts all of them (the next
+  launch most likely copies again; it still gets the catch-up pass's first draft for the comparison). Edits, renames and
+  quoting copy long runs of the prompt: +10-13% there, no measurable change on generation that does not copy.
 - **Sampling** keeps the 32 best logits of each verified row; a draft is accepted with probability p(draft) and a
   rejected one is resampled from the rest of the distribution, which keeps the sampled distribution exact.
 - **L2 warm-up**: before each barrier, blocks prefetch (evict-last) what their next latency-bound phase reads first
