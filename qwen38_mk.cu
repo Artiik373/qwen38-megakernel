@@ -308,6 +308,59 @@ constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN_MAX ? SM_MISC + 2048 : SM_ATT
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
 
 enum { T_F32 = 0, T_Q5_1 = 7, T_Q8_0 = 8, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ4NL = 20, T_IQ3S = 21, T_IQ4X = 23 };
+// Matrix weight types the kernels are built for (Makefile MK_TYPES, e.g. "Q4_K Q5_K Q6_K IQ4_XS Q5_1": shorter ptxas, less
+// RAM). Unset: every type. MK_TY_<type> is 1 / 0; the dispatch switches drop the others (trap) and the loader refuses them.
+#ifndef MK_TYPESET
+#define MK_TY_Q4K 1
+#define MK_TY_Q5K 1
+#define MK_TY_Q6K 1
+#define MK_TY_Q8_0 1
+#define MK_TY_IQ4XS 1
+#define MK_TY_IQ4NL 1
+#define MK_TY_Q3K 1
+#define MK_TY_IQ3S 1
+#define MK_TY_Q5_1 1
+#endif
+#ifndef MK_TY_Q4K
+#define MK_TY_Q4K 0
+#endif
+#ifndef MK_TY_Q5K
+#define MK_TY_Q5K 0
+#endif
+#ifndef MK_TY_Q6K
+#define MK_TY_Q6K 0
+#endif
+#ifndef MK_TY_Q8_0
+#define MK_TY_Q8_0 0
+#endif
+#ifndef MK_TY_IQ4XS
+#define MK_TY_IQ4XS 0
+#endif
+#ifndef MK_TY_IQ4NL
+#define MK_TY_IQ4NL 0
+#endif
+#ifndef MK_TY_Q3K
+#define MK_TY_Q3K 0
+#endif
+#ifndef MK_TY_IQ3S
+#define MK_TY_IQ3S 0
+#endif
+#ifndef MK_TY_Q5_1
+#define MK_TY_Q5_1 0
+#endif
+#if !MK_TY_Q6K || !MK_TY_IQ4XS
+#error "MK_TYPES: Q6_K and IQ4_XS are required (the fixed-type paths: output, the switches' fallbacks)"
+#endif
+__host__ __device__ constexpr bool mk_built(int t) {
+    return (t == T_Q4K && MK_TY_Q4K) || (t == T_Q5K && MK_TY_Q5K) || (t == T_Q6K && MK_TY_Q6K) || (t == T_Q8_0 && MK_TY_Q8_0) ||
+           (t == T_IQ4X && MK_TY_IQ4XS) || (t == T_IQ4NL && MK_TY_IQ4NL) || (t == T_Q3K && MK_TY_Q3K) ||
+           (t == T_IQ3S && MK_TY_IQ3S) || (t == T_Q5_1 && MK_TY_Q5_1);
+}
+#define MK_IF_0(...)
+#define MK_IF_1(...) __VA_ARGS__
+#define MK_IF_(c, ...) MK_IF_##c(__VA_ARGS__)
+#define MK_IF(c, ...) MK_IF_(c, __VA_ARGS__) // __VA_ARGS__ when the MK_TY_ flag c is 1
+#define MK_UNBUILT() do { __trap(); __builtin_unreachable(); } while (0) // (a type the build has no kernels for: refused at load)
 enum { MODE_PREFILL = 0, MODE_DECODE = 1, MODE_BENCH = 2 };
 
 struct Mat {
@@ -440,6 +493,8 @@ struct Bufs {
     // (NOT bitwise), 2 deal the phase's items across the blocks (item i -> block i % G) instead of in contiguous runs, 4 split
     // each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT; takes precedence over 1)
     int k6;
+    int k9;  // MK_K9 (default 1): dn_proj_wv deals qkv / z tiles by bytes (k9_tile), exact
+    int wpf; // MK_WPF bytes (default 2048): wv phases L2-prefetch each warp's first tile before the activation fill (wv_wpf), exact
     int * err; // mapped host words, set only on failure: [0] no finite main logit / invalid token, [1] MTP catch-up out of range
 #if MK_EGRESS
     Ctl * ctl_eg; // mapped host copy of ctl, written by block 0 at the end of every launch (mk_egress)
@@ -1385,14 +1440,14 @@ __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
 template <int T, int IT, class Out>
 __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Out out) {
     switch (m.type) {
-        case T_Q4K: gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out); break;
-        case T_Q5K: gemv_pairs<T, IT, T_Q5K>(m, lo, hi, out); break;
+        MK_IF(MK_TY_Q4K, case T_Q4K: gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_Q5K, case T_Q5K: gemv_pairs<T, IT, T_Q5K>(m, lo, hi, out); break;)
         case T_Q6K: gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out); break;
-        case T_Q8_0: gemv_pairs<T, IT, T_Q8_0>(m, lo, hi, out); break;
-        case T_IQ4NL: gemv_pairs<T, IT, T_IQ4NL>(m, lo, hi, out); break;
-        case T_Q3K: gemv_pairs<T, IT, T_Q3K>(m, lo, hi, out); break;
-        case T_IQ3S: gemv_pairs<T, IT, T_IQ3S>(m, lo, hi, out); break;
-        case T_Q5_1: gemv_pairs<T, IT, T_Q5_1>(m, lo, hi, out); break;
+        MK_IF(MK_TY_Q8_0, case T_Q8_0: gemv_pairs<T, IT, T_Q8_0>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_IQ4NL, case T_IQ4NL: gemv_pairs<T, IT, T_IQ4NL>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_Q3K, case T_Q3K: gemv_pairs<T, IT, T_Q3K>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_IQ3S, case T_IQ3S: gemv_pairs<T, IT, T_IQ3S>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_Q5_1, case T_Q5_1: gemv_pairs<T, IT, T_Q5_1>(m, lo, hi, out); break;)
         default: gemv_pairs<T, IT, T_IQ4X>(m, lo, hi, out); break;
     }
 }
@@ -1730,13 +1785,13 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
 template <int T, int IT>
 __device__ __forceinline__ void resid_any(const Mat & W, const QBuf & in, float * x, bool add, const float * wnext, uint8_t * sm) {
     switch (W.type) {
-        case T_Q4K: resid32<T, IT, T_Q4K>(W, in, x, add, wnext, sm); break;
-        case T_Q5K: resid32<T, IT, T_Q5K>(W, in, x, add, wnext, sm); break;
+        MK_IF(MK_TY_Q4K, case T_Q4K: resid32<T, IT, T_Q4K>(W, in, x, add, wnext, sm); break;)
+        MK_IF(MK_TY_Q5K, case T_Q5K: resid32<T, IT, T_Q5K>(W, in, x, add, wnext, sm); break;)
         case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm); break;
-        case T_Q8_0: resid32<T, IT, T_Q8_0>(W, in, x, add, wnext, sm); break;
-        case T_IQ4NL: resid32<T, IT, T_IQ4NL>(W, in, x, add, wnext, sm); break;
-        case T_Q3K: resid32<T, IT, T_Q3K>(W, in, x, add, wnext, sm); break;
-        case T_IQ3S: resid32<T, IT, T_IQ3S>(W, in, x, add, wnext, sm); break;
+        MK_IF(MK_TY_Q8_0, case T_Q8_0: resid32<T, IT, T_Q8_0>(W, in, x, add, wnext, sm); break;)
+        MK_IF(MK_TY_IQ4NL, case T_IQ4NL: resid32<T, IT, T_IQ4NL>(W, in, x, add, wnext, sm); break;)
+        MK_IF(MK_TY_Q3K, case T_Q3K: resid32<T, IT, T_Q3K>(W, in, x, add, wnext, sm); break;)
+        MK_IF(MK_TY_IQ3S, case T_IQ3S: resid32<T, IT, T_IQ3S>(W, in, x, add, wnext, sm); break;)
         default: resid32<T, IT, T_IQ4X>(W, in, x, add, wnext, sm); break;
     }
 }
@@ -1825,14 +1880,14 @@ __device__ __noinline__ LaneT<T> rows16(const Mat m, int j) {
 template <int T>
 __device__ __forceinline__ LaneT<T> rows16_any(const Mat & m, int j) {
     switch (m.type) {
-        case T_Q4K: return rows16<T, T_Q4K>(m, j);
-        case T_Q5K: return rows16<T, T_Q5K>(m, j);
+        MK_IF(MK_TY_Q4K, case T_Q4K: return rows16<T, T_Q4K>(m, j);)
+        MK_IF(MK_TY_Q5K, case T_Q5K: return rows16<T, T_Q5K>(m, j);)
         case T_Q6K: return rows16<T, T_Q6K>(m, j);
-        case T_Q8_0: return rows16<T, T_Q8_0>(m, j);
-        case T_IQ4NL: return rows16<T, T_IQ4NL>(m, j);
-        case T_Q3K: return rows16<T, T_Q3K>(m, j);
-        case T_IQ3S: return rows16<T, T_IQ3S>(m, j);
-        case T_Q5_1: return rows16<T, T_Q5_1>(m, j);
+        MK_IF(MK_TY_Q8_0, case T_Q8_0: return rows16<T, T_Q8_0>(m, j);)
+        MK_IF(MK_TY_IQ4NL, case T_IQ4NL: return rows16<T, T_IQ4NL>(m, j);)
+        MK_IF(MK_TY_Q3K, case T_Q3K: return rows16<T, T_Q3K>(m, j);)
+        MK_IF(MK_TY_IQ3S, case T_IQ3S: return rows16<T, T_IQ3S>(m, j);)
+        MK_IF(MK_TY_Q5_1, case T_Q5_1: return rows16<T, T_Q5_1>(m, j);)
         default: return rows16<T, T_IQ4X>(m, j);
     }
 }
@@ -4573,7 +4628,9 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
 template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false, bool PEN = false>
 __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr,
                                      float pres = 0.f, float freq = 0.f, int nx0 = 0) {
+#if MK_TY_Q8_0
     if (cW.head.type == T_Q8_0) return lm_head_t<TL, TOPK, FULL, LSE, PEN, T_Q8_0>(t0, draft, s_tok, cand, pres, freq, nx0);
+#endif
     return lm_head_t<TL, TOPK, FULL, LSE, PEN, T_Q6K>(t0, draft, s_tok, cand, pres, freq, nx0);
 }
 
@@ -7978,6 +8035,7 @@ struct MKEngine::Impl {
         };
         auto needq = [&](const std::string & name, int got) {
             need(name, got, {T_Q4K, T_Q5K, T_Q5_1, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL, T_Q3K, T_IQ3S});
+            if (!mk_built(got)) throw std::runtime_error(name + " is " + tname(got) + ": this build has no kernels for it (make MK_TYPES)");
         };
         if (const char * e = getenv("MK_MTP_Q4")) {
             if (!strcmp(e, "ab")) mtp_q4 = 2;
@@ -7989,6 +8047,8 @@ struct MKEngine::Impl {
             draft_q4 = e[0] == '1';
             draft_q4_env = true;
         }
+        if ((mtp_q4 || draft_q4) && !mk_built(T_Q4K))
+            throw std::runtime_error("this build has no Q4_K kernels (make MK_TYPES): MK_MTP_Q4=0 MK_DRAFT_Q4=0 or a build with Q4_K");
         rq_start();
         wrec_on = true; // (MK_WDIGEST: the weight allocations from here to token_embd, without the draft ids)
         for (int i = 0; i < (has_mtp ? NLA : NL); i++) { // (no MTP block: hw.L[NL] stays empty)
@@ -8131,7 +8191,7 @@ struct MKEngine::Impl {
         hw.onorm = up_f32("output_norm.weight", D);
         hw.head = up_mat("output.weight", D, VOCAB);
         // Q8_0: lm_head_t<.., T_Q8_0> (some fine-tunes; ~0.3 GB more than Q6_K)
-        if (hw.head.type != T_Q6K && hw.head.type != T_Q8_0)
+        if ((hw.head.type != T_Q6K && hw.head.type != T_Q8_0) || !mk_built(hw.head.type))
             throw std::runtime_error("output.weight is " + tname(hw.head.type) + ", the kernel needs Q6_K or Q8_0 (see README: the GGUF)");
         mem_mark("weights: eh, norms, lm_head");
         hw.head_d = hw.head;
@@ -8260,7 +8320,10 @@ struct MKEngine::Impl {
         // stockfix switches (bit-exact; notes/agent_stockfix.md): K1 MK_K1, K2 MK_K2 (both default on)
         hb.k1 = !(getenv("MK_K1") && atoi(getenv("MK_K1")) == 0);
         hb.k2 = !(getenv("MK_K2") && atoi(getenv("MK_K2")) == 0);
-        fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), gsync form %d\n", hb.k1, hb.k2, MK_K2_TB, MK_GSYNC);
+        hb.k9 = getenv("MK_K9") ? atoi(getenv("MK_K9")) : 1;
+        hb.wpf = getenv("MK_WPF") ? std::max(0, atoi(getenv("MK_WPF"))) : 2048;
+        fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), gsync form %d, K9 %d, WPF %d B\n", hb.k1, hb.k2, MK_K2_TB,
+                MK_GSYNC, hb.k9, hb.wpf);
         // stock2 switches (notes/agent_stock2.md): K6 MK_K6 (bits: 1 K-split of the Q8_0 k / v tiles, NOT bitwise; 2 dealing
         // across blocks, exact; 4 8-row halves of the Q8_0 k / v tiles, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second
         // stream, 2 pk_norm_quant reads x once,
@@ -8997,32 +9060,32 @@ struct MKEngine::Impl {
         hp.wsrow = exact ? 1 : 0;
         mem_mark("prefill scratch");
         CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
-        mmh_attr<pf::TQ4K, false>();
-        mmh_attr<pf::TQ5K, false>();
-        mmh_attr<pf::TQ51, false>();
+        MK_IF(MK_TY_Q4K, mmh_attr<pf::TQ4K, false>();)
+        MK_IF(MK_TY_Q5K, mmh_attr<pf::TQ5K, false>();)
+        MK_IF(MK_TY_Q5_1, mmh_attr<pf::TQ51, false>();)
         mmh_attr<pf::TQ6K, false>();
-        mmh_attr<pf::TQ80, false>();
+        MK_IF(MK_TY_Q8_0, mmh_attr<pf::TQ80, false>();)
         mmh_attr<pf::TIQ4, false>();
-        mmh_attr<pf::TIQ4NL, false>();
-        mmh_attr<pf::TQ3K, false>();
-        mmh_attr<pf::TIQ3S, false>();
-        mmh_attr<pf::TQ4K, true>();
-        mmh_attr<pf::TQ5K, true>();
+        MK_IF(MK_TY_IQ4NL, mmh_attr<pf::TIQ4NL, false>();)
+        MK_IF(MK_TY_Q3K, mmh_attr<pf::TQ3K, false>();)
+        MK_IF(MK_TY_IQ3S, mmh_attr<pf::TIQ3S, false>();)
+        MK_IF(MK_TY_Q4K, mmh_attr<pf::TQ4K, true>();)
+        MK_IF(MK_TY_Q5K, mmh_attr<pf::TQ5K, true>();)
         mmh_attr<pf::TIQ4, true>();
 #if MK_WV
-        mmh_attr<pf::TQ4K, false, 1>();
-        mmh_attr<pf::TQ5K, false, 1>();
-        mmh_attr<pf::TQ51, false, 1>();
-        mmh_attr<pf::TQ80, false, 1>();
+        MK_IF(MK_TY_Q4K, mmh_attr<pf::TQ4K, false, 1>();)
+        MK_IF(MK_TY_Q5K, mmh_attr<pf::TQ5K, false, 1>();)
+        MK_IF(MK_TY_Q5_1, mmh_attr<pf::TQ51, false, 1>();)
+        MK_IF(MK_TY_Q8_0, mmh_attr<pf::TQ80, false, 1>();)
         mmh_attr<pf::TIQ4, false, 1>();
-        mmh_attr<pf::TIQ4NL, false, 1>();
-        mmh_attr<pf::TQ4K, true, 1>();
-        mmh_attr<pf::TQ5K, true, 1>();
+        MK_IF(MK_TY_IQ4NL, mmh_attr<pf::TIQ4NL, false, 1>();)
+        MK_IF(MK_TY_Q4K, mmh_attr<pf::TQ4K, true, 1>();)
+        MK_IF(MK_TY_Q5K, mmh_attr<pf::TQ5K, true, 1>();)
         mmh_attr<pf::TIQ4, true, 1>();
 #if MK_MAXT > 5
         mmh_attr<pf::TQ6K, false, 1>();
-        mmh_attr<pf::TQ3K, false, 1>();
-        mmh_attr<pf::TIQ3S, false, 1>();
+        MK_IF(MK_TY_Q3K, mmh_attr<pf::TQ3K, false, 1>();)
+        MK_IF(MK_TY_IQ3S, mmh_attr<pf::TIQ3S, false, 1>();)
 #endif
 #endif
         glu_mix_attr();
@@ -9336,31 +9399,31 @@ struct MKEngine::Impl {
 #if MK_WV
         if (m.fm) {
             switch (m.type) {
-                case T_Q4K: mmh_launch<pf::TQ4K, false, 1>(nrt, W, X, ntok, O); return;
-                case T_Q5K: mmh_launch<pf::TQ5K, false, 1>(nrt, W, X, ntok, O); return;
-                case T_Q5_1: mmh_launch<pf::TQ51, false, 1>(nrt, W, X, ntok, O); return;
-                case T_Q8_0: mmh_launch<pf::TQ80, false, 1>(nrt, W, X, ntok, O); return;
+                MK_IF(MK_TY_Q4K, case T_Q4K: mmh_launch<pf::TQ4K, false, 1>(nrt, W, X, ntok, O); return;)
+                MK_IF(MK_TY_Q5K, case T_Q5K: mmh_launch<pf::TQ5K, false, 1>(nrt, W, X, ntok, O); return;)
+                MK_IF(MK_TY_Q5_1, case T_Q5_1: mmh_launch<pf::TQ51, false, 1>(nrt, W, X, ntok, O); return;)
+                MK_IF(MK_TY_Q8_0, case T_Q8_0: mmh_launch<pf::TQ80, false, 1>(nrt, W, X, ntok, O); return;)
                 case T_IQ4X: mmh_launch<pf::TIQ4, false, 1>(nrt, W, X, ntok, O); return;
-                case T_IQ4NL: mmh_launch<pf::TIQ4NL, false, 1>(nrt, W, X, ntok, O); return;
+                MK_IF(MK_TY_IQ4NL, case T_IQ4NL: mmh_launch<pf::TIQ4NL, false, 1>(nrt, W, X, ntok, O); return;)
 #if MK_MAXT > 5
                 case T_Q6K: mmh_launch<pf::TQ6K, false, 1>(nrt, W, X, ntok, O); return;
-                case T_Q3K: mmh_launch<pf::TQ3K, false, 1>(nrt, W, X, ntok, O); return;
-                case T_IQ3S: mmh_launch<pf::TIQ3S, false, 1>(nrt, W, X, ntok, O); return;
+                MK_IF(MK_TY_Q3K, case T_Q3K: mmh_launch<pf::TQ3K, false, 1>(nrt, W, X, ntok, O); return;)
+                MK_IF(MK_TY_IQ3S, case T_IQ3S: mmh_launch<pf::TIQ3S, false, 1>(nrt, W, X, ntok, O); return;)
 #endif
                 default: throw std::runtime_error("gemm: unsupported weight type in the wv layout");
             }
         }
 #endif
         switch (m.type) {
-            case T_Q4K: mmh_launch<pf::TQ4K, false>(nrt, W, X, ntok, O); break;
-            case T_Q5K: mmh_launch<pf::TQ5K, false>(nrt, W, X, ntok, O); break;
-            case T_Q5_1: mmh_launch<pf::TQ51, false>(nrt, W, X, ntok, O); break;
+            MK_IF(MK_TY_Q4K, case T_Q4K: mmh_launch<pf::TQ4K, false>(nrt, W, X, ntok, O); break;)
+            MK_IF(MK_TY_Q5K, case T_Q5K: mmh_launch<pf::TQ5K, false>(nrt, W, X, ntok, O); break;)
+            MK_IF(MK_TY_Q5_1, case T_Q5_1: mmh_launch<pf::TQ51, false>(nrt, W, X, ntok, O); break;)
             case T_Q6K: mmh_launch<pf::TQ6K, false>(nrt, W, X, ntok, O); break;
-            case T_Q8_0: mmh_launch<pf::TQ80, false>(nrt, W, X, ntok, O); break;
+            MK_IF(MK_TY_Q8_0, case T_Q8_0: mmh_launch<pf::TQ80, false>(nrt, W, X, ntok, O); break;)
             case T_IQ4X: mmh_launch<pf::TIQ4, false>(nrt, W, X, ntok, O); break;
-            case T_IQ4NL: mmh_launch<pf::TIQ4NL, false>(nrt, W, X, ntok, O); break;
-            case T_Q3K: mmh_launch<pf::TQ3K, false>(nrt, W, X, ntok, O); break;
-            case T_IQ3S: mmh_launch<pf::TIQ3S, false>(nrt, W, X, ntok, O); break;
+            MK_IF(MK_TY_IQ4NL, case T_IQ4NL: mmh_launch<pf::TIQ4NL, false>(nrt, W, X, ntok, O); break;)
+            MK_IF(MK_TY_Q3K, case T_Q3K: mmh_launch<pf::TQ3K, false>(nrt, W, X, ntok, O); break;)
+            MK_IF(MK_TY_IQ3S, case T_IQ3S: mmh_launch<pf::TIQ3S, false>(nrt, W, X, ntok, O); break;)
             default: throw std::runtime_error("gemm: unsupported weight type");
         }
     }
@@ -9385,8 +9448,8 @@ struct MKEngine::Impl {
 #if MK_WV
         if (glu_fused(g, u) && g.fm) {
             switch (g.type) {
-                case T_Q4K: mmh_launch<pf::TQ4K, true, 1>(nrt, W, hp.xh, ntok, O, u.w); return;
-                case T_Q5K: mmh_launch<pf::TQ5K, true, 1>(nrt, W, hp.xh, ntok, O, u.w); return;
+                MK_IF(MK_TY_Q4K, case T_Q4K: mmh_launch<pf::TQ4K, true, 1>(nrt, W, hp.xh, ntok, O, u.w); return;)
+                MK_IF(MK_TY_Q5K, case T_Q5K: mmh_launch<pf::TQ5K, true, 1>(nrt, W, hp.xh, ntok, O, u.w); return;)
                 case T_IQ4X: mmh_launch<pf::TIQ4, true, 1>(nrt, W, hp.xh, ntok, O, u.w); return;
                 default: break;
             }
@@ -9394,8 +9457,8 @@ struct MKEngine::Impl {
 #endif
         if (glu_fused(g, u)) {
             switch (g.type) {
-                case T_Q4K: mmh_launch<pf::TQ4K, true>(nrt, W, hp.xh, ntok, O, u.w); return;
-                case T_Q5K: mmh_launch<pf::TQ5K, true>(nrt, W, hp.xh, ntok, O, u.w); return;
+                MK_IF(MK_TY_Q4K, case T_Q4K: mmh_launch<pf::TQ4K, true>(nrt, W, hp.xh, ntok, O, u.w); return;)
+                MK_IF(MK_TY_Q5K, case T_Q5K: mmh_launch<pf::TQ5K, true>(nrt, W, hp.xh, ntok, O, u.w); return;)
                 case T_IQ4X: mmh_launch<pf::TIQ4, true>(nrt, W, hp.xh, ntok, O, u.w); return;
                 default: break;
             }
@@ -9412,11 +9475,14 @@ struct MKEngine::Impl {
     // Q6_K only with MK_WV_Q6F at MAXT > 5); any other pair takes the two-GEMM path.
     bool glu_mix_on = !(getenv("MK_PF_GLU_MIX") && atoi(getenv("MK_PF_GLU_MIX")) == 0);
     static constexpr int GLW = MK_WV ? 1 : 0, GL6 = MK_WV && MK_MAXT > 5 && MK_WV_Q6F ? 1 : 0;
+    // (MK_TYPES: only the pairs whose two types are built)
 #define MK_GLU_MIX_PAIRS(X)                                                                                                \
-    X(pf::TQ4K, GLW, pf::TQ5K, GLW) X(pf::TIQ4, GLW, pf::TQ5K, GLW) X(pf::TIQ4, GLW, pf::TQ4K, GLW)                      \
-    X(pf::TQ4K, GLW, pf::TIQ4, GLW) X(pf::TQ6K, GL6, pf::TQ6K, GL6) X(pf::TIQ4, GLW, pf::TQ3K, 0)                        \
-    X(pf::TQ6K, GL6, pf::TQ5K, GLW) X(pf::TQ3K, 0, pf::TIQ4, GLW) X(pf::TIQ4NL, GLW, pf::TIQ4, GLW)                      \
-    X(pf::TIQ4NL, GLW, pf::TQ5K, GLW) X(pf::TQ5K, GLW, pf::TIQ4NL, GLW)
+    MK_IF(MK_TY_Q4K, MK_IF(MK_TY_Q5K, X(pf::TQ4K, GLW, pf::TQ5K, GLW))) MK_IF(MK_TY_Q5K, X(pf::TIQ4, GLW, pf::TQ5K, GLW)) \
+    MK_IF(MK_TY_Q4K, X(pf::TIQ4, GLW, pf::TQ4K, GLW)) MK_IF(MK_TY_Q4K, X(pf::TQ4K, GLW, pf::TIQ4, GLW))                   \
+    X(pf::TQ6K, GL6, pf::TQ6K, GL6) MK_IF(MK_TY_Q3K, X(pf::TIQ4, GLW, pf::TQ3K, 0))                                      \
+    MK_IF(MK_TY_Q5K, X(pf::TQ6K, GL6, pf::TQ5K, GLW)) MK_IF(MK_TY_Q3K, X(pf::TQ3K, 0, pf::TIQ4, GLW))                     \
+    MK_IF(MK_TY_IQ4NL, X(pf::TIQ4NL, GLW, pf::TIQ4, GLW))                                                                \
+    MK_IF(MK_TY_IQ4NL, MK_IF(MK_TY_Q5K, X(pf::TIQ4NL, GLW, pf::TQ5K, GLW) X(pf::TQ5K, GLW, pf::TIQ4NL, GLW)))
     template <int TG, int LG, int TU, int LU> void mmh_attr_mix() {
         CK(cudaFuncSetAttribute(pf::mmh<TG, true, 32, LG, TU, LU>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem2<TG, TU, 32>()));
         CK(cudaFuncSetAttribute(pf::mmh<TG, true, 64, LG, TU, LU>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem2<TG, TU, 64>()));

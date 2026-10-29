@@ -6,7 +6,16 @@ ARCH := sm_$(patsubst sm_%,%,$(ARCH))
 # engine configuration: wide tensor-core verify, up to 7 drafts (-d 7), fragment-ordered Q6_K = the served build.
 # ptxas peaks at ~28 GB of RAM with it; `make MKFLAGS=` builds the lean engine (~19 GB, up to 4 drafts: -d 4).
 MKFLAGS ?= -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1
-NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC $(MKFLAGS)
+# MK_TYPES: build the matrix kernels for these weight types only (default: every type), e.g. for one model
+#   make MK_TYPES="Q4_K Q5_K Q6_K IQ4_XS Q5_1"   (Q6_K and IQ4_XS always; Q4_K for MK_MTP_Q4 / MK_DRAFT_Q4, the defaults)
+# Less ptxas time and RAM; a GGUF with another type is refused at load. Rebuild from clean when it changes (make clean).
+MK_TYPES ?=
+MK_TYPES_ALL = Q4_K Q5_K Q6_K Q8_0 IQ4_XS IQ4_NL Q3_K IQ3_S Q5_1
+ifneq ($(filter-out $(MK_TYPES_ALL),$(MK_TYPES)),)
+$(error MK_TYPES: unknown $(filter-out $(MK_TYPES_ALL),$(MK_TYPES)) (known: $(MK_TYPES_ALL)))
+endif
+MK_TYDEFS = $(if $(strip $(MK_TYPES)),-DMK_TYPESET $(foreach t,$(MK_TYPES),-DMK_TY_$(subst Q4_K,Q4K,$(subst Q5_K,Q5K,$(subst Q6_K,Q6K,$(subst Q3_K,Q3K,$(subst IQ4_XS,IQ4XS,$(subst IQ4_NL,IQ4NL,$(subst IQ3_S,IQ3S,$(t))))))))=1))
+NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC $(MKFLAGS) $(MK_TYDEFS)
 # Most of the build is ptxas on the megakernel (one thread, ~25 GB of heap). It runs ~20% faster when glibc's malloc asks
 # for transparent huge pages, which this tunable does (glibc 2.35+; nothing changes where THP is off). Same machine code.
 export GLIBC_TUNABLES ?= glibc.malloc.hugetlb=1

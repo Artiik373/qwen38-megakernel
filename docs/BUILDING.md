@@ -82,6 +82,11 @@ Build settings:
   int8 tensor cores, up to 7 drafts, the fragment-ordered Q6_K layout, the split barrier before the DeltaNet core).
 - **The lean engine:** `make MKFLAGS=`. It verifies at most 5 rows (4 drafts) with dp4a GEMVs and needs less RAM to
   compile; run it with `MK_DRAFT=4` (the launchers default to 7).
+- **One model's types only:** `make MK_TYPES="Q4_K Q5_K Q6_K IQ4_XS Q5_1"` builds the matrix kernels for those weight
+  types alone (Q6_K and IQ4_XS are always needed; Q4_K for the default `MK_MTP_Q4` / `MK_DRAFT_Q4` copies). For
+  Qwen3.8-27B-18600-NIKI-Q5_K_M that set gives ~65% of the full build's PTX, so ptxas needs less time and RAM; a GGUF
+  with another type (Kiwen's Q8_0, UD's Q3_K / IQ3_S / IQ4_NL) is then refused at load. Delete `qwen38_mk.o` (or
+  `make clean`) when the set changes.
 - **Architecture:** `make` asks `nvidia-smi` for the first GPU's compute capability (sm_86 if it is missing); override
   it with `ARCH=sm_89` or similar.
 - **Huge pages:** the Makefile sets `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, which lets ptxas's heap use transparent

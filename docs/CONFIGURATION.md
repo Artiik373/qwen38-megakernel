@@ -422,6 +422,8 @@ These switch single decode kernels back to an earlier form, for A/B measurements
 | `MK_K1` | `1` | `0`: DeltaNet input projection deals its alpha / beta work the earlier way | same | earlier path | e374f27, 2026-10-15 |
 | `MK_K2` | `1` | `0`: the split-K residual combine loads its partial sums token by token (K1 + K2 together: decode +0.98..+1.58%, 2026-10-15) | same | earlier path | e374f27, 2026-10-15 |
 | `MK_K6` | `4` | Q8_0 k / v tiles of the attention projection, bits: `4` each tile as two 8-row items (88.5 to 78.0 us per call); `2` items spread over blocks (projection faster, attention slower); `1` K-split of the tiles (no gain; KL 0.00115 vs 0.00119) (2026-10-15) | same; bit 1 changes | served (`4`) | 38d0c26, 2026-10-15 |
+| `MK_K9` | `1` | `0`: the DeltaNet input projection splits its qkv / z tiles over the blocks by tile count, the earlier way; `1` by bytes (a Q6_K z tile is 1.19x a Q5_K qkv tile). Alone within noise; with `MK_WPF=2048` +0.3..0.5% over WPF alone (NIKI Q5_K_M, 2026-10-29) | same | served (`1`) | 2026-10-29 |
+| `MK_WPF` | `2048` | bytes, `0` off: each warp of the wv projection phases (DeltaNet in, attention q / k / v, FFN gate / up, out / ffn_down) L2-prefetches the first N bytes of its first tile before the activation fill or the C1 wait, so DRAM streams during the fill. 2048 with K9: decode +0.9..1.8% on three prompts, T=8 dn_proj 99.0 to 96.3 us, ffn_down 243.2 to 239.7 us; 8192 less (ffn_down 241.3); greedy cycles / acceptance identical (NIKI Q5_K_M, preset F, 2026-10-29) | same | served (`2048`) | 2026-10-29 |
 
 ### Parallel slots (`--agents`)
 
