@@ -4612,7 +4612,7 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
 // row, the last prompt row) are drawn from p_i.  tg then drives the greedy acceptance logic of
 // main_control unchanged.  cand: the rows' candidates (cB.cand, here the shared-memory copy lm_head leaves at
 // SM_CAND), dq: the drafts' proposals (cB.dq, staged at SM_DQ): single-thread code, so every load is latency.
-__device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
+__device__ __forceinline__ void sample_targets(const Launch & P, int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
     const Ctl * c = cB.ctl;
     const unsigned long long n = (unsigned long long) c->n;
     float p[TOPK_MAX];
@@ -4662,6 +4662,21 @@ __device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const 
         tg[i] = cand_draw(cd, p, K, -1, urand(P.seed, 2 * (n + i) + 1));
         return;
     }
+}
+
+// sample_targets out of line, the launch's sampling fields as values: its p / r arrays (dynamically indexed, 256 B of
+// local memory) get a frame of their own beside the main pass's call chain, and a caller's Launch copy (a lane's) none
+__device__ __noinline__ void sample_targets_ol(int mode, int top_k, float temp, float top_p, float min_p,
+                                               unsigned long long seed, int T, int tl, int * tg, const float2 * cand,
+                                               const float2 * dq) {
+    Launch S{}; // (the fields sample_targets and cand_probs read)
+    S.mode = mode;
+    S.top_k = top_k;
+    S.temp = temp;
+    S.top_p = top_p;
+    S.min_p = min_p;
+    S.seed = seed;
+    sample_targets(S, T, tl, tg, cand, dq);
 }
 
 // ---- main-model control (single thread) ----
@@ -4847,7 +4862,8 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         int tg[MAXT];
         for (int i = 0; i < tl; i++) tg[i] = s_tok[i];
         if (sampling) // lm_head left the candidates at SM_CAND and the drafts' q' at SM_DQ
-            sample_targets(P, Tr, tl, tg, reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
+            sample_targets_ol(P.mode, P.top_k, P.temp, P.top_p, P.min_p, P.seed, Tr, tl, tg,
+                              reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
         for (int i = 0; i < tl; i++) cB.ctl->tgt[i] = tg[i];
         main_control(P.mode, P.last, Tr, P.score ? s_tok + T - 1 : tg, pen, !P.score);
         __threadfence();
@@ -5303,7 +5319,8 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
                 const int T = Q.T, r0 = P.ln[i].r0;
                 s_view = view_main(P.ln[i].lane);
                 int tg[MAXT];
-                if (Q.temp > 0.f) sample_targets(Q, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
+                if (Q.temp > 0.f)
+                    sample_targets_ol(Q.mode, Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
                 else if (smp)
                     for (int t = 0; t < T; t++) tg[t] = cand_argmax(cand + (r0 + t) * TOPK_MAX);
                 else
@@ -5325,7 +5342,8 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
             const int T = Q.T, r0 = P.ln[i].r0;
             s_view = view_main(P.ln[i].lane);
             int tg[MAXT];
-            if (Q.temp > 0.f) sample_targets(Q, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
+            if (Q.temp > 0.f)
+                sample_targets_ol(Q.mode, Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
             else if (smp)
                 for (int t = 0; t < T; t++) tg[t] = cand_argmax(cand + (r0 + t) * TOPK_MAX);
             else
