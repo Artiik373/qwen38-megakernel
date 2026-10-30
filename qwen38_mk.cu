@@ -522,6 +522,18 @@ __device__ __forceinline__ int rt_lane(const RowTab & rt, int t, int & r0) {
         }
     return ln;
 }
+// a batched launch's row table, built at each call that takes it (held across the layer loop, its fields stayed live)
+__device__ __forceinline__ RowTab row_tab(const Launch & P) {
+    RowTab rt;
+    rt.nl = P.nl;
+#pragma unroll
+    for (int i = 0; i < NSEQ; i++) {
+        rt.lane[i] = (signed char) (i < P.nl ? P.ln[i].lane : 0);
+        rt.T[i] = (signed char) (i < P.nl ? P.ln[i].T : 0);
+        rt.r0[i] = (signed char) (i < P.nl ? P.ln[i].r0 : 0);
+    }
+    return rt;
+}
 
 // lane i of a batched launch as a solo decode launch of its own (its rows, drafts and sampling)
 __device__ __forceinline__ Launch lane_launch(const Launch & P, int i) {
@@ -5232,15 +5244,7 @@ template <int RT>
 __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) {
     uint8_t * const sm = smem;
     constexpr bool CK = RT > MAXT;
-    RowTab rt;
-    rt.nl = P.nl;
-#pragma unroll
-    for (int i = 0; i < NSEQ; i++) {
-        rt.lane[i] = (signed char) (i < P.nl ? P.ln[i].lane : 0);
-        rt.T[i] = (signed char) (i < P.nl ? P.ln[i].T : 0);
-        rt.r0[i] = (signed char) (i < P.nl ? P.ln[i].r0 : 0);
-    }
-    embed_prologue<RT, true>(rt);
+    embed_prologue<RT, true>(row_tab(P));
     gsync(epoch, PH_EMBED);
     int dl = 0;
     for (int L = 0; L < NL; L++) {
@@ -5275,10 +5279,10 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
             gsync(epoch, PH_RESID_O);
         } else {
 #if MK_PAR_WIDE
-            if constexpr (CK) dn_proj_ck<RT>(W, dl, rt);
+            if constexpr (CK) dn_proj_ck<RT>(W, dl, row_tab(P));
             else
 #endif
-                dn_proj_wv<RT, true>(W, dl, 0, 0, rt);
+                dn_proj_wv<RT, true>(W, dl, 0, 0, row_tab(P));
             gsync(epoch, PH_DN_PROJ);
             for (int it = blockIdx.x; it < P.nl * NVH; it += gridDim.x) {
                 const int i = it / NVH;
