@@ -5575,8 +5575,9 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
                 cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
     #endif
                 // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-                const int dt = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                         (unsigned long long) c->mtp_P + 1 + k)
+                const int dt = Q.spec_smp ? draft_sample_ol(Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed,
+                                                            reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                            cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                           : s_tok[0];
                 c->tok[1 + k] = dt;
                 // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -5590,8 +5591,9 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
     #endif
                 const float f = Q.gate_chain ? chain : conf;
                 // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-                c->tok[1 + k] = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                          (unsigned long long) c->mtp_P + 1 + k)
+                c->tok[1 + k] = Q.spec_smp ? draft_sample_ol(Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed,
+                                                             reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                             cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                            : s_tok[0];
     #endif
                 c->dsmp = Q.spec_smp;
