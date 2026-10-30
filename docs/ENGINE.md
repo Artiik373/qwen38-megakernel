@@ -90,11 +90,12 @@ resampling numbers by its position, a sampled draft's by the position it drafts.
 position drafted again after a rejection before it draws the same number, but that number is independent of
 everything that decided the tokens before it, so the output stays exact (2026-10-17: a CPU replica of the loop,
 `tests/spec_rng_sim.py`, 396k re-drafted positions; the PIT test on 13,401 re-drafted rows of the engine at 7
-drafts). Two opt-in `MK_POLICY` settings were not: with `blk=1` (block verification), which reads every row's number
-and leaves the rows after its cut to the next cycle, the acceptance numbers and the drafts are now keyed by the cycle's
-start position as well (position-only keys made the next cycle reuse numbers conditioned on the last one: biased in
-the replica; with the new keys 72k rows of the engine pass the PIT test); and `chain=2` with sampled drafts runs
-without drop gates (dropping a draft on its own probability selects which drafts get verified: biased).
+drafts). Two opt-in `MK_POLICY` settings were not: `blk=1` (block verification, removed on 2026-10-28: within noise),
+which read every row's number and left the rows after its cut to the next cycle, needed the acceptance numbers and the
+drafts keyed by the cycle's start position as well (position-only keys made the next cycle reuse numbers conditioned on
+the last one: biased in the replica; with those keys 72k rows of the engine passed the PIT test); and `chain=2` with
+sampled drafts runs without drop gates (dropping a draft on its own probability selects which drafts get verified:
+biased).
 
 **unsloth UD-Q4_K_XL** (`Qwen3.8-27B-UD-Q4_K_XL.gguf`, 17.6 GB: Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS per tensor plus a
 few Q3_K, IQ3_S and IQ4_NL) puts its extra bits where the decode spends its time: its FFN gate / up average 5.1 bits
@@ -137,8 +138,8 @@ any of:
 
 `token_embd` can be Q4_K, Q5_K, Q6_K or Q8_0: it stays in mapped pinned host memory (not in VRAM) as stored, and each lookup
 (the decode embed phase, the MTP block's input, the prefill embed kernels) stages the token's row and dequantizes it the
-way ggml does. `output` can be Q6_K or Q8_0 (Q8_0: ~0.3 GB more VRAM; lm_head and the draft head have an instance per
-type). Q8_0 `ssm_alpha` /
+way ggml does. `output` can be Q6_K or Q8_0 (Q8_0: ~0.3 GB more VRAM; lm_head and the draft head switch on the type
+around the row reader). Q8_0 `ssm_alpha` /
 `ssm_beta` (UD) stay int8 with their block scales and the kernels apply the norm weight on the fly; other types (F32,
 BF16, F16, the quantized ones) are dequantized to F32 at load and folded with the norm weight into fp32 rows (the same
 values; `MK_AB_F32=1` forces this path); BF16 is accepted only for these two. The exact re-encodes keep every weight's
@@ -171,11 +172,14 @@ for nothing (from open-jet 09cf51d, 2026-10-28). The next start reads the file f
 The MTP draft block (`blk.64.*`, `nextn.eh_proj`) is the one lossy exception: its matrices stored wider than Q4_K
 (Q5_K, Q6_K, Q8_0: all of them in UD-Q4_K_XL, `eh_proj` / `attn_v` / `ffn_down` in Q4_K_M) are re-quantized to Q4_K at
 load (`ggml_quantize_chunk`, ~2.5 s of CPU for UD-Q4_K_XL, on a background thread during the load), so every MTP pass
-streams less (a Q4_0 MTP block too; with `MK_MTP_Q4=0` Q4_0 is repacked to Q8_0 exactly). Only the drafts change: they
-are verified by the unchanged main model, so greedy output and the sampled output distribution stay exact. When it went
-in (2026-10-12, before wide verify) it saved 107 MiB of VRAM on UD-Q4_K_XL, sped greedy decode up 1.5% and moved
-acceptance by under a point. `MK_MTP_Q4=0` keeps the stored types (`MK_MTP_Q4=ab` loads both and the policy key
-`mtpq=0|1` switches between them, for A/B tests).
+streams less (a Q4_0 MTP block too, and IQ4_NL in builds with more than 4 drafts). Only the drafts change: they are
+verified by the unchanged main model, so greedy output and the sampled output distribution stay exact. When it went in
+(2026-10-12, before wide verify) it saved 107 MiB of VRAM on UD-Q4_K_XL, sped greedy decode up 1.5% and moved
+acceptance by under a point. On the lean build `MK_MTP_Q4=0` keeps the stored types (Q4_0 repacked to Q8_0 exactly;
+`MK_MTP_Q4=ab` loads both and the policy key `mtpq=0|1` switches between them, for A/B tests). Builds with more than 4
+drafts refuse both since 2026-10-28: there every main-layer matrix of those types is in the tensor-core layout, so only
+the MTP block reached their dp4a kernels, which the build no longer compiles (less compile time and memory); a matrix
+of a type those kernels do not read is refused at load.
 
 The MTP layer can come from another file (`--mtp FILE`, `MK_MTP=FILE`; C API `mk_new_mtp`), e.g. the separate
 `mtp-*.gguf` files published for conversions that dropped it: its `blk.64.*` tensors replace the model file's (the

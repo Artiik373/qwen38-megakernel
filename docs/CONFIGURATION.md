@@ -70,7 +70,7 @@ on when the vision projector is found. These are the settings worth knowing:
 | Prefill chunk | `MK_PF_CAP` | (engine) | 2048; the launchers set 1024 above 96k context, `serve.bat` 512 above 240k with your own `MK_KV` | 1024 frees ~0.34 GB of VRAM (2026-10-11) |
 | Thinking off by default | `MK_CHAT_TEMPLATE_KWARGS` | `--chat-template-kwargs` | thinking on | `{"enable_thinking": false}` |
 | Python | `MK_PYTHON` | - | `python3` (Windows: `python`) | a virtual environment with jinja2 |
-| Lean build | `make MKFLAGS=` / `build.ps1 -MkFlags ""` | - | the served build | less RAM to compile (~19 GB instead of up to ~34 GB); at most 4 drafts |
+| Lean build | `make MKFLAGS=` / `build.ps1 -MkFlags ""` | - | the served build | less RAM to compile (~19 GB on 2026-10-17; the served build now peaks at ~21 GB); at most 4 drafts |
 
 Running `server/mk_server.py` directly instead of a launcher: its own defaults are more conservative (port 18080,
 context 32768, 4 drafts, `--kv auto`, exact reuse off, no images unless `--mmproj`). More than 4 drafts needs the q8_0
@@ -365,7 +365,7 @@ on (even `0`). The measurement and test switches are in [their own section](#mea
 |---|---|---|---|---|---|
 | `MK_POLICY` | empty: the defaults | the draft-depth policy as `key=value,...` ([keys](#mk_policy-keys)); the CLI's `--policy` sets it per job | drafts only | option | 74ae97c, 2026-10-11 |
 | `MK_DRAFT_Q4` | `1` | the draft head reads a Q4_K copy of its lm_head rows, built at load (+90 MiB of VRAM, +0.83 s of load); `0`: lm_head itself. Short greedy replies +2.1% tok/s, long context no measurable change (2026-10-17) | drafts only | served | d40a48b, 2026-10-17 (on by default since 8fee261) |
-| `MK_MTP_Q4` | `1` | the MTP layer's matrices stored wider than Q4_K are re-quantized to Q4_K at load (-107 MiB, greedy +1.5%, 2026-10-12); `0`: as stored; `ab`: both copies, the policy key `mtpq` picks one | drafts only | served | 8d4c18b, 2026-10-12 |
+| `MK_MTP_Q4` | `1` | the MTP layer's matrices stored wider than Q4_K are re-quantized to Q4_K at load (-107 MiB, greedy +1.5%, 2026-10-12). Builds with more than 4 drafts always do it (IQ4_NL too) and refuse `0` / `ab` since 2026-10-28: their dp4a kernels no longer carry the types only the MTP layer reached (compile time and memory). On the lean build `0`: as stored; `ab`: both copies, the policy key `mtpq` picks one | drafts only | served | 8d4c18b, 2026-10-12 |
 | `MK_MTP` | unset | the MTP layer from another GGUF of the same model (as `--mtp`; the CLI's and server's options win) | drafts only | option | f334fd0, 2026-10-18 |
 | `MK_NO_MTP` | unset | `1`: no MTP layer, plain decoding at depth 0 (as `--no-mtp`) | drafts only | option | f334fd0, 2026-10-18 |
 | `MK_MTP_KVC` | `1` (builds with more than 4 drafts) | the MTP catch-up rows before the last 5 compute K / V only; `0`: the full pass. +0.9% at 38k, +0.7% at 101.6k (2026-10-14) | same (identical drafts) | served | 455017a, 2026-10-14 |
@@ -388,8 +388,8 @@ keeps its distribution). The defaults were tuned on replayed logs and live A/B r
 | `dctx` | off | (builds with more than 4 drafts) from position N on, at most 4 drafts | f02f8b4, 2026-10-13 |
 | `chain` | `1` | what the gates compare: `1` the running product of the top-1 probabilities, `0` each draft's own top-1 probability, `2` with sampled drafts the product of the drafted tokens' own probabilities (drop gates off) | 74ae97c, 2026-10-11 |
 | `h1` | `1` | when sampling, draft by sampling the MTP head (`0`: its top-1 token) | 74ae97c, 2026-10-11 |
-| `blk` | `0` | (builds with more than 4 drafts) `1`: block verification of sampled drafts (opt-in; within noise live, 2026-10-14) | 455017a, 2026-10-14 |
-| `mtpq` | - | with `MK_MTP_Q4=ab`: `1` the re-quantized MTP layer, `0` the stored one (from the next prefill) | 8d4c18b, 2026-10-12 |
+| `blk` | `0` | (builds with more than 4 drafts) `0` only; `1` (block verification of sampled drafts, opt-in, within noise live on 2026-10-14) was removed on 2026-10-28 and is refused | 455017a, 2026-10-14 |
+| `mtpq` | - | (lean build) with `MK_MTP_Q4=ab`: `1` the re-quantized MTP layer, `0` the stored one (from the next prefill); builds with more than 4 drafts refuse it (2026-10-28) | 8d4c18b, 2026-10-12 |
 | `dq4` | - | with the draft head's Q4_K copy (`MK_DRAFT_Q4`, on by default): `1` the copy, `0` lm_head (from the next launch) | d40a48b, 2026-10-17 |
 | `ng` | `24` | n-gram drafts: when the sequence's last N tokens occurred earlier (prompt or output) and the tokens that followed their latest occurrence start with the MTP's first draft, the next launch verifies up to `-d` of those tokens instead of the MTP drafts; a launch that accepts all of them skips MTP draft steps 2 and up (~3.4 of 31 ms). Solo decoding only (not the batched launches of several agents); sampled output is verified as fixed drafts (distribution unchanged). `0`: off. NIKI, 512 tokens: greedy +12.9% adding docstrings to code, +10.2% renaming variables, the 10 other prompts (code, prose, rewrite, Chinese, SQL, math) within ±1.4%, greedy ids identical; temperature 0.7: +16.5% / +10.5% on the same two, code and prose unchanged | 2026-10-29 |
 
@@ -422,7 +422,7 @@ These switch single decode kernels back to an earlier form, for A/B measurements
 | `MK_DATTN` | `1` | `0`: the earlier, unpipelined decode attention for q8_0 layers (the pipelined one was +18.7% at 101.6k and +7.3% at 38k, 2026-10-12) | same | earlier path | 7c962ed, 2026-10-12 |
 | `MK_K1` | `1` | `0`: DeltaNet input projection deals its alpha / beta work the earlier way | same | earlier path | e374f27, 2026-10-15 |
 | `MK_K2` | `1` | `0`: the split-K residual combine loads its partial sums token by token (K1 + K2 together: decode +0.98..+1.58%, 2026-10-15) | same | earlier path | e374f27, 2026-10-15 |
-| `MK_K6` | `4` | Q8_0 k / v tiles of the attention projection, bits: `4` each tile as two 8-row items (88.5 to 78.0 us per call); `2` items spread over blocks (projection faster, attention slower); `1` K-split of the tiles (no gain; KL 0.00115 vs 0.00119) (2026-10-15) | same; bit 1 changes | served (`4`) | 38d0c26, 2026-10-15 |
+| `MK_K6` | `4` | Q8_0 k / v tiles of the attention projection, bits: `4` each tile as two 8-row items (88.5 to 78.0 us per call); `2` items spread over blocks (projection faster, attention slower) (2026-10-15). Bit `1` (a K-split of the tiles: no gain, KL 0.00115 vs 0.00119) was removed on 2026-10-28 and is refused | same | served (`4`) | 38d0c26, 2026-10-15 |
 | `MK_K9` | `1` | `0`: the DeltaNet input projection splits its qkv / z tiles over the blocks by tile count, the earlier way; `1` by bytes (a Q6_K z tile is 1.19x a Q5_K qkv tile). Alone within noise; with `MK_WPF=2048` +0.3..0.5% over WPF alone (NIKI Q5_K_M, 2026-10-29) | same | served (`1`) | 2026-10-29 |
 | `MK_WPF` | `2048` | bytes, `0` off: each warp of the wv projection phases (DeltaNet in, attention q / k / v, FFN gate / up, out / ffn_down) L2-prefetches the first N bytes of its first tile before the activation fill or the C1 wait, so DRAM streams during the fill. 2048 with K9: decode +0.9..1.8% on three prompts, T=8 dn_proj 99.0 to 96.3 us, ffn_down 243.2 to 239.7 us; 8192 less (ffn_down 241.3); greedy cycles / acceptance identical (NIKI Q5_K_M, preset F, 2026-10-29) | same | served (`2048`) | 2026-10-29 |
 
@@ -483,10 +483,10 @@ MKFLAGS = -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1
 
 - **Served build** (the default): wide verify (`MK_WV=1`: the verify pass on int8 tensor cores), up to 7 drafts
   (`MK_MAXT=8`), every Q6_K matrix on the tensor-core path (`MK_WV_Q6F=1`) and the split DeltaNet barrier (`MK_K5=1`).
-  `MK_C1` and `MK_EGRESS` follow `MK_WV`, so they are on too. ptxas peaked at 28-34 GB of RAM for it
-  ([BUILDING.md](BUILDING.md#requirements)); the Makefile's comment still says ~28 GB.
+  `MK_C1` and `MK_EGRESS` follow `MK_WV`, so they are on too. ptxas peaked at 21.2 GB of RAM for it on
+  Linux (2026-10-28) and at 20.2 GB natively on Windows (2026-10-29; [BUILDING.md](BUILDING.md#requirements)).
 - **Lean build** (`make MKFLAGS=`, `.\build.ps1 -MkFlags ""`): every flag at its default, so the dp4a verify path and
-  at most 4 drafts (run it with `MK_DRAFT=4` / `-d 4`). ptxas needs ~19 GB.
+  at most 4 drafts (run it with `MK_DRAFT=4` / `-d 4`). ptxas needed ~19 GB (2026-10-17).
 
 Both builds give the same output at every draft depth, but not the same output as each other: the tensor-core verify
 sums in another order than the dp4a path. When the wide-verify flags were first served (2026-10-13, 72a58cd, 7 drafts)
@@ -512,7 +512,6 @@ before them at 4 drafts (999fc68). A running server reports its flags in `/props
 | `MK_DA_Q4` | `1` | `1` | low-bit `MK_KV` layers on the pipelined decode attention (q4 budgets were 9.8-18.4% faster at 101.6k than on the earlier kernel, 2026-10-12) | same | served | 6287651, 2026-10-12 |
 | `MK_FD_NOINL` | `0x1c` | `0x1c` | bit mask of the token counts whose ffn_down rows run out of line (T 2-4); inline they spilled and the phase ran 0.17-0.25 ms per pass slower (2026-10-12) | same | served | baf2d52, 2026-10-12 |
 | `MK_K2_TB` | `8` | `8` | tokens per batch of the split-K residual combine (8 beat 4 by 0.5-0.8 us per call at 38k, 2026-10-15) | same | option | e374f27, 2026-10-15 |
-| `MK_K6_S` | `2` | `2` | K-split ways of the Q8_0 tiles when `MK_K6` has bit 1 | changes (with bit 1) | option | 38d0c26, 2026-10-15 |
 | `MK_K6_DEF`, `MK_K8_DEF`, `MK_K8_NT` | `4`, `6`, `4` | same | the defaults of the `MK_K6`, `MK_K8`, `MK_K8_NT` environment variables | - | option | 38d0c26, 2026-10-15 |
 | `MK_GSYNC` | `0` | `0` | the grid barrier's form: `0` upstream's; `1`-`3` flag-broadcast and relaxed-polling variants, measured slower (0.61-0.94 us against 0.51-0.55 us per barrier, 2026-10-15). `MK_K5` needs `0`; the barrier benchmark (`MK_GSB`) runs every form in any build | same | slower | e374f27, 2026-10-15 |
 | `MK_WV_FMK` | `1` | `1` | Q4_K / Q5_K main-pass matrices fragment-ordered; `0`: tile-major whole blocks (decode -5.8% at 0 drafts, no gain at 4, 2026-10-13) | not checked | slower | 408fa84, 2026-10-13 |
@@ -542,7 +541,7 @@ before them at 4 drafts (999fc68). A running server reports its flags in `/props
 | `-Targets` (build.ps1) | `all` | any of `all`, `engine` (DLL + CLI), `vision`, `tools` | fdad907, 2026-10-16 |
 | `GLIBC_TUNABLES` (make, exported) | `glibc.malloc.hugetlb=1` | lets ptxas's malloc use transparent huge pages: the Linux build runs ~20% faster, same machine code (needs THP in `madvise` or `always` mode; glibc 2.35+) | 66ce8cf, 2026-10-17 |
 
-`build.ps1` skips the engine's 20-minute compile when its object is newer than every engine source and was built
+`build.ps1` skips the engine's compile when its object is newer than every engine source and was built
 with the same flags. Make targets: `all` (the default: CLI, engine library, tools, and the vision library when
 llama.cpp's build has libmtmd), `vision`, `tools/vit_check`, `tests/gguf_fuzz`, `clean`. `NVFLAGS`, `VISION_INC`,
 `VISION_LIBS`, `VIT_OBJ` and `VIT_DEF` are the Makefile's internal variables (`VIT_DEF` is `-DMKV_NO_VIT` on CPUs

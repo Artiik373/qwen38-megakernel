@@ -20,6 +20,8 @@ with position keys (tok_pos, the default) fits everywhere, the re-draft class in
 blk=1 with position keys is biased (blk_pos_ng, no gates: p = 4e-10; with the default gates the effect is below what
 1M seeds resolve) and fits with the salted keys; chain=2 with a drop gate is biased (tok_chain2: p = 2e-7;
 tok_chain2_d1: total variation up to 0.07) and fits without drop gates.
+Policy blk=1 (sample_targets_blk, launch_salt) was removed from the engine on 2026-10-28 (within noise); the blk
+configurations stay here as the record of this analysis.
 usage: spec_rng_sim.py [--seeds N] [--configs a,b,..] [--L 12] [--V 8]   (needs scipy; ~20 s per 100k seeds and configuration)"""
 import argparse
 import math

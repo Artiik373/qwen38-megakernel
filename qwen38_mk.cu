@@ -112,6 +112,12 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #if MK_WV_Q6F && MK_MAXT <= 5
 #error "MK_WV_Q6F needs MK_WV=1 and MK_MAXT > 5"
 #endif
+// MK_MAXT > 5 builds: every main-layer matrix of Q4_K, Q5_K, Q8_0, IQ4_NL, IQ4_XS (and Q6_K with MK_WV_Q6F) is in the wv
+// layout, so the T <= 5 dp4a GEMVs (gemv_pairs_any, resid_any, rows16_any) read the hybrid types and the MTP block only.
+// The MTP block is always re-quantised to Q4_K from Q5_K / Q6_K / Q8_0 / Q4_0 / IQ4_NL (MK_MTP_Q4=1), so their dispatch
+// drops Q5_K, Q8_0, IQ4_NL (and Q6_K with MK_WV_Q6F): ~185 k SASS instructions of mk_cycle's tree (ptxas time and
+// memory). The loader refuses any matrix these kernels would not read.
+#define DP4A_NARROW (MK_WV && MK_MAXT > 5)
 // MK_GSYNC (stockfix K4): the grid barrier's form. 0 (default): upstream's (every block's thread 0 red.release-adds one word
 // and ld.acquire-polls that same word). 1: flag broadcast with relaxed polling (arrivals atom.acq_rel-add the count word;
 // the last arriver st.release-writes the generation to a separate "go" line; the others poll go with ld.relaxed and re-read
@@ -178,11 +184,6 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 // the same registers.
 #ifndef MK_K6_LD
 #define MK_K6_LD 1
-#endif
-// MK_K6_S (stock2 K6): K-split ways of the Q8_0 k / v tiles in attn_proj_wv when MK_K6 has bit 1 (not bitwise vs the
-// unsplit tile: the parts are summed in order 0 .. S - 1 by the last arrival; the same for every T)
-#ifndef MK_K6_S
-#define MK_K6_S 2
 #endif
 #ifndef MK_K6_DEF // MK_K6's default (env overrides)
 #define MK_K6_DEF 4
@@ -489,9 +490,9 @@ struct Bufs {
     // stockfix runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
     int k1;          // K1, MK_K1 (default 1): dn_proj_wv deals the alpha / beta items to the warps without a qkv / z tile
     int k2;          // K2, MK_K2 (default 1): resid_wv's last-arrival combine issues MK_K2_TB tokens' partial loads together
-    // stock2: K6 (MK_K6, bits; attn_proj_wv's dealing, uniform per launch): 1 K-split the Q8_0 k / v tiles MK_K6_S ways
-    // (NOT bitwise), 2 deal the phase's items across the blocks (item i -> block i % G) instead of in contiguous runs, 4 split
-    // each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT; takes precedence over 1)
+    // stock2: K6 (MK_K6, bits; attn_proj_wv's dealing, uniform per launch): 2 deal the phase's items across the blocks (item
+    // i -> block i % G) instead of in contiguous runs, 4 split each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT).
+    // (Bit 1, a K-split of those tiles, is gone: no gain, not bitwise; the host refuses it.)
     int k6;
     int k9;  // MK_K9 (default 1): dn_proj_wv deals qkv / z tiles by bytes (k9_tile), exact
     int wpf; // MK_WPF bytes (default 2048): wv phases L2-prefetch each warp's first tile before the activation fill (wv_wpf), exact
@@ -543,11 +544,8 @@ struct Launch {
     // presence / frequency penalty (vLLM's semantics, OpenAI's parameters): the logit of token v is lowered by
     // freq * c(v) + pres * (c(v) > 0), c(v) = how often v occurs in this response's generated tokens before the row's
     // position (Bufs::pcnt: the committed ones; a verify row adds the drafts in its own context). Applied to the main
-    // decode rows and to the MTP draft head before the argmax / top-k; 0 / 0: off (the kernels without the penalty).
+    // decode rows and to the MTP draft head before the argmax / top-k; 0 / 0: off (lm_head skips the penalty code).
     float pres, freq;
-#if MK_MAXT > 5
-    int spec_blk; // sampled drafts: block verification of the verify rows (policy blk=1, sample_targets_blk)
-#endif
     // policy ng: this launch verifies ng host n-gram drafts (MKEngine::Impl::ng_lookup); when it accepts all of them, the
     // MTP draft steps after the first are skipped (the next launch takes n-gram drafts again). 0: MTP drafts
     int ng;
@@ -582,9 +580,6 @@ __device__ __forceinline__ Launch lane_launch(const Launch & P, int i) {
     Q.top_p = l.top_p;
     Q.min_p = l.min_p;
     Q.seed = l.seed;
-#if MK_MAXT > 5
-    Q.spec_blk = P.spec_blk && l.spec_smp;
-#endif
     Q.nl = 0;
     return Q;
 }
@@ -1435,7 +1430,7 @@ __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
     }
 }
 
-// Runtime dispatch on a matrix's type (uniform across the grid). Plain switches: a capturing
+// Runtime dispatch on a matrix's type (uniform across the grid; fewer types with DP4A_NARROW). Plain switches: a capturing
 // lambda would take the address of the caller's locals and push them to local memory.
 // (mk_cycle's stack frame is the deepest call chain incl. the callees' spills: a spilling GEMV instantiation of any
 // type raises the local memory of the whole kernel, ~0.12 MiB per byte. A second out-of-line switch for the newer types
@@ -1444,13 +1439,19 @@ template <int T, int IT, class Out>
 __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Out out) {
     switch (m.type) {
         MK_IF(MK_TY_Q4K, case T_Q4K: gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out); break;)
+#if !DP4A_NARROW
         MK_IF(MK_TY_Q5K, case T_Q5K: gemv_pairs<T, IT, T_Q5K>(m, lo, hi, out); break;)
+#endif
+#if !MK_WV_Q6F
         case T_Q6K: gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out); break;
+#endif
+#if !DP4A_NARROW
         MK_IF(MK_TY_Q8_0, case T_Q8_0: gemv_pairs<T, IT, T_Q8_0>(m, lo, hi, out); break;)
         MK_IF(MK_TY_IQ4NL, case T_IQ4NL: gemv_pairs<T, IT, T_IQ4NL>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_Q5_1, case T_Q5_1: gemv_pairs<T, IT, T_Q5_1>(m, lo, hi, out); break;)
+#endif
         MK_IF(MK_TY_Q3K, case T_Q3K: gemv_pairs<T, IT, T_Q3K>(m, lo, hi, out); break;)
         MK_IF(MK_TY_IQ3S, case T_IQ3S: gemv_pairs<T, IT, T_IQ3S>(m, lo, hi, out); break;)
-        MK_IF(MK_TY_Q5_1, case T_Q5_1: gemv_pairs<T, IT, T_Q5_1>(m, lo, hi, out); break;)
         default: gemv_pairs<T, IT, T_IQ4X>(m, lo, hi, out); break;
     }
 }
@@ -1789,10 +1790,16 @@ template <int T, int IT>
 __device__ __forceinline__ void resid_any(const Mat & W, const QBuf & in, float * x, bool add, const float * wnext, uint8_t * sm) {
     switch (W.type) {
         MK_IF(MK_TY_Q4K, case T_Q4K: resid32<T, IT, T_Q4K>(W, in, x, add, wnext, sm); break;)
+#if !DP4A_NARROW
         MK_IF(MK_TY_Q5K, case T_Q5K: resid32<T, IT, T_Q5K>(W, in, x, add, wnext, sm); break;)
+#endif
+#if !MK_WV_Q6F
         case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm); break;
+#endif
+#if !DP4A_NARROW
         MK_IF(MK_TY_Q8_0, case T_Q8_0: resid32<T, IT, T_Q8_0>(W, in, x, add, wnext, sm); break;)
         MK_IF(MK_TY_IQ4NL, case T_IQ4NL: resid32<T, IT, T_IQ4NL>(W, in, x, add, wnext, sm); break;)
+#endif
         MK_IF(MK_TY_Q3K, case T_Q3K: resid32<T, IT, T_Q3K>(W, in, x, add, wnext, sm); break;)
         MK_IF(MK_TY_IQ3S, case T_IQ3S: resid32<T, IT, T_IQ3S>(W, in, x, add, wnext, sm); break;)
         default: resid32<T, IT, T_IQ4X>(W, in, x, add, wnext, sm); break;
@@ -1884,13 +1891,19 @@ template <int T>
 __device__ __forceinline__ LaneT<T> rows16_any(const Mat & m, int j) {
     switch (m.type) {
         MK_IF(MK_TY_Q4K, case T_Q4K: return rows16<T, T_Q4K>(m, j);)
+#if !DP4A_NARROW
         MK_IF(MK_TY_Q5K, case T_Q5K: return rows16<T, T_Q5K>(m, j);)
+#endif
+#if !MK_WV_Q6F
         case T_Q6K: return rows16<T, T_Q6K>(m, j);
+#endif
+#if !DP4A_NARROW
         MK_IF(MK_TY_Q8_0, case T_Q8_0: return rows16<T, T_Q8_0>(m, j);)
         MK_IF(MK_TY_IQ4NL, case T_IQ4NL: return rows16<T, T_IQ4NL>(m, j);)
+        MK_IF(MK_TY_Q5_1, case T_Q5_1: return rows16<T, T_Q5_1>(m, j);)
+#endif
         MK_IF(MK_TY_Q3K, case T_Q3K: return rows16<T, T_Q3K>(m, j);)
         MK_IF(MK_TY_IQ3S, case T_IQ3S: return rows16<T, T_IQ3S>(m, j);)
-        MK_IF(MK_TY_Q5_1, case T_Q5_1: return rows16<T, T_Q5_1>(m, j);)
         default: return rows16<T, T_IQ4X>(m, j);
     }
 }
@@ -4396,7 +4409,7 @@ static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + MK_MAX_GRID * 8 <= SM_M
 // every logit of each row in cB.logits (scoring).  LSE (TL == 1): also the log-sum-exp of the row's
 // true logits; the last block leaves misc[LM_LSE] = lse and misc[LM_BEST] = the best true logit.
 // Draft rows: s_tok and the TOPK ids are token ids (mapped through cW.draft_ids).
-// PEN: presence / frequency penalty (Launch::pres / freq) on the true logits, the occurrences of a token = its count in
+// pen: presence / frequency penalty (Launch::pres / freq) on the true logits, the occurrences of a token = its count in
 // cB.pcnt plus its occurrences in ctl->tok[1 .. nx0 + t] (the drafts in row t's context; nx0: the drafts before row 0).
 // Every value is then the true logit minus the penalty (correctly rounded, no contraction: the same in any T).
 // misc() slots ([LM_WLSE, +2 * NW): per-warp lse), above the argmax lists [16, 16 + 2 NW MAXT) and s_last (LM_LAST)
@@ -4407,11 +4420,13 @@ constexpr int DQ4_RB = D / 256 * 144; // MK_DRAFT_Q4: bytes of one Q4_K lm_head 
 __device__ __forceinline__ float pen_logit(float a, float sc, int c, float pres, float freq) {
     return __fsub_rn(__fsub_rn(__fmul_rn(a, sc), __fmul_rn(freq, (float) c)), c > 0 ? pres : 0.f);
 }
-// HT: lm_head's type (output.weight: Q6_K, or Q8_0 in some fine-tunes); lm_head<...> below picks the instance.
-template <int TL, bool TOPK, bool FULL, bool LSE, bool PEN, int HT>
-__device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 * cand, float pres, float freq, int nx0) {
+// output.weight is Q6_K, or Q8_0 in some fine-tunes: one function per variant reads either, the type switch around the
+// row reader only (the two readers are exclusive branches: the loop needs the registers of one, not of both).
+template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false>
+__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr,
+                                     bool pen = false, float pres = 0.f, float freq = 0.f, int nx0 = 0) {
     static_assert(!LSE || TL == 1, "LSE: one row");
-    static_assert(!(PEN && FULL), "no penalty when scoring");
+    if constexpr (FULL) pen = false; // no penalty when scoring (the FULL instances keep no penalty code)
     uint8_t * const sm = smem;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SX sx = make_sx(sm, U_D);
@@ -4428,11 +4443,12 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
     }
     float lm_m = -INFINITY, lm_s = 0.f; // LSE: running max / sum of exp (warp-uniform)
     const Mat head = draft ? cW.head_d : cW.head;
+    const bool q8 = cW.head.type == T_Q8_0; // (head_d: a row subset of head, the same type)
     // MK_DRAFT_Q4 (draft head only: its calls are the LSE ones): rows [0, nq4) from the Q4_K copy cW.dq4
     int nq4 = 0;
     if constexpr (LSE) nq4 = draft ? cW.dq4_n : 0;
-    int xt[MAXT - 1]; // PEN: the drafts tok[1..MAXT - 1] (only the first nx0 + t count for row t)
-    if constexpr (PEN) {
+    int xt[MAXT - 1]; // pen: the drafts tok[1..MAXT - 1] (only the first nx0 + t count for row t)
+    if (pen) {
 #pragma unroll
         for (int i = 0; i < MAXT - 1; i++) xt[i] = ((volatile Ctl *) cB.ctl)->tok[1 + i];
     }
@@ -4442,7 +4458,7 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
         int p0, p1; // token ids of the rows
         {
             const uint8_t * rp[2];
-            const __half * dp[2]; // Q6_K: the rows' scale (meta) streams
+            const __half * dp[2]; // the rows' scale streams (Q6_K: meta, Q8_0: d)
             p0 = ids ? __ldg(ids + r) : r;
             p1 = ids ? __ldg(ids + r + 1) : r + 1;
             if (LSE && r < nq4) { // (rows come in pairs and nq4 is even)
@@ -4454,11 +4470,15 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
                 rp[1] = head.w + (size_t) p1 * head.rb;
                 dp[0] = head.d + (size_t) p0 * head.nd;
                 dp[1] = head.d + (size_t) p1 * head.nd;
-                rows_t<TL, 5, 2, HT>(rp, dp, sx, a);
+#if MK_TY_Q8_0
+                if (q8) rows_t<TL, 5, 2, T_Q8_0>(rp, dp, sx, a);
+                else
+#endif
+                    rows_t<TL, 5, 2, T_Q6K>(rp, dp, sx, a);
             }
         }
         wsum_acc<TL, 2>(a);
-        if constexpr (PEN) { // a[k][t] <- the penalised true logit
+        if (pen) { // a[k][t] <- the penalised true logit
             const int c0 = __ldcg(cB.pcnt + p0), c1 = __ldcg(cB.pcnt + p1);
 #pragma unroll
             for (int t = 0; t < TL; t++) {
@@ -4473,9 +4493,10 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
                 a[1][t] = pen_logit(a[1][t], m[t], e1, pres, freq);
             }
         }
-        // (below, PEN ? a : a * m = the true logits: PEN's a already are)
+        // (below, pen ? a : a * m = the true logits: pen's a already are. LSE: __fmul_rn keeps v - mx a separate
+        // multiply and subtract, as without the select (no contraction))
         if constexpr (LSE) {
-            const float v0 = PEN ? a[0][0] : a[0][0] * m[0], v1 = PEN ? a[1][0] : a[1][0] * m[0];
+            const float v0 = pen ? a[0][0] : __fmul_rn(a[0][0], m[0]), v1 = pen ? a[1][0] : __fmul_rn(a[1][0], m[0]);
             const float mx = fmaxf(lm_m, fmaxf(v0, v1));
             lm_s = lm_s * __expf(lm_m - mx) + __expf(v0 - mx) + __expf(v1 - mx);
             lm_m = mx;
@@ -4492,8 +4513,8 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
 #pragma unroll
         for (int t = 0; t < TL; t++) {
             if constexpr (TOPK) { // true logits: apply the final RMS norm scale (irrelevant to the argmax)
-                topk_insert(bv[t], bi[t], PEN ? a[0][t] : a[0][t] * m[t], r);
-                topk_insert(bv[t], bi[t], PEN ? a[1][t] : a[1][t] * m[t], r + 1);
+                topk_insert(bv[t], bi[t], pen ? a[0][t] : a[0][t] * m[t], r);
+                topk_insert(bv[t], bi[t], pen ? a[1][t] : a[1][t] * m[t], r + 1);
             } else {
                 if (a[0][t] > bv[t]) { bv[t] = a[0][t]; bi[t] = r; }
                 if (a[1][t] > bv[t]) { bv[t] = a[1][t]; bi[t] = r + 1; }
@@ -4618,7 +4639,7 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
         }
         if (lane == 0) {
             s_tok[warp] = (draft && cW.draft_ids) ? cW.draft_ids[ix] : ix;
-            if (LSE) m[LM_BEST] = PEN ? b : b * m[0];
+            if (LSE) m[LM_BEST] = pen ? b : b * m[0];
             if (!draft && !(b > -INFINITY)) cB.err[0] = 1;
         }
     }
@@ -4626,16 +4647,7 @@ __device__ __noinline__ bool lm_head_t(int t0, bool draft, int * s_tok, float2 *
     __syncthreads();
     return true;
 }
-// lm_head on the file's output.weight type: a thin out-of-line wrapper, so the callers (mk_cycle, mtp_pass) are unchanged
-// and each type's body is its own function (both bodies inline in one function would raise register pressure)
-template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false, bool PEN = false>
-__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr,
-                                     float pres = 0.f, float freq = 0.f, int nx0 = 0) {
-#if MK_TY_Q8_0
-    if (cW.head.type == T_Q8_0) return lm_head_t<TL, TOPK, FULL, LSE, PEN, T_Q8_0>(t0, draft, s_tok, cand, pres, freq, nx0);
-#endif
-    return lm_head_t<TL, TOPK, FULL, LSE, PEN, T_Q6K>(t0, draft, s_tok, cand, pres, freq, nx0);
-}
+
 
 // ---- sampling (single thread) ----
 // counter-based uniform random number in [0, 1)
@@ -4648,11 +4660,7 @@ __device__ __forceinline__ float urand(unsigned long long seed, unsigned long lo
 }
 // Keys: a row's acceptance / residual uniforms by its position, a draft's by its absolute position. The per-token rule
 // uses each once (a position is decided once), and a draft drawn again at a position (after a rejection before it) is
-// independent of everything that decided its prefix: exact as is. Block verification (policy blk=1) reads every row's
-// eta, past its tau too, and the next launch verifies those positions again with drafts drawn again there: keyed by
-// position alone, those draws repeat, conditioned on the previous block (eta_i >= h_i past tau), a bias
-// (tests/spec_rng_sim.py). blk=1 salts its etas and the drafts by the launch's start position (fresh per launch).
-__device__ __forceinline__ unsigned long long launch_salt(unsigned long long n) { return (n + 1) * 0xD6E8FEB86659FD93ull; }
+// independent of everything that decided its prefix: exact as is.
 
 // sampling distribution over one row's candidates (descending), llama.cpp order: top_k, top_p, min_p,
 // temperature; returns the number kept, p[0..K) normalised
@@ -4712,11 +4720,11 @@ __device__ __forceinline__ float dq_prob(const float2 * q, int id) {
 
 // Sampled draft (single thread): q' = the sampling distribution (top_k, top_p, min_p, temp) of the draft
 // head's top logits src; writes q' to dst as (prob, token id) terminated by (0, -1) (dst may alias src) and
-// draws the draft from it with its own random stream, keyed by the draft's absolute position (and salt: blk=1).
-__device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos, unsigned long long salt = 0) {
+// draws the draft from it with its own random stream, keyed by the draft's absolute position.
+__device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos) {
     float p[TOPK_MAX];
     const int K = cand_probs(src, P, p);
-    float x = urand(P.seed ^ 0xD1B54A32D192ED03ull ^ salt, pos);
+    float x = urand(P.seed ^ 0xD1B54A32D192ED03ull, pos);
     int pick = -1, last = __float_as_int(src[0].y);
     for (int j = 0; j < K; j++) {
         const float2 e = src[j];
@@ -4731,84 +4739,6 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
     return pick >= 0 ? pick : last;
 }
 
-#if MK_MAXT > 5
-// Block verification (Sun et al. 2024, arXiv 2403.10444, Alg. 2) of the g = T - 1 sampled drafts (Ctl::dsmp; policy blk=1,
-// Launch::spec_blk). Same output distribution as the per-token rule, at least as many accepted drafts in expectation (it
-// judges the drafts as a block: a draft the token rule rejects can still be kept when the ones before it had weight
-// to spare). Row i verifies draft d_i = tok[i + 1] (target p_i, draft distribution q_i). Weights w_0 = 1, w_i = min(1,
-// w_(i-1) p_(i-1)(d_(i-1)) / q_(i-1)(d_(i-1))); h_i = r_i / (r_i + 1 - w_i) with r_i = sum_x max(0, w_i p_i(x) - q_i(x))
-// for i < g, h_g = w_g; tau = the largest i with eta_i < h_i (0 if none; eta_i = row i - 1's acceptance uniform).
-// Rows < tau keep their drafts; row tau draws from max(0, w_tau p_tau - q_tau) (tau < g; never d_tau, see notes/
-// agent_mtp.md) or from p_g (tau = g). A later row is drawn fresh from its p only while every row before it emitted its
-// draft (main_control then reads it; its prefix is the drafts, so its p is the target conditional): a fallback only.
-// Single thread (the last lm_head block's thread 0), out of line, one pass over the rows with the caller's probability
-// array p (no arrays of its own: a local array here raised mk_cycle's cumulative stack 1104 -> 1360 B, ~31 MiB of VRAM).
-// tau is found in the same forward pass (the last i with eta_i < h_i); the residual is drawn in two passes over row tau.
-__device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl, int * tg, const float2 * cand,
-                                                const float2 * dq, float (&p)[TOPK_MAX]) {
-    const Ctl * c = cB.ctl;
-    const unsigned long long n = (unsigned long long) c->n;
-    const unsigned long long es = P.seed ^ launch_salt(n); // the etas: fresh per launch (launch_salt)
-    const int g = T - 1;
-    float w = 1.f, wt = 1.f; // w_i; w_tau
-    int tau = 0;
-    for (int i = 0; i < g; i++) { // row i: h_i (i >= 1) from p_i, q_i and w_i, then w_(i + 1) from the draft d_i
-        const float2 * cd = cand + i * TOPK_MAX;
-        const float2 * q = dq + i * TOPK_MAX;
-        const int K = cand_probs(cd, P, p);
-        if (i >= 1) {
-            float r = 0.f; // (q_i's mass outside p_i's candidates adds nothing: max(0, 0 - q) = 0)
-            for (int j = 0; j < K; j++) r += fmaxf(0.f, w * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
-            const float den = r + 1.f - w;
-            const float h = den > 0.f ? r / den : 1.f;
-            if (urand(es, 2 * (n + i - 1)) < h) {
-                tau = i;
-                wt = w;
-            }
-        }
-        const int d = c->tok[i + 1];
-        float pd = 0.f;
-        for (int j = 0; j < K; j++)
-            if (__float_as_int(cd[j].y) == d) pd += p[j];
-        const float qd = dq_prob(q, d);
-        w = qd > 0.f ? fminf(w * pd / qd, 1.f) : 0.f;
-    }
-    if (urand(es, 2 * (n + g - 1)) < w) { // h_g = w_g
-        tau = g;
-        wt = w;
-    }
-    for (int i = 0; i < tau; i++) tg[i] = c->tok[i + 1];
-    {
-        const float2 * cd = cand + tau * TOPK_MAX;
-        const int K = cand_probs(cd, P, p);
-        const float u = urand(P.seed, 2 * (n + tau) + 1);
-        const float2 * q = dq + tau * TOPK_MAX;
-        float rs = 0.f;
-        if (tau < g)
-            for (int j = 0; j < K; j++) rs += fmaxf(0.f, wt * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
-        if (!(rs > 0.f)) { // tau = g: p_g; else rounding only
-            tg[tau] = cand_draw(cd, p, K, -1, u);
-        } else {
-            float x = u * rs;
-            int pick = -1;
-            for (int j = 0; j < K; j++) {
-                const float rj = fmaxf(0.f, wt * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
-                if (rj <= 0.f) continue;
-                pick = __float_as_int(cd[j].y);
-                x -= rj;
-                if (x < 0.f) break;
-            }
-            tg[tau] = pick;
-        }
-    }
-    for (int i = tau + 1; i < tl && tg[i - 1] == c->tok[i]; i++) {
-        const float2 * cd = cand + i * TOPK_MAX;
-        const int K = cand_probs(cd, P, p);
-        tg[i] = cand_draw(cd, p, K, -1, urand(P.seed, 2 * (n + i) + 1));
-    }
-}
-#endif
-
 // Sampled targets for the verified rows.  Point-mass drafts (argmax of the MTP): draft token d at row
 // i is accepted with probability p_i(d); on rejection the row's token is drawn from p_i without d.
 // Sampled drafts (Ctl::dsmp, d ~ q'_i): accepted with probability min(1, p_i(d) / q'_i(d)); on
@@ -4819,17 +4749,8 @@ __device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl,
 // SM_CAND), dq: the drafts' proposals (cB.dq, staged at SM_DQ): single-thread code, so every load is latency.
 __device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
     const Ctl * c = cB.ctl;
-#if MK_MAXT > 5
-    float p[TOPK_MAX];
-    if (P.spec_blk && P.mode == MODE_DECODE && c->dsmp && T >= 2 && tl == T) {
-        sample_targets_blk(P, T, tl, tg, cand, dq, p);
-        return;
-    }
-    const unsigned long long n = (unsigned long long) c->n;
-#else
     const unsigned long long n = (unsigned long long) c->n;
     float p[TOPK_MAX];
-#endif
     for (int i = 0; i < tl; i++) {
         const float2 * cd = cand + i * TOPK_MAX;
         const int K = cand_probs(cd, P, p);
@@ -5045,13 +4966,11 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     constexpr int Tr = T;
 #endif
     if (P.mode == MODE_DECODE || P.score) {
-        if (sampling) am_last = pen ? lm_head<T, true, false, false, true>(0, false, sm, s_tok, nullptr, P.pres, P.freq, 0)
-                                    : lm_head<T, true>(0, false, sm, s_tok);
+        if (sampling) am_last = lm_head<T, true>(0, false, sm, s_tok, nullptr, pen, P.pres, P.freq, 0);
         else if (P.score == 2) {
             if constexpr (T <= 5) am_last = lm_head<T, false, true>(0, false, sm, s_tok);
             else am_last = false;
-        } else am_last = pen ? lm_head<T, false, false, false, true>(0, false, sm, s_tok, nullptr, P.pres, P.freq, 0)
-                             : lm_head<T>(0, false, sm, s_tok);
+        } else am_last = lm_head<T>(0, false, sm, s_tok, nullptr, pen, P.pres, P.freq, 0);
         tl = Tr;
     } else if (P.last) {
         am_last = sampling ? lm_head<1, true>(T - 1, false, sm, s_tok) : lm_head<1>(T - 1, false, sm, s_tok);
@@ -5144,10 +5063,8 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
         float2 * const tl = cB.dq + k * TOPK_MAX;
         // presence / frequency penalty: draft k + 1 has the committed tokens and drafts 1..k in its context
         const bool pen = P.pres != 0.f || P.freq != 0.f;
-        const bool lastb = P.spec_smp ? (pen ? lm_head<1, true, false, true, true>(R - 1, true, sm, s_tok, tl, P.pres, P.freq, k)
-                                             : lm_head<1, true, false, true>(R - 1, true, sm, s_tok, tl))
-                                      : (pen ? lm_head<1, false, false, true, true>(R - 1, true, sm, s_tok, nullptr, P.pres, P.freq, k)
-                                             : lm_head<1, false, false, true>(R - 1, true, sm, s_tok));
+        const bool lastb = P.spec_smp ? lm_head<1, true, false, true>(R - 1, true, sm, s_tok, tl, pen, P.pres, P.freq, k)
+                                      : lm_head<1, false, false, true>(R - 1, true, sm, s_tok, nullptr, pen, P.pres, P.freq, k);
 #endif
         if (lastb && threadIdx.x == 0) {
             Ctl * c = cB.ctl;
@@ -5159,7 +5076,7 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
 #endif
             // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
             const int dt = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                     (unsigned long long) c->mtp_P + 1 + k, P.spec_blk ? launch_salt(c->mtp_P) : 0ull)
+                                                     (unsigned long long) c->mtp_P + 1 + k)
                                       : s_tok[0];
             c->tok[1 + k] = dt;
             // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -5744,10 +5661,8 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
             float2 * const tl = cB.dq + k * TOPK_MAX;
             // presence / frequency penalty: draft k + 1 has the committed tokens and drafts 1..k in its context
             const bool pen = Q.pres != 0.f || Q.freq != 0.f;
-            const bool lastb = Q.spec_smp ? (pen ? lm_head<1, true, false, true, true>(0, true, sm, s_tok, tl, Q.pres, Q.freq, k)
-                                                 : lm_head<1, true, false, true>(0, true, sm, s_tok, tl))
-                                          : (pen ? lm_head<1, false, false, true, true>(0, true, sm, s_tok, nullptr, Q.pres, Q.freq, k)
-                                                 : lm_head<1, false, false, true>(0, true, sm, s_tok));
+            const bool lastb = Q.spec_smp ? lm_head<1, true, false, true>(0, true, sm, s_tok, tl, pen, Q.pres, Q.freq, k)
+                                          : lm_head<1, false, false, true>(0, true, sm, s_tok, nullptr, pen, Q.pres, Q.freq, k);
     #endif
             if (lastb && threadIdx.x == 0) {
                 Ctl * c = cB.ctl;
@@ -5759,7 +5674,7 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
     #endif
                 // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
                 const int dt = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                         (unsigned long long) c->mtp_P + 1 + k, Q.spec_blk ? launch_salt(c->mtp_P) : 0ull)
+                                                         (unsigned long long) c->mtp_P + 1 + k)
                                           : s_tok[0];
                 c->tok[1 + k] = dt;
                 // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -6468,9 +6383,6 @@ struct MKEngine::Impl {
 #endif
         int gate_chain = 1;
         int h1 = 1; // sampling: sampled drafts (Launch::spec_smp)
-#if MK_MAXT > 5
-        int blk = 0; // sampled drafts: block verification (Launch::spec_blk)
-#endif
         // ng = N (0: off): when the sequence's last N tokens occurred before and the tokens after their latest earlier
         // occurrence start with the MTP's first draft, verify those tokens instead of the MTP drafts (MKEngine::Impl::
         // step_live). 24: +10..13% on edit / rename tasks, the other 10 prompts within noise (NIKI, greedy, 2026-10-29)
@@ -7335,6 +7247,7 @@ struct MKEngine::Impl {
     // imatrix). Lossy, but only the drafts can change: they are verified by the exact main model, so the output (greedy
     // ids, the sampled distribution) is unchanged and only acceptance moves. Each MTP pass streams ~0.1 GB less.
     // 0 off, 1 on (default), ab: both copies on the device and the policy key mtpq=0|1 picks one (A/B tests).
+    // DP4A_NARROW builds: always on, IQ4_NL too (their dp4a kernels read none of these types; 0 / ab are refused).
     int mtp_q4 = 1;
     bool req_q4 = false; // want(): re-quantise the current tensor to Q4_K (set while the MTP block loads)
     int n_req = 0;
@@ -7403,7 +7316,9 @@ struct MKEngine::Impl {
             ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), out + (size_t) r * rs_to, 0, 1, K, nullptr); // lossy by design (mtp_q4)
         });
     }
-    static bool requant_type(uint32_t t) { return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0; }
+    static bool requant_type(uint32_t t) {
+        return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0 || (DP4A_NARROW && t == gguf::IQ4_NL);
+    }
     // The MTP block's re-quantisation (~2.5 s of CPU on UD-Q4_K_XL) runs on a background thread from early in the load
     // (rq_start; MK_LOAD_RQBG=0: inline as before); want() takes its results. Same rows, same calls, same bytes.
     std::map<std::string, std::vector<uint8_t>> rq_res;
@@ -8063,9 +7978,15 @@ struct MKEngine::Impl {
             if (!mk_built(got)) throw std::runtime_error(name + " is " + tname(got) + ": this build has no kernels for it (make MK_TYPES)");
         };
         if (const char * e = getenv("MK_MTP_Q4")) {
+#if DP4A_NARROW
+            if (strcmp(e, "1"))
+                throw std::runtime_error(std::string("MK_MTP_Q4=") + e + " was removed from this build: the MTP block is always re-quantised to "
+                                         "Q4_K (MK_MTP_Q4=0 / ab and the policy key mtpq: builds with MK_MAXT 5 only)");
+#else
             if (!strcmp(e, "ab")) mtp_q4 = 2;
             else if (!strcmp(e, "0") || !strcmp(e, "1")) mtp_q4 = e[0] - '0';
             else throw std::runtime_error("MK_MTP_Q4: 0, 1 or ab");
+#endif
         }
         if (const char * e = getenv("MK_DRAFT_Q4")) {
             if (strcmp(e, "0") && strcmp(e, "1")) throw std::runtime_error("MK_DRAFT_Q4: 0 or 1");
@@ -8213,9 +8134,41 @@ struct MKEngine::Impl {
             hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
             hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
         }
+#if DP4A_NARROW
+        // Every matrix outside the wv layout must be of a type this build's dp4a dispatch keeps: main layers a hybrid type
+        // (Q3_K / IQ3_S; Q6_K without MK_WV_Q6F: wv.cuh gemv_pairs_dp), the MTP block (solo and batched passes: gemv_pairs_any,
+        // resid_any, rows16_any) after its re-quantisation also Q4_K / IQ4_XS. The loader above guarantees it for every file
+        // it accepts; anything else is refused here rather than mis-read.
+        {
+            auto dp4a_need = [&](const std::string & name, const Mat & m, bool mtp) {
+                const int t = m.type;
+                if (m.fm || t == T_Q3K || t == T_IQ3S || (!MK_WV_Q6F && t == T_Q6K) || (mtp && (t == T_Q4K || t == T_IQ4X))) return;
+                throw std::runtime_error(name + " is " + tname(t) + (mtp ? " in the MTP block" : " outside the wv layout") +
+                                         ": this build's dp4a kernels do not read it");
+            };
+            for (int i = 0; i < (has_mtp ? NLA : NL); i++) {
+                const LayerW & L = hw.L[i];
+                auto chk = [&](const char * r, const Mat & m) { dp4a_need(blk(i, r), m, i == NL); };
+                if (L.attn) {
+                    chk("attn_q.weight", L.q);
+                    chk("attn_k.weight", L.k);
+                    chk("attn_v.weight", L.v);
+                    chk("attn_output.weight", L.o);
+                } else {
+                    chk("attn_qkv.weight", L.qkv);
+                    chk("attn_gate.weight", L.gate);
+                    chk("ssm_out.weight", L.sout);
+                }
+                chk("ffn_gate.weight", L.fg);
+                chk("ffn_up.weight", L.fu);
+                chk("ffn_down.weight", L.fd);
+            }
+            if (has_mtp) dp4a_need(blk(NL, "nextn.eh_proj.weight"), hw.eh, true);
+        }
+#endif
         hw.onorm = up_f32("output_norm.weight", D);
         hw.head = up_mat("output.weight", D, VOCAB);
-        // Q8_0: lm_head_t<.., T_Q8_0> (some fine-tunes; ~0.3 GB more than Q6_K)
+        // Q8_0: some fine-tunes (~0.3 GB more than Q6_K); lm_head reads either type (Q8_0 in builds with its kernels)
         if ((hw.head.type != T_Q6K && hw.head.type != T_Q8_0) || !mk_built(hw.head.type))
             throw std::runtime_error("output.weight is " + tname(hw.head.type) + ", the kernel needs Q6_K or Q8_0 (see README: the GGUF)");
         mem_mark("weights: eh, norms, lm_head");
@@ -8323,8 +8276,8 @@ struct MKEngine::Impl {
         if (n_nat)
             fprintf(stderr, "[mk] %d Q3_K / IQ3_S tensors repacked to their native layouts in %.1f s (exact, checked per row)\n", n_nat, nat_s);
         if (n_req)
-            fprintf(stderr, "[mk] MTP block: %d matrices re-quantised to Q4_K in %.1f s (drafts only; MK_MTP_Q4=0: as stored%s)\n",
-                    n_req, req_s, mtp_q4 == 2 ? "; ab: both copies, policy mtpq=0|1" : "");
+            fprintf(stderr, "[mk] MTP block: %d matrices re-quantised to Q4_K in %.1f s (drafts only%s)\n", n_req, req_s,
+                    DP4A_NARROW ? "" : mtp_q4 == 2 ? "; MK_MTP_Q4=0: as stored; ab: both copies, policy mtpq=0|1" : "; MK_MTP_Q4=0: as stored");
 
         hb.x = dalloc<float>(RMAX * D);
         hb.xm = dalloc<float>(RMAX * D);
@@ -8349,15 +8302,15 @@ struct MKEngine::Impl {
         hb.wpf = getenv("MK_WPF") ? std::max(0, atoi(getenv("MK_WPF"))) : 2048;
         fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), gsync form %d, K9 %d, WPF %d B\n", hb.k1, hb.k2, MK_K2_TB,
                 MK_GSYNC, hb.k9, hb.wpf);
-        // stock2 switches (notes/agent_stock2.md): K6 MK_K6 (bits: 1 K-split of the Q8_0 k / v tiles, NOT bitwise; 2 dealing
-        // across blocks, exact; 4 8-row halves of the Q8_0 k / v tiles, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second
-        // stream, 2 pk_norm_quant reads x once,
+        // stock2 switches (notes/agent_stock2.md): K6 MK_K6 (bits: 2 dealing across blocks, exact; 4 8-row halves of the Q8_0
+        // k / v tiles, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second stream, 2 pk_norm_quant reads x once,
         // 4 pk_dn_prep MK_K8_NT tokens per block); compile-time K7 (state layout), K6_LD (Q8_0 tile loads)
         hb.k6 = getenv("MK_K6") ? atoi(getenv("MK_K6")) : MK_K6_DEF;
+        if (hb.k6 & 1)
+            throw std::runtime_error("MK_K6=" + std::to_string(hb.k6) + ": bit 1 (the K-split of the Q8_0 k / v tiles) was removed; bits 2 and 4 remain (default 4)");
         k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
         if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
-        fprintf(stderr, "[mk] stock2: K6 %d (split %d, ld %d), K7 state layout %d, K8 %d (nt %d)\n", hb.k6, MK_K6_S, MK_K6_LD, MK_K7, k8,
-                k8_nt);
+        fprintf(stderr, "[mk] stock2: K6 %d (ld %d), K7 state layout %d, K8 %d (nt %d)\n", hb.k6, MK_K6_LD, MK_K7, k8, k8_nt);
 #if MK_K5
         fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order (MK_K5=1)\n");
 #endif
@@ -8803,9 +8756,6 @@ struct MKEngine::Impl {
         // pick which drafts get verified by their value (biased output: tests/spec_rng_sim.py); stop gates only
         if (L.gate_chain == 2 && L.spec_smp)
             for (int k = 0; k < MAXT - 1; k++) L.gate_drop[k] = 0.f;
-#if MK_MAXT > 5
-        L.spec_blk = L.spec_smp && pol.blk;
-#endif
         L.ng = mode == MODE_DECODE ? ng_launch : 0;
         if (!score && (pen_pres != 0.f || pen_freq != 0.f)) {
             L.pres = pen_pres;
@@ -10802,7 +10752,7 @@ struct MKEngine::Impl {
 #if MK_PAR_WIDE
         {
             // the RMAX-row pass (wv.cuh "batched passes wider than MAXT rows") runs every main matrix but ffn_gate / ffn_up in
-            // the wv layout, K6 without its K parts (bit 1 alone), and one item per warp in every weight phase
+            // the wv layout, and one item per warp in every weight phase
             std::string why;
             for (int L = 0; L < NL && why.empty(); L++) {
                 const LayerW & W = hw.L[L];
@@ -10810,7 +10760,6 @@ struct MKEngine::Impl {
                 if (!W.attn && !W.sout.fm) why = "a delta-net ssm_out matrix of a type outside the wv layout";
                 if (!W.fd.fm) why = "an ffn_down matrix outside the wv layout";
             }
-            if (why.empty() && (hb.k6 & 1) && !(hb.k6 & 4)) why = "MK_K6 K parts (bit 1 without bit 4)";
             const int G = nsm / WV_S;
             if (why.empty() && ((D / 16 + G - 1) / std::max(G, 1) > NW || (FF / 16 / WV_S + G - 1) / std::max(G, 1) > NW ||
                                 (QKV / 16 + VD / 16 + nsm - 1) / nsm > NW || QG / 16 + 4 * (KVD / 16) > nsm * NW))
@@ -11032,7 +10981,6 @@ struct MKEngine::Impl {
         for (int i = 0; i < L.nl; i++) L.spec_smp |= L.ln[i].spec_smp;
         if (L.gate_chain == 2 && L.spec_smp)
             for (int k = 0; k < MAXT - 1; k++) L.gate_drop[k] = 0.f;
-        L.spec_blk = 0;
         for (int i = 0; i < nl; i++) {
             if (li[i] < 0) continue;
             Lane & l = lanes[ks[i]];
@@ -11126,11 +11074,11 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 
 // "key=value,...": depth=0|1|2 (see Impl::Policy), dmin=N; on-device early stop (Launch::gate_*): drop=F,
 // stop=F (every draft), dropK=F / stopK=F (draft K = 1..4 only), chain=0|1; h1=0|1 (sampled drafts when
-// sampling); mtpq=0|1 (MK_MTP_Q4=ab only: the MTP block as stored / re-quantised to Q4_K; kept until changed);
+// sampling); mtpq=0|1 (MK_MTP_Q4=ab only, MK_MAXT 5 builds: the MTP block as stored / re-quantised to Q4_K; kept until changed);
 // dq4=0|1 (MK_DRAFT_Q4=1 only: the draft head reads lm_head / its Q4_K copy; kept until changed);
 // MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
 // chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);
-// blk=0|1 (sampled drafts: block verification, sample_targets_blk); g7=0|1 (the depth > 5 gates, Impl::Policy);
+// g7=0|1 (the depth > 5 gates, Impl::Policy); blk=0 only (blk=1, block verification of sampled drafts, was removed);
 // ng=N (n-gram drafts after a match of the sequence's last N tokens, 0: off); "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
@@ -11166,9 +11114,15 @@ void MKEngine::set_policy(const std::string & spec) {
         else if (k == "ng") pol.ng = std::stoi(v);
         else if (k == "h1") pol.h1 = std::stoi(v);
 #if MK_MAXT > 5
-        else if (k == "blk") pol.blk = std::stoi(v);
+        else if (k == "blk") {
+            if (std::stoi(v)) throw std::runtime_error("policy blk=" + v + " was removed (block verification of sampled drafts; blk=0 is the only value)");
+        }
 #endif
+#if DP4A_NARROW
+        else if (k == "mtpq") throw std::runtime_error("policy mtpq was removed from this build: the MTP block is always re-quantised to Q4_K");
+#else
         else if (k == "mtpq") p_->set_mtp_q4(std::stoi(v)); // MK_MTP_Q4=ab only; takes effect from the next prefill
+#endif
         else if (k == "dq4") p_->set_draft_q4(std::stoi(v)); // MK_DRAFT_Q4=1 only; from the next launch
         else throw std::runtime_error("policy: unknown key " + k);
     }
