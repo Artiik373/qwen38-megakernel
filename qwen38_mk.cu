@@ -5557,8 +5557,10 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
                 c->dsmp = Q.spec_smp;
                 c->dconf[k] = conf;
                 c->dchain = chain;
-                c->nd_prod = f < Q.gate_drop[k] ? k : k + 1;
-                c->nd_stop = f < Q.gate_stop[k] || f < Q.gate_drop[k];
+                // (the gates are the launch's, lane_launch keeps them: read from P, as a dynamic index into Q would keep
+                // the whole copy in local memory)
+                c->nd_prod = f < P.gate_drop[k] ? k : k + 1;
+                c->nd_stop = f < P.gate_stop[k] || f < P.gate_drop[k];
                 __threadfence();
             }
 
