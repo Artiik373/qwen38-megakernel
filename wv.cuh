@@ -520,8 +520,9 @@ __device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * 
             if (t < T) {
                 const uint2 m0 = xm[t * LDU + ub + (hh < 0 ? 0 : hh)];
                 const uint2 m1 = xm[t * LDU + ub + 1];
-                dx = __half2float(reinterpret_cast<const __half *>(&m0.x)[part]);
-                const int q0 = reinterpret_cast<const short *>(&m0.y)[part], q1 = reinterpret_cast<const short *>(&m1.y)[part];
+                const int sh = 16 * part; // (shifts: a runtime index into &m0 / &m1 would put them in local memory)
+                dx = __half2float(__ushort_as_half((unsigned short) (m0.x >> sh)));
+                const int q0 = (short) (m0.y >> sh), q1 = (short) (m1.y >> sh);
                 qs = hh < 0 ? q0 + q1 : q0;
             }
             v[2 * k] = dx;
@@ -1437,8 +1438,9 @@ __device__ __forceinline__ WvXS wv_fill_ck(const QBuf & q, int u0, int nu, bool 
             if (t < T) {
                 const uint2 m0 = xm[t * LDU + ub + (hh < 0 ? 0 : hh)];
                 const uint2 m1 = xm[t * LDU + ub + 1];
-                dx = __half2float(reinterpret_cast<const __half *>(&m0.x)[part]);
-                const int q0 = reinterpret_cast<const short *>(&m0.y)[part], q1 = reinterpret_cast<const short *>(&m1.y)[part];
+                const int sh = 16 * part; // (as wv_fill: shifts, not a runtime index into &m0 / &m1)
+                dx = __half2float(__ushort_as_half((unsigned short) (m0.x >> sh)));
+                const int q0 = (short) (m0.y >> sh), q1 = (short) (m1.y >> sh);
                 qs = hh < 0 ? q0 + q1 : q0;
             }
             v[2 * k] = dx;
