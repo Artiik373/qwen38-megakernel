@@ -5702,7 +5702,9 @@ __device__ __noinline__ void run_batch(const Launch & P, unsigned & epoch) {
 }
 #endif
 
-__global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) { MK_VIEW_INIT();
+// P is __grid_constant__: the out-of-line callees take it by reference, and a plain parameter whose address is taken is
+// copied to local memory (320 B of the stack frame, which the driver reserves for every thread slot of the GPU)
+__global__ void __launch_bounds__(NT, 1) mk_cycle(const __grid_constant__ Launch P) { MK_VIEW_INIT();
     uint8_t * const sm = smem;
     unsigned epoch = 0;
 #if MK_EGRESS
