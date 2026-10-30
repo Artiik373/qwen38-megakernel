@@ -1555,19 +1555,13 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
 #ifndef MK_FD_NOINL
 #define MK_FD_NOINL 0x1c
 #endif
-// T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spilled 136-188 B into this loop.
+// T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spilled 136-188 B into this loop. The sums go in and out
+// by value (registers): by reference, resid32's a lived in local memory.
+template <int T> struct PairT { float a[2][T]; };
 template <int T, int IT, int TYPE>
-__device__ __noinline__ void half_rows(const Mat W, int row0, const SX s, float (&a)[2][T], int u0) {
-    float b[2][T];
-#pragma unroll
-    for (int k = 0; k < 2; k++)
-#pragma unroll
-        for (int t = 0; t < T; t++) b[k][t] = a[k][t];
-    mrows<T, IT, 2, TYPE>(W, row0, s, b, u0);
-#pragma unroll
-    for (int k = 0; k < 2; k++)
-#pragma unroll
-        for (int t = 0; t < T; t++) a[k][t] = b[k][t];
+__device__ __noinline__ PairT<T> half_rows(const Mat W, int row0, const SX s, PairT<T> b, int u0) {
+    mrows<T, IT, 2, TYPE>(W, row0, s, b.a, u0);
+    return b;
 }
 
 // Output rows (32 consecutive rows per block item) with optional residual add; the new
@@ -1618,9 +1612,10 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
             const int j1 = j0 + gridDim.x;
             fill_xs_part<T, U0>(in, 0, s0);
             if (j0 == blockIdx.x) mark_fill();
-            float a[2][T];
+            PairT<T> p;
+            float (&a)[2][T] = p.a;
             zero_acc<T, 2>(a);
-            half_rows<T, U0 / 32, TYPE>(W, 32 * j0 + 2 * warp, s0, a, 0);
+            p = half_rows<T, U0 / 32, TYPE>(W, 32 * j0 + 2 * warp, s0, p, 0);
 #pragma unroll
             for (int t = 0; t < T; t++) {
                 park[t * NT + threadIdx.x] = a[0][t];
@@ -1628,11 +1623,11 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
             }
             if (j1 < D / 32) {
                 zero_acc<T, 2>(a);
-                half_rows<T, U0 / 32, TYPE>(W, 32 * j1 + 2 * warp, s0, a, 0);
+                p = half_rows<T, U0 / 32, TYPE>(W, 32 * j1 + 2 * warp, s0, p, 0);
             }
             fill_xs_part<T, U1>(in, U0, s1);
             if (j1 < D / 32) {
-                half_rows<T, U1 / 32, TYPE>(W, 32 * j1 + 2 * warp, s1, a, U0);
+                p = half_rows<T, U1 / 32, TYPE>(W, 32 * j1 + 2 * warp, s1, p, U0);
                 epilogue(j1, a);
             }
 #pragma unroll
@@ -1640,16 +1635,17 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
                 a[0][t] = park[t * NT + threadIdx.x];
                 a[1][t] = park[(T + t) * NT + threadIdx.x];
             }
-            half_rows<T, U1 / 32, TYPE>(W, 32 * j0 + 2 * warp, s1, a, U0);
+            p = half_rows<T, U1 / 32, TYPE>(W, 32 * j0 + 2 * warp, s1, p, U0);
             epilogue(j0, a);
         }
     } else {
         const SX sx = make_sx(sm, in.U);
         fill_xs<T>(in, 0, false, sx, s_rs);
         for (int j = blockIdx.x; j < D / 32; j += gridDim.x) {
-            float a[2][T];
+            PairT<T> p;
+            float (&a)[2][T] = p.a;
             zero_acc<T, 2>(a);
-            if constexpr (IT == 17 && ((MK_FD_NOINL >> T) & 1)) half_rows<T, IT, TYPE>(W, 32 * j + 2 * warp, sx, a, 0);
+            if constexpr (IT == 17 && ((MK_FD_NOINL >> T) & 1)) p = half_rows<T, IT, TYPE>(W, 32 * j + 2 * warp, sx, p, 0);
             else mrows<T, IT, 2, TYPE>(W, 32 * j + 2 * warp, sx, a);
             epilogue(j, a);
         }
