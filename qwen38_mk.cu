@@ -1833,14 +1833,16 @@ struct PairOut {
     float * base;
     int stride, ring;
     template <int T> __device__ __forceinline__ void operator()(int r, const float (&a)[2][T]) const {
-        const int lane = threadIdx.x & 31;
+        const int lane = threadIdx.x & 31, t = lane >> 1;
         const float * s_rs = misc(nullptr);
+        // selects, not a store per t (merged into a runtime index into a: gemv_pairs' a went to local memory)
+        float v = 0.f;
 #pragma unroll
-        for (int t = 0; t < T; t++)
-            if ((lane >> 1) == t) {
-                const int row = ring >= 0 ? (ring + t) % CONV_RING : t;
-                base[row * stride + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
-            }
+        for (int k = 0; k < T; k++) v = t == k ? ((lane & 1) ? a[1][k] : a[0][k]) : v;
+        if (t < T) {
+            const int row = ring >= 0 ? (ring + t) % CONV_RING : t;
+            base[row * stride + r + (lane & 1)] = v * s_rs[t];
+        }
     }
 };
 #endif
