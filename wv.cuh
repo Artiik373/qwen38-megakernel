@@ -564,6 +564,24 @@ __device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * 
 #endif
 }
 
+// wv_fill's view (the same addresses) rebuilt from its token stride ldu = US + 2 units, for the out-of-line wv_tile: a
+// WvXS passed by value arrives as generic pointers (generic loads in the K loop), this one derives from smem (LDS)
+template <int T, bool X16>
+__device__ __forceinline__ WvXS wv_xs(int ldu) {
+    using C = WvCfg<T, X16>;
+    const int4 * xa = reinterpret_cast<const int4 *>(smem);
+    const int4 * xb = xa + C::NTOKP * ldu;
+    const uint2 * xm = reinterpret_cast<const uint2 *>(xb + C::NTOKP * ldu);
+    const float4 * md = reinterpret_cast<const float4 *>(xm + T * ldu);
+    const float2 * mx = reinterpret_cast<const float2 *>(md + (ldu - 2) * C::NG * 4);
+#if MK_WV_Q6F
+    const float4 * mx4 = reinterpret_cast<const float4 *>(mx + (ldu - 2) * C::NG * 4);
+    return WvXS{reinterpret_cast<const int8_t *>(xa), reinterpret_cast<const int8_t *>(xb), ldu * 16, md, mx, mx4};
+#else
+    return WvXS{reinterpret_cast<const int8_t *>(xa), reinterpret_cast<const int8_t *>(xb), ldu * 16, md, mx};
+#endif
+}
+
 // one super-block (8 sub-blocks) of the tile from the thread's raw rows r0 (row g) and r1 (row g + 8); sbl = the
 // super-block's index within the shared-memory chunk; xra / xrb = this thread's A / B unit row (+ 8 tq)
 template <int TYPE, int T, bool X16>
@@ -727,8 +745,10 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_q6f(const Mat & m, i
 }
 #endif
 
+// (the activations: wv_fill<T, X16, ldu - 2>'s, rebuilt here by wv_xs)
 template <int TYPE, int T, bool X16, int ROLE = 0> // ROLE: separate instances for MK_WV_OUT's out role (wv_tile_off)
-__device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile(const Mat m, int tile, int sb0, int nsb, const WvXS xs) {
+__device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile(const Mat m, int tile, int sb0, int nsb, int ldu) {
+    const WvXS xs = wv_xs<T, X16>(ldu);
 #if MK_WV_Q6F
     if constexpr (TYPE == T_Q6K) {
         return wv_tile_q6f<T, X16>(m, tile, sb0, nsb, xs);
@@ -764,28 +784,30 @@ __device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile(const Mat m, int tile, 
 #endif
 }
 
+// xs: the phase's wv_fill view (wv_tile gets only its token stride)
 template <int T, bool X16>
 __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
+    const int ldu = xs.ld / 16;
 #if MK_WV_Q6F
     if constexpr (!X16) // FM Q6_K in the q32 phases (m16n8k16 form; the phase's fill was q6)
-        if (m.type == T_Q6K) return wv_tile<T_Q6K, T, false>(m, tile, sb0, nsb, xs);
+        if (m.type == T_Q6K) return wv_tile<T_Q6K, T, false>(m, tile, sb0, nsb, ldu);
 #endif
 #if MK_MAXT > 5
     if constexpr (X16) { // ffn_down: the offset types too
         switch (m.type) {
-            case T_Q6K: return wv_tile<T_Q6K, T, X16>(m, tile, sb0, nsb, xs);
-            case T_Q3K: return wv_tile<T_Q3K, T, X16>(m, tile, sb0, nsb, xs);
-            case T_IQ3S: return wv_tile<T_IQ3S, T, X16>(m, tile, sb0, nsb, xs);
+            case T_Q6K: return wv_tile<T_Q6K, T, X16>(m, tile, sb0, nsb, ldu);
+            case T_Q3K: return wv_tile<T_Q3K, T, X16>(m, tile, sb0, nsb, ldu);
+            case T_IQ3S: return wv_tile<T_IQ3S, T, X16>(m, tile, sb0, nsb, ldu);
             default: break;
         }
     }
 #endif
     switch (m.type) {
-        case T_Q4K: return wv_tile<T_Q4K, T, X16>(m, tile, sb0, nsb, xs);
-        case T_Q5K: return wv_tile<T_Q5K, T, X16>(m, tile, sb0, nsb, xs);
-        case T_IQ4NL: return wv_tile<T_IQ4NL, T, X16>(m, tile, sb0, nsb, xs);
-        case T_Q8_0: return wv_tile<T_Q8_0, T, X16>(m, tile, sb0, nsb, xs);
-        default: return wv_tile<T_IQ4X, T, X16>(m, tile, sb0, nsb, xs);
+        case T_Q4K: return wv_tile<T_Q4K, T, X16>(m, tile, sb0, nsb, ldu);
+        case T_Q5K: return wv_tile<T_Q5K, T, X16>(m, tile, sb0, nsb, ldu);
+        case T_IQ4NL: return wv_tile<T_IQ4NL, T, X16>(m, tile, sb0, nsb, ldu);
+        case T_Q8_0: return wv_tile<T_Q8_0, T, X16>(m, tile, sb0, nsb, ldu);
+        default: return wv_tile<T_IQ4X, T, X16>(m, tile, sb0, nsb, ldu);
     }
 }
 
@@ -795,9 +817,9 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
 template <int T>
 __device__ __forceinline__ WvAcc<WvCfg<T, true>::NG> wv_tile_off(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
     switch (m.type) {
-        case T_Q6K: return wv_tile<T_Q6K, T, true, 1>(m, tile, sb0, nsb, xs);
-        case T_Q3K: return wv_tile<T_Q3K, T, true, 1>(m, tile, sb0, nsb, xs);
-        default: return wv_tile<T_IQ3S, T, true, 1>(m, tile, sb0, nsb, xs);
+        case T_Q6K: return wv_tile<T_Q6K, T, true, 1>(m, tile, sb0, nsb, xs.ld / 16);
+        case T_Q3K: return wv_tile<T_Q3K, T, true, 1>(m, tile, sb0, nsb, xs.ld / 16);
+        default: return wv_tile<T_IQ3S, T, true, 1>(m, tile, sb0, nsb, xs.ld / 16);
     }
 }
 #endif
