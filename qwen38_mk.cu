@@ -567,6 +567,31 @@ struct RowTab {
     int nl;
     signed char lane[NSEQ], T[NSEQ], r0[NSEQ];
 };
+// the lane of row t of a batched pass (-1: a row past the lanes) and the lane's first row; unrolled over NSEQ, so that rt is
+// read at constant indices (a runtime index copies it to local memory)
+__device__ __forceinline__ int rt_lane(const RowTab & rt, int t, int & r0) {
+    int ln = -1;
+    r0 = 0;
+#pragma unroll
+    for (int i = 0; i < NSEQ; i++)
+        if (i < rt.nl && t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) {
+            ln = rt.lane[i];
+            r0 = rt.r0[i];
+        }
+    return ln;
+}
+// a batched launch's row table, built at each call that takes it (held across the layer loop, its fields stayed live)
+__device__ __forceinline__ RowTab row_tab(const Launch & P) {
+    RowTab rt;
+    rt.nl = P.nl;
+#pragma unroll
+    for (int i = 0; i < NSEQ; i++) {
+        rt.lane[i] = (signed char) (i < P.nl ? P.ln[i].lane : 0);
+        rt.T[i] = (signed char) (i < P.nl ? P.ln[i].T : 0);
+        rt.r0[i] = (signed char) (i < P.nl ? P.ln[i].r0 : 0);
+    }
+    return rt;
+}
 
 // lane i of a batched launch as a solo decode launch of its own (its rows, drafts and sampling)
 __device__ __forceinline__ Launch lane_launch(const Launch & P, int i) {
@@ -1637,9 +1662,9 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
         for (int it = blockIdx.x; it < T * NB; it += gridDim.x) {
             const int t = it / NB, s = it - t * NB;
             if (it != (int) blockIdx.x) __syncthreads(); // (the previous item's staged embedding is read)
-            int tok = 0;
-            for (int i = 0; i < rt.nl; i++)
-                if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) tok = ((volatile Ctl *) cBs[view_main(rt.lane[i])].ctl)->tok[t - rt.r0[i]];
+            int r0;
+            const int ln = rt_lane(rt, t, r0);
+            const int tok = ln < 0 ? 0 : ((volatile Ctl *) cBs[view_main(ln)].ctl)->tok[t - r0];
             const int j = EMB_UB * s + warp, e = 32 * j + lane;
             float v;
             if (cW.embd_t == T_Q4K) {
@@ -1659,9 +1684,9 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int tok;
     if constexpr (BAT) {
-        tok = 0;
-        for (int i = 0; i < rt.nl; i++)
-            if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) tok = ((volatile Ctl *) cBs[view_main(rt.lane[i])].ctl)->tok[t - rt.r0[i]];
+        int r0;
+        const int ln = rt_lane(rt, t, r0);
+        tok = ln < 0 ? 0 : ((volatile Ctl *) cBs[view_main(ln)].ctl)->tok[t - r0];
     } else {
         tok = ((volatile Ctl *) cB.ctl)->tok[t];
     }
@@ -1685,19 +1710,13 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
 #ifndef MK_FD_NOINL
 #define MK_FD_NOINL 0x1c
 #endif
-// T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spilled 136-188 B into this loop.
+// T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spilled 136-188 B into this loop. The sums go in and out
+// by value (registers): by reference, resid32's a lived in local memory.
+template <int T> struct PairT { float a[2][T]; };
 template <int T, int IT, int TYPE>
-__device__ __noinline__ void half_rows(const Mat W, int row0, const SX s, float (&a)[2][T], int u0) {
-    float b[2][T];
-#pragma unroll
-    for (int k = 0; k < 2; k++)
-#pragma unroll
-        for (int t = 0; t < T; t++) b[k][t] = a[k][t];
-    mrows<T, IT, 2, TYPE>(W, row0, s, b, u0);
-#pragma unroll
-    for (int k = 0; k < 2; k++)
-#pragma unroll
-        for (int t = 0; t < T; t++) a[k][t] = b[k][t];
+__device__ __noinline__ PairT<T> half_rows(const Mat W, int row0, const SX s, PairT<T> b, int u0) {
+    mrows<T, IT, 2, TYPE>(W, row0, s, b.a, u0);
+    return b;
 }
 
 // Output rows (32 consecutive rows per block item) with optional residual add; the new
@@ -1748,9 +1767,10 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
             const int j1 = j0 + gridDim.x;
             fill_xs_part<T, U0>(in, 0, s0);
             if (j0 == blockIdx.x) mark_fill();
-            float a[2][T];
+            PairT<T> p;
+            float (&a)[2][T] = p.a;
             zero_acc<T, 2>(a);
-            half_rows<T, U0 / 32, TYPE>(W, 32 * j0 + 2 * warp, s0, a, 0);
+            p = half_rows<T, U0 / 32, TYPE>(W, 32 * j0 + 2 * warp, s0, p, 0);
 #pragma unroll
             for (int t = 0; t < T; t++) {
                 park[t * NT + threadIdx.x] = a[0][t];
@@ -1758,11 +1778,11 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
             }
             if (j1 < D / 32) {
                 zero_acc<T, 2>(a);
-                half_rows<T, U0 / 32, TYPE>(W, 32 * j1 + 2 * warp, s0, a, 0);
+                p = half_rows<T, U0 / 32, TYPE>(W, 32 * j1 + 2 * warp, s0, p, 0);
             }
             fill_xs_part<T, U1>(in, U0, s1);
             if (j1 < D / 32) {
-                half_rows<T, U1 / 32, TYPE>(W, 32 * j1 + 2 * warp, s1, a, U0);
+                p = half_rows<T, U1 / 32, TYPE>(W, 32 * j1 + 2 * warp, s1, p, U0);
                 epilogue(j1, a);
             }
 #pragma unroll
@@ -1770,16 +1790,17 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
                 a[0][t] = park[t * NT + threadIdx.x];
                 a[1][t] = park[(T + t) * NT + threadIdx.x];
             }
-            half_rows<T, U1 / 32, TYPE>(W, 32 * j0 + 2 * warp, s1, a, U0);
+            p = half_rows<T, U1 / 32, TYPE>(W, 32 * j0 + 2 * warp, s1, p, U0);
             epilogue(j0, a);
         }
     } else {
         const SX sx = make_sx(sm, in.U);
         fill_xs<T>(in, 0, false, sx, s_rs);
         for (int j = blockIdx.x; j < D / 32; j += gridDim.x) {
-            float a[2][T];
+            PairT<T> p;
+            float (&a)[2][T] = p.a;
             zero_acc<T, 2>(a);
-            if constexpr (IT == 17 && ((MK_FD_NOINL >> T) & 1)) half_rows<T, IT, TYPE>(W, 32 * j + 2 * warp, sx, a, 0);
+            if constexpr (IT == 17 && ((MK_FD_NOINL >> T) & 1)) p = half_rows<T, IT, TYPE>(W, 32 * j + 2 * warp, sx, p, 0);
             else mrows<T, IT, 2, TYPE>(W, 32 * j + 2 * warp, sx, a);
             epilogue(j, a);
         }
@@ -1964,14 +1985,16 @@ struct PairOut {
     float * base;
     int stride, ring;
     template <int T> __device__ __forceinline__ void operator()(int r, const float (&a)[2][T]) const {
-        const int lane = threadIdx.x & 31;
+        const int lane = threadIdx.x & 31, t = lane >> 1;
         const float * s_rs = misc(nullptr);
+        // selects, not a store per t (merged into a runtime index into a: gemv_pairs' a went to local memory)
+        float v = 0.f;
 #pragma unroll
-        for (int t = 0; t < T; t++)
-            if ((lane >> 1) == t) {
-                const int row = ring >= 0 ? (ring + t) % CONV_RING : t;
-                base[row * stride + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
-            }
+        for (int k = 0; k < T; k++) v = t == k ? ((lane & 1) ? a[1][k] : a[0][k]) : v;
+        if (t < T) {
+            const int row = ring >= 0 ? (ring + t) % CONV_RING : t;
+            base[row * stride + r + (lane & 1)] = v * s_rs[t];
+        }
     }
 };
 #endif
@@ -4721,7 +4744,7 @@ __device__ __forceinline__ float dq_prob(const float2 * q, int id) {
 // Sampled draft (single thread): q' = the sampling distribution (top_k, top_p, min_p, temp) of the draft
 // head's top logits src; writes q' to dst as (prob, token id) terminated by (0, -1) (dst may alias src) and
 // draws the draft from it with its own random stream, keyed by the draft's absolute position.
-__device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos) {
+__device__ __forceinline__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos) {
     float p[TOPK_MAX];
     const int K = cand_probs(src, P, p);
     float x = urand(P.seed ^ 0xD1B54A32D192ED03ull, pos);
@@ -4739,6 +4762,20 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
     return pick >= 0 ? pick : last;
 }
 
+// draft_sample out of line, the launch's sampling fields as values (as sample_targets_ol). Inlined into the five
+// mtp_pass<R>, cicc unrolled its candidate loops and kept the 32 p[j] in registers, ptxas spilled them, and the five
+// spill blocks took disjoint slots of the stack frame (5 x 128 B above the MTP chain)
+__device__ __noinline__ int draft_sample_ol(int top_k, float temp, float top_p, float min_p, unsigned long long seed,
+                                            const float2 * src, float2 * dst, unsigned long long pos) {
+    Launch S{}; // (the fields draft_sample and cand_probs read)
+    S.top_k = top_k;
+    S.temp = temp;
+    S.top_p = top_p;
+    S.min_p = min_p;
+    S.seed = seed;
+    return draft_sample(S, src, dst, pos);
+}
+
 // Sampled targets for the verified rows.  Point-mass drafts (argmax of the MTP): draft token d at row
 // i is accepted with probability p_i(d); on rejection the row's token is drawn from p_i without d.
 // Sampled drafts (Ctl::dsmp, d ~ q'_i): accepted with probability min(1, p_i(d) / q'_i(d)); on
@@ -4747,7 +4784,7 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
 // row, the last prompt row) are drawn from p_i.  tg then drives the greedy acceptance logic of
 // main_control unchanged.  cand: the rows' candidates (cB.cand, here the shared-memory copy lm_head leaves at
 // SM_CAND), dq: the drafts' proposals (cB.dq, staged at SM_DQ): single-thread code, so every load is latency.
-__device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
+__device__ __forceinline__ void sample_targets(const Launch & P, int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
     const Ctl * c = cB.ctl;
     const unsigned long long n = (unsigned long long) c->n;
     float p[TOPK_MAX];
@@ -4797,6 +4834,21 @@ __device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const 
         tg[i] = cand_draw(cd, p, K, -1, urand(P.seed, 2 * (n + i) + 1));
         return;
     }
+}
+
+// sample_targets out of line, the launch's sampling fields as values: its p / r arrays (dynamically indexed, 256 B of
+// local memory) get a frame of their own beside the main pass's call chain, and a caller's Launch copy (a lane's) none
+__device__ __noinline__ void sample_targets_ol(int mode, int top_k, float temp, float top_p, float min_p,
+                                               unsigned long long seed, int T, int tl, int * tg, const float2 * cand,
+                                               const float2 * dq) {
+    Launch S{}; // (the fields sample_targets and cand_probs read)
+    S.mode = mode;
+    S.top_k = top_k;
+    S.temp = temp;
+    S.top_p = top_p;
+    S.min_p = min_p;
+    S.seed = seed;
+    sample_targets(S, T, tl, tg, cand, dq);
 }
 
 // ---- main-model control (single thread) ----
@@ -4982,7 +5034,8 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         int tg[MAXT];
         for (int i = 0; i < tl; i++) tg[i] = s_tok[i];
         if (sampling) // lm_head left the candidates at SM_CAND and the drafts' q' at SM_DQ
-            sample_targets(P, Tr, tl, tg, reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
+            sample_targets_ol(P.mode, P.top_k, P.temp, P.top_p, P.min_p, P.seed, Tr, tl, tg,
+                              reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
         for (int i = 0; i < tl; i++) cB.ctl->tgt[i] = tg[i];
         main_control(P.mode, P.last, Tr, P.score ? s_tok + T - 1 : tg, pen, !P.score);
         __threadfence();
@@ -4990,10 +5043,11 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     gsync(epoch, PH_LMHEAD);
 }
 
-// one MTP pass over R consecutive positions; rows read from ctl (catch-up) or a draft row.
+// one MTP pass over R consecutive positions; rows read from ctl (catch-up) or a draft row. li: the lane of a batched
+// launch PL whose drafts these are (-1: PL is the sequence's own launch).
 template <int R>
-__device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row, int draft_idx, bool logits, uint8_t * /*sm*/,
-                                     unsigned & epoch) {
+__device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool draft_row, int draft_idx, bool logits,
+                                     uint8_t * /*sm*/, unsigned & epoch) {
     uint8_t * const sm = smem;
     volatile Ctl * vc = cB.ctl;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -5052,6 +5106,8 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
     resid_any<R, 17>(W.fd, cB.qa, cB.xm, true, cW.shnorm, sm);
     gsync(epoch, PH_MTP_FFN_DOWN);
     if (logits) {
+        // the launch the drafts are for (a lane's: lane_launch; fixed fields only, so the copy lives in registers)
+        const Launch P = li < 0 ? PL : lane_launch(PL, li);
         write_h_rows<R>(cB.xm, cB.qn, cW.shnorm, cB.hm, 0, false, sm);
         int * s_tok = reinterpret_cast<int *>(misc(sm) + 400);
         const int k = draft_row ? draft_idx : 0; // this pass produces draft k + 1 (tok[k + 1])
@@ -5075,8 +5131,9 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
             cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
 #endif
             // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-            const int dt = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                     (unsigned long long) c->mtp_P + 1 + k)
+            const int dt = P.spec_smp ? draft_sample_ol(P.top_k, P.temp, P.top_p, P.min_p, P.seed,
+                                                        reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                        cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                       : s_tok[0];
             c->tok[1 + k] = dt;
             // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -5090,15 +5147,18 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
 #endif
             const float f = P.gate_chain ? chain : conf;
             // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-            c->tok[1 + k] = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                      (unsigned long long) c->mtp_P + 1 + k)
+            c->tok[1 + k] = P.spec_smp ? draft_sample_ol(P.top_k, P.temp, P.top_p, P.min_p, P.seed,
+                                                         reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                         cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                        : s_tok[0];
 #endif
             c->dsmp = P.spec_smp;
             c->dconf[k] = conf;
             c->dchain = chain;
-            c->nd_prod = f < P.gate_drop[k] ? k : k + 1;
-            c->nd_stop = f < P.gate_stop[k] || f < P.gate_drop[k];
+            // (the gates are the launch's, lane_launch keeps them: read from PL, as a dynamic index into P would keep
+            // the whole copy in local memory)
+            c->nd_prod = f < PL.gate_drop[k] ? k : k + 1;
+            c->nd_stop = f < PL.gate_stop[k] || f < PL.gate_drop[k];
             __threadfence();
         }
         gsync(epoch, PH_MTP_LMHEAD);
@@ -5195,10 +5255,13 @@ __device__ void run_main(const Launch & P, uint8_t * /*sm*/, unsigned & epoch) {
 __device__ __noinline__ void run_wide(const Launch & P, unsigned & epoch) { main_forward<MAXT>(P, smem, epoch); }
 #endif
 
-// the launch's MTP passes (catch-up rows, then the drafts the next launch verifies) of the sequence of view s_view
-__device__ __noinline__ void mtp_tail(const Launch & P, unsigned & epoch) {
+// the launch's MTP passes (catch-up rows, then the drafts the next launch verifies) of the sequence of view s_view; li:
+// its lane in the batched launch PL (-1: PL is its own launch). (A lane's Launch copy passed by reference would take
+// 320 B of local memory, under every MTP pass in the stack frame.)
+__device__ __noinline__ void mtp_tail(const Launch & PL, int li, unsigned & epoch) {
     uint8_t * const sm = smem;
     volatile Ctl * vc = cB.ctl;
+    const int ndraft = li < 0 ? PL.ndraft : PL.ln[li].nd; // (lane_launch's ndraft)
     const int Rtot = vc->mtp_R;
     const bool lg = vc->mtp_logits;
     int done = 0;
@@ -5216,22 +5279,22 @@ __device__ __noinline__ void mtp_tail(const Launch & P, unsigned & epoch) {
     while (done < Rtot) {
         const int R = min(5, Rtot - done); // (the MTP block's dp4a ffn_down holds at most 5 rows)
         const bool last_pass = done + R == Rtot;
-        const bool want = lg && last_pass && P.ndraft > 0;
+        const bool want = lg && last_pass && ndraft > 0;
         switch (R) {
-            case 1: mtp_pass<1>(P, done, false, 0, want, sm, epoch); break;
-            case 2: mtp_pass<2>(P, done, false, 0, want, sm, epoch); break;
-            case 3: mtp_pass<3>(P, done, false, 0, want, sm, epoch); break;
-            case 4: mtp_pass<4>(P, done, false, 0, want, sm, epoch); break;
-            case 5: mtp_pass<5>(P, done, false, 0, want, sm, epoch); break;
+            case 1: mtp_pass<1>(PL, li, done, false, 0, want, sm, epoch); break;
+            case 2: mtp_pass<2>(PL, li, done, false, 0, want, sm, epoch); break;
+            case 3: mtp_pass<3>(PL, li, done, false, 0, want, sm, epoch); break;
+            case 4: mtp_pass<4>(PL, li, done, false, 0, want, sm, epoch); break;
+            case 5: mtp_pass<5>(PL, li, done, false, 0, want, sm, epoch); break;
         }
         done += R;
     }
     if (lg) {
         // nd_stop is written before the PH_MTP_LMHEAD barrier, so every block takes the same exit
-        // (n-gram drafts all accepted: draft 1 only, from the catch-up pass; Launch::ng. n_acc is written before the
-        // main-model barriers the MTP passes follow, so every block takes the same branch)
-        if (!(P.ng > 0 && vc->n_acc >= P.ng))
-            for (int i = 1; i < P.ndraft && !vc->nd_stop; i++) mtp_pass<1>(P, 0, true, i, true, sm, epoch);
+        // (n-gram drafts all accepted: draft 1 only, from the catch-up pass; Launch::ng (a lane copy keeps PL's). n_acc is
+        // written before the main-model barriers the MTP passes follow, so every block takes the same branch)
+        if (!(PL.ng > 0 && vc->n_acc >= PL.ng))
+            for (int i = 1; i < ndraft && !vc->nd_stop; i++) mtp_pass<1>(PL, li, 0, true, i, true, sm, epoch);
     }
 }
 
@@ -5319,15 +5382,7 @@ template <int RT>
 __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) {
     uint8_t * const sm = smem;
     constexpr bool CK = RT > MAXT;
-    RowTab rt;
-    rt.nl = P.nl;
-#pragma unroll
-    for (int i = 0; i < NSEQ; i++) {
-        rt.lane[i] = (signed char) (i < P.nl ? P.ln[i].lane : 0);
-        rt.T[i] = (signed char) (i < P.nl ? P.ln[i].T : 0);
-        rt.r0[i] = (signed char) (i < P.nl ? P.ln[i].r0 : 0);
-    }
-    embed_prologue<RT, true>(rt);
+    embed_prologue<RT, true>(row_tab(P));
     gsync(epoch, PH_EMBED);
     int dl = 0;
     for (int L = 0; L < NL; L++) {
@@ -5362,10 +5417,10 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
             gsync(epoch, PH_RESID_O);
         } else {
 #if MK_PAR_WIDE
-            if constexpr (CK) dn_proj_ck<RT>(W, dl, rt);
+            if constexpr (CK) dn_proj_ck<RT>(W, dl, row_tab(P));
             else
 #endif
-                dn_proj_wv<RT, true>(W, dl, 0, 0, rt);
+                dn_proj_wv<RT, true>(W, dl, 0, 0, row_tab(P));
             gsync(epoch, PH_DN_PROJ);
             for (int it = blockIdx.x; it < P.nl * NVH; it += gridDim.x) {
                 const int i = it / NVH;
@@ -5433,7 +5488,8 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
                 const int T = Q.T, r0 = P.ln[i].r0;
                 s_view = view_main(P.ln[i].lane);
                 int tg[MAXT];
-                if (Q.temp > 0.f) sample_targets(Q, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
+                if (Q.temp > 0.f)
+                    sample_targets_ol(Q.mode, Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
                 else if (smp)
                     for (int t = 0; t < T; t++) tg[t] = cand_argmax(cand + (r0 + t) * TOPK_MAX);
                 else
@@ -5455,7 +5511,8 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
             const int T = Q.T, r0 = P.ln[i].r0;
             s_view = view_main(P.ln[i].lane);
             int tg[MAXT];
-            if (Q.temp > 0.f) sample_targets(Q, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
+            if (Q.temp > 0.f)
+                sample_targets_ol(Q.mode, Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed, T, T, tg, cand + r0 * TOPK_MAX, cB.dq);
             else if (smp)
                 for (int t = 0; t < T; t++) tg[t] = cand_argmax(cand + (r0 + t) * TOPK_MAX);
             else
@@ -5673,8 +5730,9 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
                 cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
     #endif
                 // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-                const int dt = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                         (unsigned long long) c->mtp_P + 1 + k)
+                const int dt = Q.spec_smp ? draft_sample_ol(Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed,
+                                                            reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                            cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                           : s_tok[0];
                 c->tok[1 + k] = dt;
                 // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -5688,15 +5746,18 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
     #endif
                 const float f = Q.gate_chain ? chain : conf;
                 // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-                c->tok[1 + k] = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                          (unsigned long long) c->mtp_P + 1 + k)
+                c->tok[1 + k] = Q.spec_smp ? draft_sample_ol(Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed,
+                                                             reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                             cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                            : s_tok[0];
     #endif
                 c->dsmp = Q.spec_smp;
                 c->dconf[k] = conf;
                 c->dchain = chain;
-                c->nd_prod = f < Q.gate_drop[k] ? k : k + 1;
-                c->nd_stop = f < Q.gate_stop[k] || f < Q.gate_drop[k];
+                // (the gates are the launch's, lane_launch keeps them: read from P, as a dynamic index into Q would keep
+                // the whole copy in local memory)
+                c->nd_prod = f < P.gate_drop[k] ? k : k + 1;
+                c->nd_stop = f < P.gate_stop[k] || f < P.gate_drop[k];
                 __threadfence();
             }
 
@@ -5821,10 +5882,9 @@ __device__ __noinline__ void run_batch(const Launch & P, unsigned & epoch) {
 #endif
     {
         for (int i = 0; i < P.nl; i++) {
-            const Launch Q = lane_launch(P, i);
-            if (Q.ndraft == 0) continue;
+            if (P.ln[i].nd == 0) continue;
             set_view(view_full(P.ln[i].lane));
-            mtp_tail(Q, epoch);
+            mtp_tail(P, i, epoch);
         }
         set_view(0);
     }
@@ -5840,7 +5900,9 @@ __device__ __noinline__ void run_batch(const Launch & P, unsigned & epoch) {
 }
 #endif
 
-__global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) { MK_VIEW_INIT();
+// P is __grid_constant__: the out-of-line callees take it by reference, and a plain parameter whose address is taken is
+// copied to local memory (320 B of the stack frame, which the driver reserves for every thread slot of the GPU)
+__global__ void __launch_bounds__(NT, 1) mk_cycle(const __grid_constant__ Launch P) { MK_VIEW_INIT();
     uint8_t * const sm = smem;
     unsigned epoch = 0;
 #if MK_EGRESS
@@ -5896,7 +5958,7 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) { MK_VIEW_INIT();
 #else
     if (P.ndraft == 0 || P.score) return;
 #endif
-    mtp_tail(P, epoch);
+    mtp_tail(P, -1, epoch);
 #if MK_EGRESS
     mk_egress(epoch);
 #endif
