@@ -4586,7 +4586,7 @@ __device__ __forceinline__ float dq_prob(const float2 * q, int id) {
 // Sampled draft (single thread): q' = the sampling distribution (top_k, top_p, min_p, temp) of the draft
 // head's top logits src; writes q' to dst as (prob, token id) terminated by (0, -1) (dst may alias src) and
 // draws the draft from it with its own random stream, keyed by the draft's absolute position.
-__device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos) {
+__device__ __forceinline__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos) {
     float p[TOPK_MAX];
     const int K = cand_probs(src, P, p);
     float x = urand(P.seed ^ 0xD1B54A32D192ED03ull, pos);
@@ -4602,6 +4602,20 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
     }
     if (K < TOPK_MAX) dst[K] = make_float2(0.f, __int_as_float(-1));
     return pick >= 0 ? pick : last;
+}
+
+// draft_sample out of line, the launch's sampling fields as values (as sample_targets_ol). Inlined into the five
+// mtp_pass<R>, cicc unrolled its candidate loops and kept the 32 p[j] in registers, ptxas spilled them, and the five
+// spill blocks took disjoint slots of the stack frame (5 x 128 B above the MTP chain)
+__device__ __noinline__ int draft_sample_ol(int top_k, float temp, float top_p, float min_p, unsigned long long seed,
+                                            const float2 * src, float2 * dst, unsigned long long pos) {
+    Launch S{}; // (the fields draft_sample and cand_probs read)
+    S.top_k = top_k;
+    S.temp = temp;
+    S.top_p = top_p;
+    S.min_p = min_p;
+    S.seed = seed;
+    return draft_sample(S, src, dst, pos);
 }
 
 // Sampled targets for the verified rows.  Point-mass drafts (argmax of the MTP): draft token d at row
@@ -4959,8 +4973,9 @@ __device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool 
             cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
 #endif
             // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-            const int dt = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                     (unsigned long long) c->mtp_P + 1 + k)
+            const int dt = P.spec_smp ? draft_sample_ol(P.top_k, P.temp, P.top_p, P.min_p, P.seed,
+                                                        reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                        cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                       : s_tok[0];
             c->tok[1 + k] = dt;
             // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -4974,8 +4989,9 @@ __device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool 
 #endif
             const float f = P.gate_chain ? chain : conf;
             // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-            c->tok[1 + k] = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                      (unsigned long long) c->mtp_P + 1 + k)
+            c->tok[1 + k] = P.spec_smp ? draft_sample_ol(P.top_k, P.temp, P.top_p, P.min_p, P.seed,
+                                                         reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                         cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                        : s_tok[0];
 #endif
             c->dsmp = P.spec_smp;
