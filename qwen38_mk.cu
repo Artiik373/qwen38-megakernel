@@ -509,6 +509,31 @@ struct RowTab {
     int nl;
     signed char lane[NSEQ], T[NSEQ], r0[NSEQ];
 };
+// the lane of row t of a batched pass (-1: a row past the lanes) and the lane's first row; unrolled over NSEQ, so that rt is
+// read at constant indices (a runtime index copies it to local memory)
+__device__ __forceinline__ int rt_lane(const RowTab & rt, int t, int & r0) {
+    int ln = -1;
+    r0 = 0;
+#pragma unroll
+    for (int i = 0; i < NSEQ; i++)
+        if (i < rt.nl && t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) {
+            ln = rt.lane[i];
+            r0 = rt.r0[i];
+        }
+    return ln;
+}
+// a batched launch's row table, built at each call that takes it (held across the layer loop, its fields stayed live)
+__device__ __forceinline__ RowTab row_tab(const Launch & P) {
+    RowTab rt;
+    rt.nl = P.nl;
+#pragma unroll
+    for (int i = 0; i < NSEQ; i++) {
+        rt.lane[i] = (signed char) (i < P.nl ? P.ln[i].lane : 0);
+        rt.T[i] = (signed char) (i < P.nl ? P.ln[i].T : 0);
+        rt.r0[i] = (signed char) (i < P.nl ? P.ln[i].r0 : 0);
+    }
+    return rt;
+}
 
 // lane i of a batched launch as a solo decode launch of its own (its rows, drafts and sampling)
 __device__ __forceinline__ Launch lane_launch(const Launch & P, int i) {
@@ -1507,9 +1532,9 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
         for (int it = blockIdx.x; it < T * NB; it += gridDim.x) {
             const int t = it / NB, s = it - t * NB;
             if (it != (int) blockIdx.x) __syncthreads(); // (the previous item's staged embedding is read)
-            int tok = 0;
-            for (int i = 0; i < rt.nl; i++)
-                if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) tok = ((volatile Ctl *) cBs[view_main(rt.lane[i])].ctl)->tok[t - rt.r0[i]];
+            int r0;
+            const int ln = rt_lane(rt, t, r0);
+            const int tok = ln < 0 ? 0 : ((volatile Ctl *) cBs[view_main(ln)].ctl)->tok[t - r0];
             const int j = EMB_UB * s + warp, e = 32 * j + lane;
             float v;
             if (cW.embd_t == T_Q4K) {
@@ -1529,9 +1554,9 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int tok;
     if constexpr (BAT) {
-        tok = 0;
-        for (int i = 0; i < rt.nl; i++)
-            if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) tok = ((volatile Ctl *) cBs[view_main(rt.lane[i])].ctl)->tok[t - rt.r0[i]];
+        int r0;
+        const int ln = rt_lane(rt, t, r0);
+        tok = ln < 0 ? 0 : ((volatile Ctl *) cBs[view_main(ln)].ctl)->tok[t - r0];
     } else {
         tok = ((volatile Ctl *) cB.ctl)->tok[t];
     }
@@ -1555,19 +1580,13 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
 #ifndef MK_FD_NOINL
 #define MK_FD_NOINL 0x1c
 #endif
-// T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spilled 136-188 B into this loop.
+// T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spilled 136-188 B into this loop. The sums go in and out
+// by value (registers): by reference, resid32's a lived in local memory.
+template <int T> struct PairT { float a[2][T]; };
 template <int T, int IT, int TYPE>
-__device__ __noinline__ void half_rows(const Mat W, int row0, const SX s, float (&a)[2][T], int u0) {
-    float b[2][T];
-#pragma unroll
-    for (int k = 0; k < 2; k++)
-#pragma unroll
-        for (int t = 0; t < T; t++) b[k][t] = a[k][t];
-    mrows<T, IT, 2, TYPE>(W, row0, s, b, u0);
-#pragma unroll
-    for (int k = 0; k < 2; k++)
-#pragma unroll
-        for (int t = 0; t < T; t++) a[k][t] = b[k][t];
+__device__ __noinline__ PairT<T> half_rows(const Mat W, int row0, const SX s, PairT<T> b, int u0) {
+    mrows<T, IT, 2, TYPE>(W, row0, s, b.a, u0);
+    return b;
 }
 
 // Output rows (32 consecutive rows per block item) with optional residual add; the new
@@ -1618,9 +1637,10 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
             const int j1 = j0 + gridDim.x;
             fill_xs_part<T, U0>(in, 0, s0);
             if (j0 == blockIdx.x) mark_fill();
-            float a[2][T];
+            PairT<T> p;
+            float (&a)[2][T] = p.a;
             zero_acc<T, 2>(a);
-            half_rows<T, U0 / 32, TYPE>(W, 32 * j0 + 2 * warp, s0, a, 0);
+            p = half_rows<T, U0 / 32, TYPE>(W, 32 * j0 + 2 * warp, s0, p, 0);
 #pragma unroll
             for (int t = 0; t < T; t++) {
                 park[t * NT + threadIdx.x] = a[0][t];
@@ -1628,11 +1648,11 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
             }
             if (j1 < D / 32) {
                 zero_acc<T, 2>(a);
-                half_rows<T, U0 / 32, TYPE>(W, 32 * j1 + 2 * warp, s0, a, 0);
+                p = half_rows<T, U0 / 32, TYPE>(W, 32 * j1 + 2 * warp, s0, p, 0);
             }
             fill_xs_part<T, U1>(in, U0, s1);
             if (j1 < D / 32) {
-                half_rows<T, U1 / 32, TYPE>(W, 32 * j1 + 2 * warp, s1, a, U0);
+                p = half_rows<T, U1 / 32, TYPE>(W, 32 * j1 + 2 * warp, s1, p, U0);
                 epilogue(j1, a);
             }
 #pragma unroll
@@ -1640,16 +1660,17 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
                 a[0][t] = park[t * NT + threadIdx.x];
                 a[1][t] = park[(T + t) * NT + threadIdx.x];
             }
-            half_rows<T, U1 / 32, TYPE>(W, 32 * j0 + 2 * warp, s1, a, U0);
+            p = half_rows<T, U1 / 32, TYPE>(W, 32 * j0 + 2 * warp, s1, p, U0);
             epilogue(j0, a);
         }
     } else {
         const SX sx = make_sx(sm, in.U);
         fill_xs<T>(in, 0, false, sx, s_rs);
         for (int j = blockIdx.x; j < D / 32; j += gridDim.x) {
-            float a[2][T];
+            PairT<T> p;
+            float (&a)[2][T] = p.a;
             zero_acc<T, 2>(a);
-            if constexpr (IT == 17 && ((MK_FD_NOINL >> T) & 1)) half_rows<T, IT, TYPE>(W, 32 * j + 2 * warp, sx, a, 0);
+            if constexpr (IT == 17 && ((MK_FD_NOINL >> T) & 1)) p = half_rows<T, IT, TYPE>(W, 32 * j + 2 * warp, sx, p, 0);
             else mrows<T, IT, 2, TYPE>(W, 32 * j + 2 * warp, sx, a);
             epilogue(j, a);
         }
@@ -1833,14 +1854,16 @@ struct PairOut {
     float * base;
     int stride, ring;
     template <int T> __device__ __forceinline__ void operator()(int r, const float (&a)[2][T]) const {
-        const int lane = threadIdx.x & 31;
+        const int lane = threadIdx.x & 31, t = lane >> 1;
         const float * s_rs = misc(nullptr);
+        // selects, not a store per t (merged into a runtime index into a: gemv_pairs' a went to local memory)
+        float v = 0.f;
 #pragma unroll
-        for (int t = 0; t < T; t++)
-            if ((lane >> 1) == t) {
-                const int row = ring >= 0 ? (ring + t) % CONV_RING : t;
-                base[row * stride + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
-            }
+        for (int k = 0; k < T; k++) v = t == k ? ((lane & 1) ? a[1][k] : a[0][k]) : v;
+        if (t < T) {
+            const int row = ring >= 0 ? (ring + t) % CONV_RING : t;
+            base[row * stride + r + (lane & 1)] = v * s_rs[t];
+        }
     }
 };
 #endif
@@ -5221,15 +5244,7 @@ template <int RT>
 __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) {
     uint8_t * const sm = smem;
     constexpr bool CK = RT > MAXT;
-    RowTab rt;
-    rt.nl = P.nl;
-#pragma unroll
-    for (int i = 0; i < NSEQ; i++) {
-        rt.lane[i] = (signed char) (i < P.nl ? P.ln[i].lane : 0);
-        rt.T[i] = (signed char) (i < P.nl ? P.ln[i].T : 0);
-        rt.r0[i] = (signed char) (i < P.nl ? P.ln[i].r0 : 0);
-    }
-    embed_prologue<RT, true>(rt);
+    embed_prologue<RT, true>(row_tab(P));
     gsync(epoch, PH_EMBED);
     int dl = 0;
     for (int L = 0; L < NL; L++) {
@@ -5264,10 +5279,10 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
             gsync(epoch, PH_RESID_O);
         } else {
 #if MK_PAR_WIDE
-            if constexpr (CK) dn_proj_ck<RT>(W, dl, rt);
+            if constexpr (CK) dn_proj_ck<RT>(W, dl, row_tab(P));
             else
 #endif
-                dn_proj_wv<RT, true>(W, dl, 0, 0, rt);
+                dn_proj_wv<RT, true>(W, dl, 0, 0, row_tab(P));
             gsync(epoch, PH_DN_PROJ);
             for (int it = blockIdx.x; it < P.nl * NVH; it += gridDim.x) {
                 const int i = it / NVH;
@@ -5577,8 +5592,9 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
                 cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
     #endif
                 // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-                const int dt = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                         (unsigned long long) c->mtp_P + 1 + k)
+                const int dt = Q.spec_smp ? draft_sample_ol(Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed,
+                                                            reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                            cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                           : s_tok[0];
                 c->tok[1 + k] = dt;
                 // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
@@ -5592,8 +5608,9 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
     #endif
                 const float f = Q.gate_chain ? chain : conf;
                 // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-                c->tok[1 + k] = Q.spec_smp ? draft_sample(Q, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
-                                                          (unsigned long long) c->mtp_P + 1 + k)
+                c->tok[1 + k] = Q.spec_smp ? draft_sample_ol(Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed,
+                                                             reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                                             cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                            : s_tok[0];
     #endif
                 c->dsmp = Q.spec_smp;
