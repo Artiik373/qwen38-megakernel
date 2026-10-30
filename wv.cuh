@@ -909,13 +909,14 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     if constexpr (BAT) {
         if (threadIdx.x < T) {
             const int t = threadIdx.x;
+            int r0;
+            const int ln = rt_lane(rt, t, r0);
             float * cv = nullptr;
-            for (int i = 0; i < rt.nl; i++)
-                if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) {
-                    const Bufs & V = cBs[view_main(rt.lane[i])];
-                    const int p = ((volatile Ctl *) V.ctl)->n + t - rt.r0[i];
-                    cv = V.conv + (size_t) dl * CONV_RING * QKV + (size_t) (p % CONV_RING) * QKV;
-                }
+            if (ln >= 0) {
+                const Bufs & V = cBs[view_main(ln)];
+                const int p = ((volatile Ctl *) V.ctl)->n + t - r0;
+                cv = V.conv + (size_t) dl * CONV_RING * QKV + (size_t) (p % CONV_RING) * QKV;
+            }
             s_cvp[t] = cv;
         }
         // (published by wv_fill's barrier)
@@ -1777,13 +1778,14 @@ __device__ __noinline__ void dn_proj_ck(const LayerW & W, int dl, RowTab rt) {
     float ** const s_cvp = reinterpret_cast<float **>(misc(nullptr) + 64);
     if (threadIdx.x < T) {
         const int t = threadIdx.x;
+        int r0;
+        const int ln = rt_lane(rt, t, r0);
         float * cv = nullptr;
-        for (int i = 0; i < rt.nl; i++)
-            if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) {
-                const Bufs & V = cBs[view_main(rt.lane[i])];
-                const int p = ((volatile Ctl *) V.ctl)->n + t - rt.r0[i];
-                cv = V.conv + (size_t) dl * CONV_RING * QKV + (size_t) (p % CONV_RING) * QKV;
-            }
+        if (ln >= 0) {
+            const Bufs & V = cBs[view_main(ln)];
+            const int p = ((volatile Ctl *) V.ctl)->n + t - r0;
+            cv = V.conv + (size_t) dl * CONV_RING * QKV + (size_t) (p % CONV_RING) * QKV;
+        }
         s_cvp[t] = cv;
     }
     rs_rows<T>(cB.qn);

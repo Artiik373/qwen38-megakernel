@@ -509,6 +509,19 @@ struct RowTab {
     int nl;
     signed char lane[NSEQ], T[NSEQ], r0[NSEQ];
 };
+// the lane of row t of a batched pass (-1: a row past the lanes) and the lane's first row; unrolled over NSEQ, so that rt is
+// read at constant indices (a runtime index copies it to local memory)
+__device__ __forceinline__ int rt_lane(const RowTab & rt, int t, int & r0) {
+    int ln = -1;
+    r0 = 0;
+#pragma unroll
+    for (int i = 0; i < NSEQ; i++)
+        if (i < rt.nl && t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) {
+            ln = rt.lane[i];
+            r0 = rt.r0[i];
+        }
+    return ln;
+}
 
 // lane i of a batched launch as a solo decode launch of its own (its rows, drafts and sampling)
 __device__ __forceinline__ Launch lane_launch(const Launch & P, int i) {
@@ -1507,9 +1520,9 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
         for (int it = blockIdx.x; it < T * NB; it += gridDim.x) {
             const int t = it / NB, s = it - t * NB;
             if (it != (int) blockIdx.x) __syncthreads(); // (the previous item's staged embedding is read)
-            int tok = 0;
-            for (int i = 0; i < rt.nl; i++)
-                if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) tok = ((volatile Ctl *) cBs[view_main(rt.lane[i])].ctl)->tok[t - rt.r0[i]];
+            int r0;
+            const int ln = rt_lane(rt, t, r0);
+            const int tok = ln < 0 ? 0 : ((volatile Ctl *) cBs[view_main(ln)].ctl)->tok[t - r0];
             const int j = EMB_UB * s + warp, e = 32 * j + lane;
             float v;
             if (cW.embd_t == T_Q4K) {
@@ -1529,9 +1542,9 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int tok;
     if constexpr (BAT) {
-        tok = 0;
-        for (int i = 0; i < rt.nl; i++)
-            if (t >= rt.r0[i] && t < rt.r0[i] + rt.T[i]) tok = ((volatile Ctl *) cBs[view_main(rt.lane[i])].ctl)->tok[t - rt.r0[i]];
+        int r0;
+        const int ln = rt_lane(rt, t, r0);
+        tok = ln < 0 ? 0 : ((volatile Ctl *) cBs[view_main(ln)].ctl)->tok[t - r0];
     } else {
         tok = ((volatile Ctl *) cB.ctl)->tok[t];
     }
