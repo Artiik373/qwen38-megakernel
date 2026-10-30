@@ -222,6 +222,7 @@ engine library and the model file exist, print one line with the settings, and s
     --exact-reuse                                   (unless MK_EXACT_REUSE=0)
     --mmproj <file> [--image-max-tokens N] [--video-fps F] [--video-max-tokens N]   (when images are on)
     --chat-template-file <MK_CHAT_TEMPLATE_FILE>    (when set)
+    --temp / --top-p / --top-k / --min-p <MK_TEMP / MK_TOP_P / MK_TOP_K / MK_MIN_P>   (each when set)
 ```
 
 with the environment passed on unchanged. The defaults are port 8080 and 120,000 tokens of context; the KV cache is
@@ -240,6 +241,7 @@ These variables are read by the launchers themselves and turned into options:
 | `MK_VIDEO_FPS` | 4 | `--video-fps`, with images on | 13377de, 2026-10-18 |
 | `MK_VIDEO_MAX_TOKENS` | the image limit | `--video-max-tokens`, with images on | 13377de, 2026-10-18 |
 | `MK_CHAT_TEMPLATE_FILE` | the GGUF's template | `--chat-template-file` | 282cd55, 2026-10-18 |
+| `MK_TEMP`, `MK_TOP_P`, `MK_TOP_K`, `MK_MIN_P` | the server's: 1.0, 0.95, 20, 0 | `--temp`, `--top-p`, `--top-k`, `--min-p`: the sampling of a request that sends none of its own (values a request sends win) | 2026-10-30 |
 | `MK_PYTHON` | `python3`; Windows `python` | the Python that runs the server (needs jinja2) | deb1b62, 2026-10-16 |
 | `MK_KV`, `MK_KV_WIN` | unset (q8_0): `serve.bat` sets preset F (`K*=5r,V*=5`, window `2048`) above 240,000 | read by the engine ([KV cache presets](#kv-cache-presets)) | 2026-10-25 |
 | `MK_PF_CAP` | unset: the launchers set `1024` when the context is above 96,000; `serve.bat` sets `512` above 240,000 when `MK_KV` was set by you | read by the engine ([Prefill](#prefill)) | f598319, 2026-10-11 |

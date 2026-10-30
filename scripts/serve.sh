@@ -45,6 +45,9 @@
 #                       request limits: body size (default 128 MB), images per request (32), pixels per image
 #                       (100,000,000; checked before decoding), video frames per request (256)
 #   MK_PYTHON           Python with jinja2 (default python3)
+#   MK_TEMP, MK_TOP_P, MK_TOP_K, MK_MIN_P
+#                       sampling of a request that sends none (the server's --temp / --top-p / --top-k / --min-p; defaults
+#                       1.0 / 0.95 / 20 / 0); values a request sends win
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${1:-8080}"
@@ -58,6 +61,8 @@ XR=(--exact-reuse) XS=on
 [ "${MK_EXACT_REUSE:-1}" = 0 ] && XR=() XS=off
 CT=()
 [ -n "${MK_CHAT_TEMPLATE_FILE:-}" ] && CT=(--chat-template-file "$MK_CHAT_TEMPLATE_FILE")
+SA=(${MK_TEMP:+--temp "$MK_TEMP"} ${MK_TOP_P:+--top-p "$MK_TOP_P"} ${MK_TOP_K:+--top-k "$MK_TOP_K"}
+    ${MK_MIN_P:+--min-p "$MK_MIN_P"})
 if [ -n "${MK_MMPROJ+x}" ]; then MMPROJ="$MK_MMPROJ"
 else MMPROJ=$(ls "$(dirname "$MODEL")/mmproj-BF16.gguf" "$HOME/models/mmproj-BF16.gguf" "$HOME/models/mmproj-Qwen3.8-27B-BF16.gguf" \
                     2>/dev/null | head -n1 || true)
@@ -72,4 +77,4 @@ echo "megakernel: $MODEL, ctx $CTX, KV q8_0${MK_KV:+ + MK_KV=$MK_KV (window ${MK
      "prefill chunk ${MK_PF_CAP:-2048}, exact reuse $XS, images $VS${MK_CHAT_TEMPLATE_FILE:+, chat template $MK_CHAT_TEMPLATE_FILE}," \
      "http://${MK_HOST:-127.0.0.1}:$PORT"
 exec "$PY" "$HERE/server/mk_server.py" -m "$MODEL" --host "${MK_HOST:-127.0.0.1}" --port "$PORT" -c "$CTX" --kv q8 \
-    -d "${MK_DRAFT:-7}" "${XR[@]}" "${VA[@]}" "${CT[@]}"
+    -d "${MK_DRAFT:-7}" "${XR[@]}" "${VA[@]}" "${CT[@]}" "${SA[@]}"
