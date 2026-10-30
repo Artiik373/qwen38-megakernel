@@ -4855,10 +4855,11 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     gsync(epoch, PH_LMHEAD);
 }
 
-// one MTP pass over R consecutive positions; rows read from ctl (catch-up) or a draft row.
+// one MTP pass over R consecutive positions; rows read from ctl (catch-up) or a draft row. li: the lane of a batched
+// launch PL whose drafts these are (-1: PL is the sequence's own launch).
 template <int R>
-__device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row, int draft_idx, bool logits, uint8_t * /*sm*/,
-                                     unsigned & epoch) {
+__device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool draft_row, int draft_idx, bool logits,
+                                     uint8_t * /*sm*/, unsigned & epoch) {
     uint8_t * const sm = smem;
     volatile Ctl * vc = cB.ctl;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -4917,6 +4918,8 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
     resid_any<R, 17>(W.fd, cB.qa, cB.xm, true, cW.shnorm, sm);
     gsync(epoch, PH_MTP_FFN_DOWN);
     if (logits) {
+        // the launch the drafts are for (a lane's: lane_launch; fixed fields only, so the copy lives in registers)
+        const Launch P = li < 0 ? PL : lane_launch(PL, li);
         write_h_rows<R>(cB.xm, cB.qn, cW.shnorm, cB.hm, 0, false, sm);
         int * s_tok = reinterpret_cast<int *>(misc(sm) + 400);
         const int k = draft_row ? draft_idx : 0; // this pass produces draft k + 1 (tok[k + 1])
@@ -4962,8 +4965,10 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
             c->dsmp = P.spec_smp;
             c->dconf[k] = conf;
             c->dchain = chain;
-            c->nd_prod = f < P.gate_drop[k] ? k : k + 1;
-            c->nd_stop = f < P.gate_stop[k] || f < P.gate_drop[k];
+            // (the gates are the launch's, lane_launch keeps them: read from PL, as a dynamic index into P would keep
+            // the whole copy in local memory)
+            c->nd_prod = f < PL.gate_drop[k] ? k : k + 1;
+            c->nd_stop = f < PL.gate_stop[k] || f < PL.gate_drop[k];
             __threadfence();
         }
         gsync(epoch, PH_MTP_LMHEAD);
@@ -5060,10 +5065,13 @@ __device__ void run_main(const Launch & P, uint8_t * /*sm*/, unsigned & epoch) {
 __device__ __noinline__ void run_wide(const Launch & P, unsigned & epoch) { main_forward<MAXT>(P, smem, epoch); }
 #endif
 
-// the launch's MTP passes (catch-up rows, then the drafts the next launch verifies) of the sequence of view s_view
-__device__ __noinline__ void mtp_tail(const Launch & P, unsigned & epoch) {
+// the launch's MTP passes (catch-up rows, then the drafts the next launch verifies) of the sequence of view s_view; li:
+// its lane in the batched launch PL (-1: PL is its own launch). (A lane's Launch copy passed by reference would take
+// 320 B of local memory, under every MTP pass in the stack frame.)
+__device__ __noinline__ void mtp_tail(const Launch & PL, int li, unsigned & epoch) {
     uint8_t * const sm = smem;
     volatile Ctl * vc = cB.ctl;
+    const int ndraft = li < 0 ? PL.ndraft : PL.ln[li].nd; // (lane_launch's ndraft)
     const int Rtot = vc->mtp_R;
     const bool lg = vc->mtp_logits;
     int done = 0;
@@ -5081,19 +5089,19 @@ __device__ __noinline__ void mtp_tail(const Launch & P, unsigned & epoch) {
     while (done < Rtot) {
         const int R = min(5, Rtot - done); // (the MTP block's dp4a ffn_down holds at most 5 rows)
         const bool last_pass = done + R == Rtot;
-        const bool want = lg && last_pass && P.ndraft > 0;
+        const bool want = lg && last_pass && ndraft > 0;
         switch (R) {
-            case 1: mtp_pass<1>(P, done, false, 0, want, sm, epoch); break;
-            case 2: mtp_pass<2>(P, done, false, 0, want, sm, epoch); break;
-            case 3: mtp_pass<3>(P, done, false, 0, want, sm, epoch); break;
-            case 4: mtp_pass<4>(P, done, false, 0, want, sm, epoch); break;
-            case 5: mtp_pass<5>(P, done, false, 0, want, sm, epoch); break;
+            case 1: mtp_pass<1>(PL, li, done, false, 0, want, sm, epoch); break;
+            case 2: mtp_pass<2>(PL, li, done, false, 0, want, sm, epoch); break;
+            case 3: mtp_pass<3>(PL, li, done, false, 0, want, sm, epoch); break;
+            case 4: mtp_pass<4>(PL, li, done, false, 0, want, sm, epoch); break;
+            case 5: mtp_pass<5>(PL, li, done, false, 0, want, sm, epoch); break;
         }
         done += R;
     }
     if (lg) {
         // nd_stop is written before the PH_MTP_LMHEAD barrier, so every block takes the same exit
-        for (int i = 1; i < P.ndraft && !vc->nd_stop; i++) mtp_pass<1>(P, 0, true, i, true, sm, epoch);
+        for (int i = 1; i < ndraft && !vc->nd_stop; i++) mtp_pass<1>(PL, li, 0, true, i, true, sm, epoch);
     }
 }
 
@@ -5685,10 +5693,9 @@ __device__ __noinline__ void run_batch(const Launch & P, unsigned & epoch) {
 #endif
     {
         for (int i = 0; i < P.nl; i++) {
-            const Launch Q = lane_launch(P, i);
-            if (Q.ndraft == 0) continue;
+            if (P.ln[i].nd == 0) continue;
             set_view(view_full(P.ln[i].lane));
-            mtp_tail(Q, epoch);
+            mtp_tail(P, i, epoch);
         }
         set_view(0);
     }
@@ -5762,7 +5769,7 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(const __grid_constant__ Launch
 #else
     if (P.ndraft == 0 || P.score) return;
 #endif
-    mtp_tail(P, epoch);
+    mtp_tail(P, -1, epoch);
 #if MK_EGRESS
     mk_egress(epoch);
 #endif
