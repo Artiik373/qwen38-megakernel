@@ -4,7 +4,7 @@ NVCC ?= /usr/local/cuda/bin/nvcc
 ARCH ?= $(or $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '. '),86)
 ARCH := sm_$(patsubst sm_%,%,$(ARCH))
 # engine configuration: wide tensor-core verify, up to 7 drafts (-d 7), fragment-ordered Q6_K = the served build.
-# ptxas peaks at ~21 GB of RAM with it (Linux, 2026-10-28); `make MKFLAGS=` builds the lean engine (up to 4 drafts: -d 4).
+# ptxas peaks at ~19 GiB of RAM with it (2026-10-30); `make MKFLAGS=` builds the lean engine (up to 4 drafts: -d 4).
 MKFLAGS ?= -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1
 # MK_TYPES: build the matrix kernels for these weight types only (default: every type), e.g. for one model
 #   make MK_TYPES="Q4_K Q5_K Q6_K IQ4_XS Q5_1"   (Q6_K and IQ4_XS always; Q4_K for MK_MTP_Q4 / MK_DRAFT_Q4, the defaults)
@@ -16,7 +16,7 @@ $(error MK_TYPES: unknown $(filter-out $(MK_TYPES_ALL),$(MK_TYPES)) (known: $(MK
 endif
 MK_TYDEFS = $(if $(strip $(MK_TYPES)),-DMK_TYPESET $(foreach t,$(MK_TYPES),-DMK_TY_$(subst Q4_K,Q4K,$(subst Q5_K,Q5K,$(subst Q6_K,Q6K,$(subst Q3_K,Q3K,$(subst IQ4_XS,IQ4XS,$(subst IQ4_NL,IQ4NL,$(subst IQ3_S,IQ3S,$(t))))))))=1))
 NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC $(MKFLAGS) $(MK_TYDEFS)
-# Most of the build is ptxas on the megakernel (one thread, ~21 GB of heap). It runs ~20% faster when glibc's malloc asks
+# Most of the build is ptxas on the megakernel (one thread, ~19 GiB heap). It runs ~20% faster when glibc's malloc asks
 # for transparent huge pages, which this tunable does (glibc 2.35+; nothing changes where THP is off). Same machine code.
 export GLIBC_TUNABLES ?= glibc.malloc.hugetlb=1
 
@@ -89,7 +89,11 @@ tools/llama_ref: tools/llama_ref.cpp logit_stats.h
 tests/gguf_fuzz: tests/gguf_fuzz.cpp gguf.h
 	g++ -O1 -g -std=c++17 -fsanitize=address,undefined -fno-sanitize-recover=undefined $< -o $@
 
+# README's exact-output claims on this build (scripts/exactness.py; the GPU to itself): make exactness MK_MODEL=<gguf>
+exactness: qwen38_mk libqwen38mk.so
+	python3 scripts/exactness.py $(if $(MK_MODEL),-m $(MK_MODEL)) $(EXACTNESS_ARGS)
+
 clean:
 	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz
 
-.PHONY: all vision clean FORCE
+.PHONY: all vision clean exactness FORCE

@@ -6,8 +6,9 @@
 #include <string>
 #include <vector>
 
-// A failed (non-sticky) CUDA call inside the engine. The engine's sequence state is then undefined: reset() it
-// before the next use (the C API does). Sticky errors (the CUDA context is lost) exit the process with code 4.
+// A failed (non-sticky) CUDA call inside the engine, or no finite logit. The sequence it ran on is then undefined:
+// reset() it before the next use (the C API does; a slot call marks its slots failed, see slots_open). Sticky errors
+// (the CUDA context is lost) exit the process with code 4.
 struct MKCudaError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -70,7 +71,8 @@ class MKEngine {
     // Presence / frequency penalty (OpenAI parameters, vLLM's semantics): each generated token's logit is lowered by
     // frequency * c + presence * (c > 0), c = its occurrences among the tokens generated so far in this response
     // (since the last prefill; prompt tokens do not count). Greedy and sampled; speculative verification stays exact
-    // (a verify row counts the drafts before it). 0, 0 (default): off.
+    // (a verify row counts the drafts before it). 0, 0 (default): off. The engine's own sequence only: parallel slots
+    // never apply them.
     void set_penalty(float presence, float frequency);
     // Draft-depth policy, "key=value,..." (see qwen38_mk.cu); "" restores the default. The env var
     // MK_POLICY sets it at construction.
@@ -207,8 +209,11 @@ class MKEngine {
     // last chunk saves a checkpoint before its last token (a repeat of the prompt resumes there). slots_step: one step
     // of the given slots (two or more: one batched launch, each slot up to 1 + MAXT / n - 1 tokens), the tokens each
     // emitted (a slot's first call after its prefill: the prefill's token only; empty: its context is full).
-    // slots_step_mixed: slots_step, then the next chunk of pslot's prompt. Every slot call leaves the engine's own
-    // sequence current again.
+    // slots_step_mixed: pslot's next prompt chunk, then slots_step (a failed chunk steps nothing: no token is lost).
+    // Every slot call leaves the engine's own sequence current again. An MKCudaError fails the slots the call ran on:
+    // slot_prefill / slots_step refuse them (std::runtime_error) until slot_begin, which starts them from scratch
+    // (reuses nothing). A slot_prefill stopped by cancel() (MKCancelled) queues the prompt's rest again from where the
+    // slot's sequence went back to.
     int slots_open(int n, int ctx, int seg_tokens = 0);
     int slots_count() const;
     int slot_begin(int slot, const std::vector<int> & toks, float temp, float top_p, int top_k, float min_p, unsigned long long seed,

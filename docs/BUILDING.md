@@ -45,11 +45,9 @@ folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Vis
   CUDA 13.2; it links the CUDA runtime statically, so at run time only the driver is needed.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64.
 - **RAM to compile:** most of the build is ptxas on the megakernel, one thread with a large heap. For the served
-  configuration it peaked at 21.2 GB on Linux / WSL2 in a 13-minute build (2026-10-28) and at 20.2 GB natively on
-  Windows in a 14-minute build (2026-10-29), after the code that no served setting reaches was dropped and lm_head's
-  variants were merged. Before that change: 37.7 GB and 28.5 minutes on Linux (2026-10-28); natively 27-30 GB
-  (2026-10-18) and up to 30 minutes (2026-10-28). The lean build (`MKFLAGS=`, up to 4 drafts) needed about 19 GB
-  (2026-10-17).
+  configuration it peaked at 18.8 GiB both on Linux / WSL2, in a 10.5-minute `make -j2`, and natively on Windows, in
+  a 12-minute `build.ps1` (2026-10-30, 6f3b257). The lean build (`MKFLAGS=`, up to 4 drafts) was last measured at
+  about 19 GB (2026-10-17), before the served build was trimmed.
 - **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `--park-mib` /
   `MK_PARK_MIB` (default 8192 MiB; 1024 MiB for side requests alone when parking is off), allocated as it is needed and
   kept until the server exits. The token embedding table also stays in page-locked host memory instead of VRAM.
@@ -82,8 +80,8 @@ What `make` builds:
 Build settings:
 - **The served configuration** is the default: `MKFLAGS=-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1` (wide verify on
   int8 tensor cores, up to 7 drafts, the fragment-ordered Q6_K layout, the split barrier before the DeltaNet core).
-- **The lean engine:** `make MKFLAGS=`. It verifies at most 5 rows (4 drafts) with dp4a GEMVs and needs less RAM to
-  compile; run it with `MK_DRAFT=4` (the launchers default to 7).
+- **The lean engine:** `make MKFLAGS=`. It verifies at most 5 rows (4 drafts) with dp4a GEMVs; run it with
+  `MK_DRAFT=4` (the launchers default to 7).
 - **One model's types only:** `make MK_TYPES="Q4_K Q5_K Q6_K IQ4_XS Q5_1"` builds the matrix kernels for those weight
   types alone (Q6_K and IQ4_XS are always needed; Q4_K for the default `MK_MTP_Q4` / `MK_DRAFT_Q4` copies). For
   Qwen3.8-27B-18600-NIKI-Q5_K_M that set gives ~65% of the full build's PTX, so ptxas needs less time and RAM; a GGUF
@@ -184,8 +182,13 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   3.11 and 3.12).
 - **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed and randomly corrupted files under
   AddressSanitizer and UBSan (CPU only, Linux).
-- **Draft-depth independence:** the same prompt at `-d 0`, `-d 4` and `-d 7` must give identical ids:
-  `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_56k.bin --ids`
+- **Exactness:** `python3 scripts/exactness.py -m <gguf>` (or `make exactness MK_MODEL=<gguf>`; Windows:
+  `python scripts\exactness.py -m <gguf>`) checks the README's [exact output](../README.md#exact-output) claims on the
+  GPU: greedy ids identical at 0, 4 and 7 drafts (`--depths 0,4` for a `make MKFLAGS=` build) and without the MTP
+  layer, the exact-reuse state digest and ids independent of the prefill chunk size, and a warm server's follow-up,
+  edited and sampled replies equal to a fresh server's (a check whose runs drafted nothing or reused nothing fails: it
+  would prove nothing). It needs the GPU to itself (11 model loads), prints PASS / FAIL per check, exits 1 on a failure
+  and writes every result to `exactness-out/exactness.json`.
 - **Accuracy against llama.cpp:** `tools/llama_ref` writes a reference file, and
   `./qwen38_mk -m <gguf> --kld <ref> --score-path mixed --kv q8` scores the engine against it
   ([BENCHMARKS.md](BENCHMARKS.md#against-llamacpp) has the full recipe and the expected numbers).
@@ -194,8 +197,10 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 - **Speed:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_56k.bin --model <gguf>` (4 chat
   prompts through the CLI; it uses the CLI's default KV cache, so at most 4 drafts). `bench/*.cu` are kernel
   microbenchmarks.
-- **Windows against Linux:** the ids of the depth check, the `--kld` report and server replies to the same requests
-  should be identical between a Windows and a Linux build of the same commit.
+- **Windows against Linux:** run the exactness checks on both builds of the same commit, the second with
+  `--compare <the first's output directory>`: every token id, state digest and server reply must be identical, and so
+  should the `--kld` report. Release packages include the script, so a downloaded package can be checked the same way,
+  also against the previous release.
 
 ## Files
 
