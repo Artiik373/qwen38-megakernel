@@ -1,8 +1,9 @@
 // wvgemm_bench: a flat int8 tensor-core verify GEMM ("wv": mma.m16n8k32, tokens on N) for the main-pass roles, against
-// today's dp4a GEMV (the engine's own rows_* / accR code, copied verbatim into wv_ref.cuh by wv_extract.py).
+// the engine's dp4a GEMV (its own rows_* / accR code, copied verbatim into wv_ref.cuh by wv_extract.py).
 //
 //   python3 wv_extract.py && nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo -Xptxas -v wvgemm_bench.cu -o wvgemm_bench
-//   ./wvgemm_bench check            exactness: T-invariance (T = 1..16 bit-identical per row) + integer / fp64 checks
+//   ./wvgemm_bench check            exactness: T-invariance (T = 1..16 bit-identical per row) + wv / dp4a vs fp64
+//                                   (exit status 1 on a failure; `make check` runs it)
 //   ./wvgemm_bench time [roles] [types] [reps]
 //
 // Weights are random bytes in the engine's on-device layouts (native Q4_K / Q5_K, the load-time repacks of IQ4_XS, IQ4_NL,
@@ -60,7 +61,7 @@ struct QB {
 };
 
 // ==================================================================================================================
-// today's GEMV: gemv_pairs (2-row warp items over all warps) with the engine's mrows<T, IT, 2, TYPE>
+// the engine's GEMV: gemv_pairs (2-row warp items over all warps) with the engine's mrows<T, IT, 2, TYPE>
 // ==================================================================================================================
 struct DpArgs {
     const Mat * mats;
@@ -549,8 +550,8 @@ struct XSm {
     const float4 * mx4; // K16: per (32-block j, group n, tq): MAGIC - 32 qsum of (token a, chunk 0), (b, 0), (a, 1), (b, 1)
 };
 
-// WV_Q6FM (spill2, M3): Q6_K in a fragment-ordered unit with the meta inline (wv_tile_q6f); 0 = off (TM / row-major as
-// before), 1 = split m16n8k32 at every T, 2 = m16n8k16 per 16-chunk at every T, 3 = split at T <= 4, k16 at T > 4.
+// WV_Q6FM: Q6_K in a fragment-ordered unit with the meta inline (wv_tile_q6f); 0 = off (TM / row-major),
+// 1 = split m16n8k32 at every T, 2 = m16n8k16 per 16-chunk at every T, 3 = split at T <= 4, k16 at T > 4.
 // All forms are bit-identical to each other and to the split path on the engine layouts (same integer chunk sums, same
 // float sequence per (row, token, chunk), the two chunk accumulators added last).
 #ifndef WV_Q6FM
@@ -682,7 +683,7 @@ template <class R> __device__ __forceinline__ void raw_opaque(R & r) {
 #pragma unroll
     for (int i = 0; i < (int) (sizeof(R) / 4); i++) asm volatile("" : "+r"(p[i]));
 }
-// ---- WV_Q6FM: fragment-ordered Q6_K (spill2) ---------------------------------------------------------------------
+// ---- WV_Q6FM: fragment-ordered Q6_K ---------------------------------------------------------------------
 // Unit (16-row tile, super-block) = 3360 B = 16 x (192 + 18), meta inline:
 //   [0, 256)     sc: per g {row g sc[16] | row g + 8 sc[16]} (int8, natural 16-chunk order)
 //   [256, 288)   d: per g {row g fp16 | row g + 8 fp16}
@@ -1158,7 +1159,7 @@ __global__ void __launch_bounds__(NT, 1) k_wv(WvArgs A) {
 //  - Token scales: MIN 0 one float4 per (64-group, n, tq) {dx_a, dx_b of j = 2G, then of 2G + 1}; MIN 1 / 2 one float4
 //    per (32-block, n, tq) {dx_a, dx_b, e_a, e_b}, e = dx * qsum (MIN 1) or the accumulator input MAGIC - 32 qsum (MIN 2).
 //    -12582912 dx by FMUL (the product is exact, so fmaf(dx, C, -12582912 dx) is the same number as in k_wv).
-//  - Stream-K inside the block: the block's (tile, super-block) units are split evenly over its 16 warps (k_wv gave
+//  - Stream-K inside the block: the block's (tile, super-block) units are split evenly over its 16 warps (k_wv gives
 //    whole tiles to warps: ffn_gu 26.5 tiles per block = 1 or 2 per warp, dn_proj 12.5 = 0 or 1). A tile split between
 //    warps is summed after the block's last unit in warp order: fixed by M, K and the grid, so the same for every T.
 //  - Rolling register prefetch: unit u + 1's header / group words are loaded into the registers of unit u as soon as
@@ -1884,7 +1885,7 @@ static float wv_T(int T, bool q16, WvArgs & a, int reps) {
 #define WV_PF 0
 #endif
 static float dp4a_any(int ty, int T, int IT, DpArgs & a, int reps) {
-#if defined(WV_Q6ONLY) // spill2 go / no-go builds: Q6_K only
+#if defined(WV_Q6ONLY) // Q6_K-only builds
     return ty == T_Q6K ? dp4a_T<T_Q6K>(T, IT, a, reps) : -1.f;
 #elif defined(WV_QUICK)
     if (T != 1) return -1.f;
@@ -2087,7 +2088,9 @@ static void init_grid(std::mt19937 & rng) {
     CK(cudaMemcpyToSymbol(g_iq3s_grid, grid.data(), 512 * 4));
 }
 
-// exactness: per type x role: wv at T = 1..8, 16 bit-identical per (row, token) to T = 16's; wv and dp4a vs fp64
+// exactness: per type x role: wv at T = 1..8, 16 bit-identical per (row, token) to the largest T that ran; wv and the
+// engine's dp4a (T = 4) vs fp64 within CHK_RMS / CHK_MAX of the rows' rms, |wv - dp4a| within CHK_MAX (NaN fails)
+constexpr double CHK_RMS = 1e-5, CHK_MAX = 1e-4; // (correct kernels: rms errors <= 6e-7, max <= 4.5e-6)
 static int check(const std::vector<int> & roles, const std::vector<int> & types) {
     std::mt19937 rng(1234);
     init_grid(rng);
@@ -2118,6 +2121,7 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
             std::vector<double> href((size_t) 16 * R.M);
             CK(cudaMemcpy(href.data(), ref, href.size() * 8, cudaMemcpyDeviceToHost));
             std::vector<std::vector<float>> res;
+            std::vector<char> ran; // the T's whose kernel launched (the others need more shared memory than there is)
             for (int T : TS) {
                 CK(cudaMemset(out, 0xff, sizeof(float) * 16 * R.M));
                 WvArgs a{D2.dmats, 1, X.q, out, part, cnt, R.M, R.K, R.S, g_scr};
@@ -2126,15 +2130,19 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
                 std::vector<float> h((size_t) 16 * R.M);
                 CK(cudaMemcpy(h.data(), out, h.size() * 4, cudaMemcpyDeviceToHost));
                 if (ms < 0) h.assign(h.size(), NAN);
+                ran.push_back(ms >= 0);
                 res.push_back(h);
             }
-            // T-invariance against the largest T that ran (rows t < T)
-            int tinv_bad = 0, tref = -1, ntested = 0;
-            for (int ti = (int) res.size() - 1; ti >= 0 && tref < 0; ti--)
-                if (!std::isnan(res[ti][0]) || !std::isnan(res[ti][1])) tref = ti;
+            // T-invariance against the largest T that ran (rows t < T); none ran: a failure (tref 0, its rows NaN)
+            int tinv_bad = 0, tref = 0, ntested = 0;
+            for (int ti = (int) res.size() - 1; ti > 0; ti--)
+                if (ran[ti]) {
+                    tref = ti;
+                    break;
+                }
             for (size_t ti = 0; ti < res.size(); ti++) {
                 const int T = TS[ti];
-                if (std::isnan(res[ti][0]) && std::isnan(res[ti][1])) continue;
+                if (!ran[ti]) continue;
                 ntested++;
                 for (int t = 0; t < T; t++)
                     if (memcmp(res[ti].data() + (size_t) t * R.M, res[tref].data() + (size_t) t * R.M, 4 * R.M)) tinv_bad++;
@@ -2144,7 +2152,7 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
             const int Td = 4; // dp4a reference rows
             CK(cudaMemset(out, 0, sizeof(float) * 16 * R.M));
             DpArgs da{D.dmats, 1, X.q, out, R.M, g_park};
-            dp4a_any(ty, Td, R.IT, da, 0);
+            const bool dp_ran = dp4a_any(ty, Td, R.IT, da, 0) >= 0;
             CK(cudaDeviceSynchronize());
             std::vector<float> hd((size_t) 16 * R.M);
             CK(cudaMemcpy(hd.data(), out, hd.size() * 4, cudaMemcpyDeviceToHost));
@@ -2173,11 +2181,15 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
                 const size_t nbh = (size_t) 4 * R.M * (Tmax < 8 ? Tmax : 8);
                 for (size_t i = 0; i < nbh; i++) hsh = (hsh ^ hb[i]) * 1099511628211ull;
             }
+            const double e_w = sqrt(ew / n) / rms, m_w = mw / rms, e_d = sqrt(ed / nd) / rms, m_d = md / rms;
+            const double m_wd = dwd / rms;
+            const bool in_bounds =
+                e_w <= CHK_RMS && m_w <= CHK_MAX && e_d <= CHK_RMS && m_d <= CHK_MAX && m_wd <= CHK_MAX;
             printf("%-9s %-6s T-inv(%d T's, ref T=%d) %s (%d rows differ) | rel err vs fp64: wv rms %.2e max %.2e, dp4a rms "
-                   "%.2e max %.2e | max |wv-dp4a| %.2e | hash %016llx\n",
-                   R.name, tname(ty), ntested, Tmax, tinv_bad ? "FAIL" : "ok", tinv_bad, sqrt(ew / n) / rms, mw / rms,
-                   sqrt(ed / nd) / rms, md / rms, dwd / rms, hsh);
-            if (tinv_bad || sqrt(ew / n) / rms > 1e-4) bad++;
+                   "%.2e max %.2e | max |wv-dp4a| %.2e | hash %016llx%s\n",
+                   R.name, tname(ty), ntested, Tmax, tinv_bad || !ntested ? "FAIL" : "ok", tinv_bad, e_w, m_w, e_d,
+                   m_d, m_wd, hsh, !dp_ran ? " | FAIL: dp4a did not run" : !in_bounds ? " | FAIL: error bound" : "");
+            if (tinv_bad || !ntested || !dp_ran || !in_bounds) bad++;
             cudaFree(out); cudaFree(part); cudaFree(cnt); cudaFree(ref); cudaFree(idot);
             release(D);
             release(D2);
@@ -2277,7 +2289,7 @@ int main(int argc, char ** argv) {
             if (c) q = c + 1;
         }
     }
-    if (mode == "check") return check(roles, types);
+    if (mode == "check") return check(roles, types) ? 1 : 0;
     const int reps = argc > 4 ? atoi(argv[4]) : 5;
     std::vector<int> wvT = {1, 2, 4, 8, 16}, dpT = {1, 2, 4, 5};
     auto ints = [](const char * s) {

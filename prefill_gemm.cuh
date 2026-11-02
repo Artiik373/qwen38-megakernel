@@ -3,9 +3,9 @@
 //   Y[tok][row] (+)= sum_k W[row][k] * X[tok][k]
 //
 // X is fp16 [tok][K] with the elements of every 16-group permuted (hperm) so that the 4-byte weight
-// words give m16n8k16 A fragments directly.  W stays Q4_K / Q5_K (GGUF layout), Q6_K (224-byte
-// repack, see qwen38_mk.cu), Q8_0 (unit repack), IQ4_XS (272-byte block pairs, indices in Q4_K order) or
-// IQ4_NL (Q4_K-shaped 144-byte repack) and is dequantised to fp16 in registers.
+// words give m16n8k16 A fragments directly.  W stays Q4_K / Q5_K (GGUF layout), Q6_K (210-byte
+// two-stream repack: layout in qwen38_mk.cu, made by loader.cu), Q8_0 (unit repack), IQ4_XS (272-byte block pairs,
+// indices in Q4_K order) or IQ4_NL (Q4_K-shaped 144-byte repack) and is dequantised to fp16 in registers.
 // Tile: 128 weight rows x 128 tokens per CTA, 8 warps of 16 rows x 128 tokens.  K is staged 64 at a
 // time (one 64-group of a super-block: two 32-element sub-blocks) through a cp.async pipeline with
 // one block barrier per stage (Q5_K / IQ4_NL: per two stages, see pf_wown); per-row sub-block scales
@@ -20,12 +20,6 @@
 #ifndef MK_PF_FRAG_G
 #define MK_PF_FRAG_G -1 // (tuning) the MMA group of a stage after which the next stage's scales + fragments are made; -1: frag_g
 #endif
-#ifndef MK_WV_Q6F
-#define MK_WV_Q6F 0 // (qwen38_mk.cu sets it; FM Q6_K units, see mmh's FM6)
-#endif
-#ifndef MK_PF_INFCHK
-#define MK_PF_INFCHK 0 // debug builds: 1 = count the prefill GEMMs' fp16 overflows (chk_*; the served build has none of it)
-#endif
 
 namespace pf {
 
@@ -35,9 +29,6 @@ namespace pf {
 // the MMAs) that are inf / NaN when added to the fp32 accumulators, kind 1 = non-finite fp32 outputs. Input sites (the
 // fp16 stores of GEMM inputs, saturated to +-65504): kind 0 = |v| > 65504 (inf included), kind 1 = NaN (stored as
 // -65504 by the clamp).
-enum { CHK_Q, CHK_K, CHK_V, CHK_O, CHK_QKV, CHK_GATE, CHK_SOUT, CHK_GU, CHK_UP, CHK_DOWN, CHK_EH, CHK_HEAD, // GEMMs
-       CHK_IN_NORM, CHK_IN_DN, CHK_IN_MTP, CHK_IN_ATTN, CHK_IN_GLU, CHK_SITES };                            // inputs
-constexpr int CHK_LAYERS = 66; // 64 trunk layers, 64 = the MTP block, 65 = the output head
 __device__ unsigned long long chk_cnt[CHK_LAYERS][CHK_SITES][2];
 __device__ int chk_layer, chk_site;
 __device__ __forceinline__ void chk_add(int site, int kind, unsigned n) {
@@ -49,16 +40,8 @@ __device__ __forceinline__ void chk_clamp(float v, int site) { // v: about to be
 }
 #endif
 
-constexpr int BM = 128, BN = 128, BK = 64;
-constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8, TIQ4 = 23, TIQ4NL = 20, TQ3K = 11, TIQ3S = 21, TQ51 = 7;
 // kvalues_iq4nl + 128 as bytes (the Q8_0 path's offset)
 constexpr unsigned IQ4U_T0 = 0x3F2D1801u, IQ4U_T1 = 0x766A5D4Fu, IQ4U_T2 = 0xA6998D81u, IQ4U_T3 = 0xF1D9C5B5u;
-
-struct WMat { // device view of one weight matrix (mirrors Mat in qwen38_mk.cu)
-    const uint8_t * w;
-    const __half * d;
-    int type, K, N, rb, nd;
-};
 
 // Raw bytes of one stage (64-group p of super-block sb) per weight row, copied as 16 B chunks:
 //   Q4_K: [hdr 16 | qs 32]                    src: blk + {0, 16 + 32p}
@@ -117,15 +100,6 @@ __device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], unsigned addr) {
 
 constexpr unsigned M4 = 0x0F0F0F0Fu;
 
-enum { OUT_STORE = 0, OUT_ADD = 1 };
-
-struct Out {
-    float * y; // y[tok * ldy + row]
-    int ldy;
-    int mode;
-    __half * yh; // fused gate / up (mmh<.., true>): yh[tok * ldy + row] = silu(gate) * up, fp16 in hperm order
-};
-
 // Element e of a 16-group sits at slot hperm(e): 4 t + {0, 1} -> 2 t + {0, 1}, 4 t + {2, 3} ->
 // 8 + 2 t + {0, 1}.  With that order a weight word (elements 4 t4 .. 4 t4 + 3) gives the A fragment
 // registers a0 / a1 = (e0, e1) and a2 / a3 = (e2, e3) of an m16n8k16 MMA.
@@ -152,7 +126,7 @@ template <> struct HT<TQ3K> { static constexpr int SR = 48, NS = 4; static const
 template <> struct HT<TIQ3S> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
 // Per-super-block bytes that the 4 stages of a super-block share (Q5_K: header 16 + qh 32 B per row) go to a double buffer
 // (SBB, by super-block parity) once per super-block instead of into every stage: Q5_K's stage is then 32 B per row, so it
-// gets 4 stages like the 48-B types (3 before: 2-5% slower). R: bytes per row, NC: 16-B chunks per row.
+// gets 4 stages like the 48-B types. R: bytes per row, NC: 16-B chunks per row.
 template <int TYPE> struct SBT { static constexpr int R = 0, NC = 0; };
 template <> struct SBT<TQ5K> { static constexpr int R = 48, NC = 3; };
 template <> struct SBT<TQ51> { static constexpr int R = 64, NC = 4; }; // the 8 (d, m) pairs 32 + qh 32
@@ -163,13 +137,13 @@ constexpr int HMI = 1, HWR = 16 * HMI, HNWM = BM / HWR; // warp tiles: 8 warps o
 // not depend on which other tokens share the CTA), so every NB gives bit-identical results.
 template <int NB> __host__ __device__ constexpr int hm_x() { return NB * 128; } // activation tile per stage: NB tokens x 64 halves, 16 B chunks XOR-swizzled
 template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_stage() { return HT<TYPE>::SR * BM + hm_x<NB>(); }
-// (A deeper cp.async pipeline for the narrow tiles, up to 8 stages, measured no faster.)
-// At NB = 32 every type fits two CTAs per SM (<= 48 KB smem, <= 96 registers), at NB = 64 / 128 one.
+// (A deeper cp.async pipeline for the narrow tiles, up to 8 stages, is no faster.)
+// At NB = 32 every type fits two CTAs per SM (<= 49,216 B smem, Q6_K's; <= 96 registers), at NB = 64 / 128 one.
 // Per-stage mbarriers (MBL) instead of the per-stage CTA barrier: full[b] completes when the 256 threads' copies of the
 // stage in buffer b have landed (cp.async.mbarrier.arrive), empty[b] when the 8 warps are done reading it; the copies run
-// two stages ahead (not three), so a warp waits for the others only to reuse the buffer of two stages back. Measured per
-// kernel: Q6_K, Q3_K, IQ3_S and these mixed-type gate / up pairs 1.5-8% faster; Q4_K, IQ4_XS and Q8_0 1-5%
-// slower (Q5_K / IQ4_NL: pf_wown). Needs 4 stages; MBB bytes at the end of the dynamic shared memory.
+// two stages ahead (not three), so a warp waits for the others only to reuse the buffer of two stages back. Per
+// kernel: faster for Q6_K, Q3_K, IQ3_S and these mixed-type gate / up pairs, slower for Q4_K, IQ4_XS and Q8_0
+// (Q5_K / IQ4_NL: pf_wown). Needs 4 stages; MBB bytes at the end of the dynamic shared memory.
 __host__ __device__ constexpr bool pf_mbl(int tg, int tu, bool mix) {
     if (!mix) return tg == TQ6K || tg == TQ3K || tg == TIQ3S;
     return (tg == TQ4K && (tu == TQ5K || tu == TIQ4)) || (tg == TIQ4 && (tu == TQ4K || tu == TQ3K)) ||
@@ -208,7 +182,7 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // warps 0-3 compute the 64 gate rows of W (TYPE, LAY), warps 4-7 the 64 up rows of Wu (TYPE2, LAY2), each half with its
 // own stage layout (gate's weight bytes, then up's), copies, scales and fragments; the products, sums and the epilogue
 // are those of mmh<TYPE> + mmh<TYPE2> into fp32 + pk_glu: bit-identical.
-// LAY 1 (MK_WV): W (and W2) are stored in the wv layout of wv.cuh: units (16-row tile, super-block) of 16 x UB bytes.
+// LAY 1: W (and W2) are stored in the wv layout of wv.cuh: units (16-row tile, super-block) of 16 x UB bytes.
 // Q4_K / Q5_K / IQ4_XS are fragment-ordered there (FMT: a 16-B chunk of qh / qs holds 8 B of rows g and g + 8), IQ4_NL /
 // Q8_0 (and Q8_0's scales) are tile-major whole blocks (shared memory receives the same bytes as from the row-major layout).
 // FMT stage layout: the FM chunks land whole (one cp.async 16 each): per 16-row tile a 512-B region of qs (Q5_K: and qh)
@@ -216,15 +190,14 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // row; IQ4_XS: 16 B per row pair g / g + 8). rawq's 32-bit reads are bank-conflict-free because odd-g lanes read their
 // chunks' second half (row g + 8) as their "row A": the lane's MMA rows are g + 8 (g & 1) and the other one, which the
 // scales and the epilogue follow (the same products and sums per row: exact).
-// FM6 (MK_WV_Q6F): Q6_K in wv.cuh's FM Q6_K units (3360 B per tile and super-block, meta inline). Stage layout (the
+// FM6: Q6_K in wv.cuh's FM Q6_K units (3360 B per tile and super-block, meta inline). Stage layout (the
 // weight part, 64 B x ROWS): qlo of tile t at F6L + 512 t (the unit's group-p block, whole), qhi at F6H + 256 t (likewise),
 // per row 16 B at F6M + 16 r: sc[4p .. 4p + 3] | d of rows g / g + 8 | the fp16 scale pairs (scales). The unit's qlo / qhi
 // order is the thread order of rawq (lane l = 4 g + t4: rows g / g + 8, elements 4 t4 .. + 3 of each 16-chunk), so rawq
 // reads one 16-B and one 8-B word and builds the same wd words as from the row-major stage: exact.
 
-// The MMA group (0-3) of a stage after which the next stage's scales + fragments are made (pipelined step): measured per
-// kernel on the microbenchmark (launcher layouts, 1024 tokens; groups 1 vs 2 differ by up to 4%; re-measured with
-// 4-stage Q5_K, pf_wown and pf_mbl: Q4_K GLU 1).
+// The MMA group (0-3) of a stage after which the next stage's scales + fragments are made (pipelined step): tuned per
+// kernel on the microbenchmark (launcher layouts, 1024 tokens).
 __host__ __device__ constexpr int frag_g(int tg, int tu, bool glu, bool mix) {
     if (MK_PF_FRAG_G >= 0) return MK_PF_FRAG_G;
     if (!mix) return tg == TQ5K || tg == TQ51 || tg == TQ80 || (tg == TIQ4 && !glu) || (tg == TQ4K && glu) ? 1 : 2;
@@ -232,8 +205,8 @@ __host__ __device__ constexpr int frag_g(int tg, int tu, bool glu, bool mix) {
 }
 // Warp-owned weight copies (HalfW OWN): each warp copies the weight bytes of its own 16 rows (the only ones it reads), so a
 // warp-level wait covers them and the CTA barrier is needed for the activation tiles only, which are then copied in pairs:
-// one barrier per two stages instead of one per stage. Measured per kernel: Q5_K and IQ4_NL GEMMs (plain and
-// the Q5_K fused gate / up) 4-5% faster; Q4_K, IQ4_XS, Q6_K, Q3_K, IQ3_S and the mixed-type kernels 1-14% slower: they keep
+// one barrier per two stages instead of one per stage. Faster for the Q5_K and IQ4_NL GEMMs (plain and
+// the Q5_K fused gate / up); slower for Q4_K, IQ4_XS, Q6_K, Q3_K, IQ3_S and the mixed-type kernels, which keep
 // the per-stage barrier. Needs the 4 cp.async stages of the same-type kernels.
 __host__ __device__ constexpr bool pf_wown(int t, bool mix) { return !mix && (t == TQ5K || t == TQ51 || t == TIQ4NL); }
 
@@ -254,10 +227,10 @@ template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_smem2() {
 // the rest from W2), or one half (BM/2 rows) of a mixed-type gate / up. HB: the rows' offset in a stage; TB: the first
 // thread of the per-row copies (scale streams, Q6_K meta, Q3_K / IQ3_S extra bytes): threads TB .. TB + ROWS - 1.
 template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = false> struct HalfW {
-    static constexpr bool FMT = LAY && (TYPE == TIQ4 || (MK_WV_FMK && (TYPE == TQ4K || TYPE == TQ5K || TYPE == TQ51))); // fragment-ordered
+    static constexpr bool FMT = LAY && (TYPE == TIQ4 || TYPE == TQ4K || TYPE == TQ5K || TYPE == TQ51); // fragment-ordered
     static constexpr bool Q5H = TYPE == TQ5K || TYPE == TQ51; // 5-bit: qh in the super-block buffer
     static constexpr int HDR = TYPE == TQ51 ? 32 : 16;        // FMT super-block buffer: header bytes per row
-    static constexpr bool FM6 = LAY && TYPE == TQ6K && MK_WV_Q6F;
+    static constexpr bool FM6 = LAY && TYPE == TQ6K;
     static constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR;
     static constexpr bool SEP = HT<TYPE>::SEP;
     static constexpr int F6L = 0, F6H = 32 * ROWS, F6M = 48 * ROWS, F6U = 3360;
@@ -277,7 +250,7 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = fals
     static constexpr int WIT = OWN ? (CPT + 31) / 32 : (WCH + 255) / 256;
     static constexpr int WITS = !WCHS ? 1 : OWN ? (CPTS + 31) / 32 : (WCHS + 255) / 256;
     static constexpr int UB = FM6 ? F6U : 16 * (TYPE == TIQ4 ? 136 : BLK); // LAY: bytes per (tile, super-block) unit
-    // LAY 1 offset types (MK_MAXT > 5 ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
+    // LAY 1 offset types (ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
     // 16 entries per block (VST: value bytes per super-block, EST: meta bytes per Q6_K / Q3_K block pair or IQ3_S block)
     static constexpr int VST = LAY ? 16 * BLK : BLK, EST = LAY ? 16 * (TYPE == TIQ3S ? 16 : 36) : (TYPE == TIQ3S ? 16 : 36);
     static_assert(!FMT || SBR || FHO + ROWS * 16 <= SR * ROWS, "FMT stage layout fits the stage's weight part");
@@ -825,11 +798,11 @@ __global__ void __launch_bounds__(256, 1)
 #pragma unroll
     for (int G = 0; G < 4; G++) xo[G] = xl + (((2 * G + ((lane >> 3) & 1)) ^ (lane & 7)) << 4);
 
-    // Software pipeline (S4): a stage's MMAs use fragments made during the previous stage, and the next stage's
+    // Software pipeline: a stage's MMAs use fragments made during the previous stage, and the next stage's
     // scales + fragments are made between this stage's MMAs (the warp's own rows: scales -> fragments needs only
     // __syncwarp). ch: the fp16 sums of the current 128-k group; they go into acc at the start of the next group
     // (interleaved with its first MMAs) and after the loop. ch starts at 0, so the first add is 0 + 0 (exactly 0):
-    // every acc element gets the same sequence of fp32 adds as before.
+    // every acc element gets the same sequence of fp32 adds as without the pipeline.
     static_assert(HCH == 2, "pipelined step: fp16 groups of two stages");
     unsigned ch[HMI][HNI][2];
 #pragma unroll

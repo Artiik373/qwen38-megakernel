@@ -4,48 +4,54 @@ Every number here was measured on one machine: an RTX 3090 (24 GB, 480 W limit),
 Windows 11 with WSL2, CUDA 13.2, with unsloth's `Qwen3.8-27B-UD-Q4_K_XL.gguf` unless a section says otherwise. Each
 result carries its date and the commit it was measured on.
 
+Bit-level results are tied to the GPU's SM count: the kernel runs one block per SM and some sums are split by the grid
+(lm_head's per-block softmax sums; without exact reuse, the prefill attention's last-wave split, `a2_plan`). A GPU
+with another SM count (the 3090 has 82, an RTX 4090 128) can differ in the last bits and, at near-ties, in greedy
+tokens, so its replies are not expected to match these runs token for token.
+
 How to read them:
 - **Sessions.** The same binary runs several percent faster or slower from one session to the next with GPU temperature
   and clocks (up to ~11% between sessions on 2026-10-12). Absolute numbers are only compared within one session;
   changes made after a full run are measured A-B-A (old build, new build, old build again, in one session), never added
-  onto older absolutes. The llama.cpp column (2026-10-12 / 13) is the one exception, compared with later runs because
-  each of its rows is already the best of three sessions, which can only favour it, and because every gap is wider than
-  that spread: the narrowest, reading a 38k-token prompt (29.6 s against 24.2 s with preset F), is 22%, twice the ~11%,
-  and the decode rates are 63% to 110% apart.
+  onto older absolutes. The comparison with llama.cpp ran in one session with this engine (2026-10-31); only this
+  engine's question totals there come from the 2026-10-30 run.
 - **Rates.** Decode "tok/s" is generated tokens over decode time, as the server reports it (`timings`). The
   short-prompt rows are means of the per-request rates, as the client reports them; token-weighted rates (total tokens
   over total time) are given next to them.
 - **VRAM** is `nvidia-smi`'s memory used on the whole card, other processes included, unless a row says otherwise.
   GiB = MiB / 1,024.
-- **Other engines** are only compared where we ran them ourselves on this machine: llama.cpp b11548 (tuned) for speed,
+- **Other engines** are only compared where they ran on this machine: llama.cpp b12024 (tuned) for speed,
   llama.cpp b10246 as the accuracy reference, and upstream open-jet at 72ba4a7.
 
-Contents: [headline numbers](#headline-numbers) - [full run 2026-10-30](#full-run-2026-10-30) -
+Contents: [headline numbers](#headline-numbers) - [against llama.cpp, 2026-10-31](#against-llamacpp-2026-10-31) -
+[full run 2026-10-30](#full-run-2026-10-30) -
 [parallel agents](#parallel-agents) - [KV cache presets](#kv-cache-presets) -
 [Q4_K_M and upstream's scripts](#q4_k_m-and-upstreams-scripts) - [exactness](#exactness) -
 [the conversation cache](#the-conversation-cache) - [keep-warm](#keep-warm) - [images and video](#images-and-video) -
-[earlier full runs](#earlier-full-runs) - [reproducing](#reproducing).
+[wide verify](#wide-verify-2026-10-13) - [earlier full runs](#earlier-full-runs) - [reproducing](#reproducing).
 
 ## Headline numbers
 
 The latest result in each area. The links lead to the details, and the previous full run is at the
 [end of the file](#earlier-full-runs).
 
-**Against llama.cpp** ([full run 2026-10-30](#full-run-2026-10-30)): UD-Q4_K_XL, q8_0 KV cache, the server at 120k
-context. This engine: the release v2026.10.30 (6f3b257), 2026-10-30. llama.cpp: b11548's `llama-server`, tuned (q8_0
-KV, 4 MTP drafts), the same client, prompts and model file, the best value of each row over three sessions on
-2026-10-12 / 13.
+**Against llama.cpp** ([2026-10-31](#against-llamacpp-2026-10-31)): one session, UD-Q4_K_XL, q8_0 KV cache, the server
+at 120k context, the same client, prompts and model file. This engine: the release v2026.10.30 (6f3b257) at its default
+7 drafts. llama.cpp: b12024's `llama-server`, tuned, at 4 MTP drafts (its fastest) and at 7.
 
-| | llama.cpp | this engine |
-|---|---|---|
-| greedy decode, short prompts (4 x 512 tokens) | 82.7 tok/s | 156.7 tok/s |
-| sampled decode, thinking on (8 runs) | 65.8 tok/s | 138.2 tok/s |
-| decode at 38k / 101.6k context | 62.3 / 53.4 tok/s | 119.8 / 109.4 tok/s |
-| read a 101.6k-token prompt from scratch | 101.0 s | 75.2 s |
-| first token, short prompt | 124 ms | 66 ms |
-| follow-up turn in an 11.8k-token chat, prompt time | 323 ms | 176 ms |
-| 282 benchmark questions: right, total time | 229, 2,727 s | 230, 1,676 s |
-| VRAM, idle server at 120k context | 22.8 GiB | 21.3 GiB (preset D: 20.1, preset F: 20.0) |
+| | llama.cpp, 4 drafts | llama.cpp, 7 drafts | this engine |
+|---|---|---|---|
+| greedy decode, short prompts (4 x 512 tokens) | 86.8 tok/s | 73.4 tok/s | 156.9 tok/s |
+| sampled decode, thinking on (8 runs) | 72.8 tok/s | 57.6 tok/s | 138.5 tok/s |
+| decode at 38k / 101.6k context | 66.1 / 54.4 tok/s | 52.7 / 44.7 tok/s | 119.7 / 109.2 tok/s |
+| read a 101.6k-token prompt from scratch | 95.9 s | 96.5 s | 75.1 s |
+| first token, short prompt | 117 ms | 120 ms | 66 ms |
+| follow-up turn in an 11.8k-token chat, prompt time | 222 ms | 241 ms | 177 ms |
+| 282 benchmark questions: right, total time | 229, 2,563 s | 229, 2,841 s | 230, 1,676 s (2026-10-30) |
+| VRAM, idle server at 120k context | 22.7 GiB | 23.2 GiB | 21.2 GiB (presets D / F: 20.1 / 20.0, 2026-10-30) |
+
+Without drafts on either side: 43.5 against 46.7 tok/s on the short prompts, 36.1 against 43.3 at 38k and 27.8 against
+39.1 at 101.6k context ([without drafts](#without-drafts)).
 
 **Everything else:**
 
@@ -56,36 +62,95 @@ KV, 4 MTP drafts), the same client, prompts and model file, the best value of ea
 | accuracy against llama.cpp generating token by token | top token agrees on 98.737% of positions, mean KL 0.00119 nats (llama.cpp's own batched run: 98.489%, 0.00166) | 2026-10-17, unchanged through v2026.10.30 | [against llama.cpp](#against-llamacpp) |
 | KV presets D / F: KL at 100k context | 0.00226 / 0.00218, against q8_0's 0.00217 | 2026-10-25 | [KV cache presets](#kv-cache-presets) |
 | the full 262,144-token context, preset F | a 260,896-token prompt in 340 s, decode at that depth 66.6 tok/s, 23,650 MiB on the card | 2026-10-25 | [the full context](#the-full-context) |
-| greedy token ids at 0, 4 and 7 drafts | identical | each release | [speculation](#speculation) |
+| greedy token ids at 0, 4 and 7 drafts | identical (llama.cpp b12024's greedy answers at 4 and 7 drafts: 9 of 282 differ) | each release (llama.cpp: 2026-10-31) | [speculation](#speculation) |
 | Windows build against Linux build | identical output | each release | [Windows and Linux](#windows-and-linux) |
 | reused, parked and restored requests (exact reuse) | bit for bit equal to the same request sent fresh | 2026-10-14 to 10-21 | [exact reuse](#exact-reuse) |
+
+## Against llama.cpp, 2026-10-31
+
+One session on 2026-10-31: llama.cpp b12024's `llama-server` (ddf48f85c, built from source on Windows with CUDA 12.8
+for sm_86) at 4, 7 and 0 MTP drafts, then this engine, the release v2026.10.30 (6f3b257, the build of the
+[2026-10-30 run](#full-run-2026-10-30), its Linux build on WSL2 as `scripts/serve.sh` starts it) at its default 7
+drafts and at 0. Both at 120,000 tokens of context with a q8_0 KV cache, driven by
+[bench/suite](../bench/suite/README.md)'s clients with the same prompts and model file; llama.cpp with the tuned command
+in [bench/suite](../bench/suite/README.md#2-start-a-server).
+
+| | llama.cpp, 4 drafts | llama.cpp, 7 drafts | this engine, 7 drafts |
+|---|---|---|---|
+| greedy decode, short prompts (4 x 512 tokens), mean of request rates | 86.8 tok/s | 73.4 | 156.9 |
+| the same, token-weighted | 80.4 | 62.4 | 133.4 |
+| sampled decode, thinking on (8 runs), mean of request rates | 72.8 tok/s | 57.6 | 138.5 |
+| the same, token-weighted | 67.8 | 51.5 | 132.3 |
+| decode at 11.6k context (200 tokens) | 72.5 tok/s | 58.5 | 138.8 |
+| decode at 38k context (256 tokens) | 66.1 tok/s | 52.7 | 119.7 |
+| decode at 101.6k context (256 tokens) | 54.4 tok/s | 44.7 | 109.2 |
+| read an 11.6k-token prompt | 7.47 s | 7.59 s | 5.95 s |
+| read a 38k-token prompt | 27.8 s | 27.9 s | 23.2 s |
+| read a 101.6k-token prompt from scratch | 95.9 s | 96.5 s | 75.1 s |
+| first token, short prompt | 117 ms | 120 ms | 66 ms |
+| follow-up turn in an 11.8k-token chat, prompt time | 222 ms | 241 ms | 177 ms |
+| edit an earlier message in an 11.7k-token chat, prompt time | 266 ms | 269 ms | 76 ms |
+| edit the end of a 9.1k-token system prompt, prompt time | 874 ms | 883 ms | 89 ms |
+| VRAM, whole card, server idle | 22.7 GiB | 23.2 GiB | 21.2 GiB |
+| 282 benchmark questions: right, total time | 229, 2,563 s | 229, 2,841 s | 230, 1,676 s (2026-10-30) |
+
+### Without drafts
+
+The same clients with no drafting on either side (llama.cpp without `--spec-type`, this engine with `MK_DRAFT=0`):
+
+| | llama.cpp | this engine | this engine ahead |
+|---|---|---|---|
+| greedy decode, short prompts, mean of request rates | 43.5 tok/s | 46.7 | 7.5% |
+| sampled decode, thinking on, mean of request rates | 43.3 tok/s | 46.4 | 7.3% |
+| decode at 11.6k / 38k / 101.6k context | 40.8 / 36.1 / 27.8 tok/s | 45.3 / 43.3 / 39.1 | 11% / 20% / 41% |
+| VRAM, whole card, server idle | 21.1 GiB | 21.1 GiB | |
+
+Notes:
+- **Draft depth.** 4 drafts is llama.cpp's fastest setting here, as it was on b11548: 2, 5 and 6 drafts, measured in
+  the same session, were slower than 4 on every decode row above (greedy short prompts 80.0, 82.1 and 76.7 tok/s) except
+  2 drafts' token-weighted sampled rate (69.8 against 67.8); 2 drafts was also faster on the story prompt alone (66.9
+  against 61.4 tok/s, greedy). At 7 drafts llama.cpp decodes 15% to 24% slower than at 4 and reads prompts within 2% of
+  it. Its greedy answers also change with the depth ([speculation](#speculation)).
+- **This engine reproduced its 2026-10-30 numbers:** the decode, prompt, first-token, follow-up and VRAM rows within
+  0.3% (greedy 156.9 against 156.7 tok/s, decode at 101.6k 109.2 against 109.4, the 101.6k prompt 75.1 against 75.2 s),
+  the two edit rows within 2.2% (75.5 against 77.2 ms, 88.8 against 89.2 ms).
+- **Against b11548**, the previous llama.cpp column (the best of three sessions on 2026-10-12 / 13; in this file's
+  history at d034e3a): b12024 at 4 drafts decodes 2% to 11% faster, reads prompts 5% to 9% faster and answers the
+  follow-up turn in 222 instead of 323 ms. On the four greedy prompts through a simpler client, an A-B-A in one session
+  gave b11548 85.2, b12024 89.5, b11548 84.9 tok/s.
+- **The questions:** llama.cpp got the same 229 at both depths (GSM8K 50 / 50, MMLU-Pro 45 / 70, ARC-C 47 / 50,
+  MATH-500 28 / 40 and 9 / 10 with thinking on, HumanEval 38 / 41, NIAH 9 / 9, LongBench v2 3 / 12), in 2,563 s instead
+  of b11548's 2,727. This engine's 230 are [the 2026-10-30 run's](#full-run-2026-10-30).
+- **Passes repeated:** a first pass ran ~20% slow (same draft acceptance, the rate climbing within each request) and
+  was repeated after a reboot; the 6-draft pass was repeated after outside load during it.
+- **Conditions:** fans at 97-98%; GPU 48-73 C and SM clock 1,815-2,025 MHz at the start and end of each pass; memory
+  clock 9,851 MHz. llama.cpp ran natively on Windows, this engine under WSL2.
 
 ## Full run 2026-10-30
 
 The release v2026.10.30 (6f3b257), its Linux build on WSL2: the server at 120,000 tokens of context as
 `scripts/serve.sh` starts it (wide verify, 7 drafts, exact reuse, side requests and parked conversations on, prefill
-chunk 1,024), driven by [bench/suite](../bench/suite/README.md) in one session. The llama.cpp column is b11548's
-`llama-server`, tuned (q8_0 KV, 4 MTP drafts), driven by the same client with the same prompts and model file: the best
-value of each row over three sessions (2026-10-12 and 10-13; the questions on 10-13).
+chunk 1,024), driven by [bench/suite](../bench/suite/README.md) in one session. The comparison with llama.cpp is in
+[against llama.cpp, 2026-10-31](#against-llamacpp-2026-10-31).
 
-| | llama.cpp (10-12 / 10-13) | this, q8_0 KV | this, preset D | this, preset F |
-|---|---|---|---|---|
-| greedy decode, short prompts (4 x 512 tokens), mean of request rates | 82.7 tok/s | 156.7 | 156.8 | 150.2 |
-| the same, token-weighted | 76.2 | 133.2 | 133.4 | 127.3 |
-| sampled decode, thinking on (8 runs), mean of request rates | 65.8 tok/s | 138.2 | 138.2 | 138.3 |
-| the same, token-weighted | 63.9 | 132.0 | 132.0 | 130.6 |
-| decode at 11.6k context (200 tokens) | 69.3 tok/s | 138.7 | 137.5 | 124.0 |
-| decode at 38k context (256 tokens) | 62.3 tok/s | 119.8 | 102.8 | 101.8 |
-| decode at 101.6k context (256 tokens) | 53.4 tok/s | 109.4 | 99.0 | 109.9 |
-| read an 11.6k-token prompt | 8.24 s | 5.95 s | 6.06 s | 6.11 s |
-| read a 38k-token prompt | 29.6 s | 23.1 s | 24.0 s | 24.2 s |
-| read a 101.6k-token prompt from scratch | 101.0 s | 75.2 s | 78.1 s | 77.9 s |
-| first token, short prompt | 124 ms | 66 ms | 65 ms | 66 ms |
-| follow-up turn in an 11.8k-token chat, prompt time | 323 ms | 176 ms | 184 ms | 185 ms |
-| edit an earlier message in an 11.7k-token chat, prompt time | 329 ms | 77 ms | 76 ms | 77 ms |
-| edit the end of a 9.1k-token system prompt, prompt time | 956 ms | 89 ms | 99 ms | 100 ms |
-| VRAM, whole card, server idle | 22.8 GiB | 21.3 GiB | 20.1 GiB | 20.0 GiB |
-| 282 benchmark questions: right, total time | 229, 2,727 s | 230, 1,676 s | 230, 1,716 s | 229, 1,714 s |
+| | q8_0 KV | preset D | preset F |
+|---|---|---|---|
+| greedy decode, short prompts (4 x 512 tokens), mean of request rates | 156.7 tok/s | 156.8 | 150.2 |
+| the same, token-weighted | 133.2 | 133.4 | 127.3 |
+| sampled decode, thinking on (8 runs), mean of request rates | 138.2 tok/s | 138.2 | 138.3 |
+| the same, token-weighted | 132.0 | 132.0 | 130.6 |
+| decode at 11.6k context (200 tokens) | 138.7 tok/s | 137.5 | 124.0 |
+| decode at 38k context (256 tokens) | 119.8 tok/s | 102.8 | 101.8 |
+| decode at 101.6k context (256 tokens) | 109.4 tok/s | 99.0 | 109.9 |
+| read an 11.6k-token prompt | 5.95 s | 6.06 s | 6.11 s |
+| read a 38k-token prompt | 23.1 s | 24.0 s | 24.2 s |
+| read a 101.6k-token prompt from scratch | 75.2 s | 78.1 s | 77.9 s |
+| first token, short prompt | 66 ms | 65 ms | 66 ms |
+| follow-up turn in an 11.8k-token chat, prompt time | 176 ms | 184 ms | 185 ms |
+| edit an earlier message in an 11.7k-token chat, prompt time | 77 ms | 76 ms | 77 ms |
+| edit the end of a 9.1k-token system prompt, prompt time | 89 ms | 99 ms | 100 ms |
+| VRAM, whole card, server idle | 21.3 GiB | 20.1 GiB | 20.0 GiB |
+| 282 benchmark questions: right, total time | 230, 1,676 s | 230, 1,716 s | 229, 1,714 s |
 
 Notes:
 - **The follow-up turn** re-reads the previous reply because exact reuse is on; `MK_EXACT_REUSE=0` appends to it
@@ -141,7 +206,7 @@ Notes:
 - **Edits:** a three-turn chat over 30k characters of the document, then turn 2's user message edited; a 9.1k-token
   system prompt, then its last word changed. The row is the prompt time of the edited request.
 - **Questions:** 282 items, greedy, zero-shot, the same prompts for both engines, thinking off except for the 10
-  MATH-500 items with thinking; scored offline. The llama.cpp answers come from the same client on 2026-10-13.
+  MATH-500 items with thinking; scored offline. The llama.cpp answers come from the same client on 2026-10-31.
 
 ### Changes since the 2026-10-20 run
 
@@ -185,6 +250,27 @@ of open-jet's `bench/parallel_bench.py`) on unsloth's plain `Qwen3.8-27B-Q4_K_M.
   sampling beside other slots keeps its distribution, not its tokens
   ([SERVER.md](SERVER.md#several-agents-at-once---agents)).
 
+### Against open-jet's server
+
+Open-jet's `bench/parallel_bench.py` (unchanged) against this server and against open-jet's own server (f246ff0) running
+the same engine library: Q4_K_M, `--agents 4 -d 7`, one session on an RTX 3090 with open-jet's server first and last,
+2026-10-28. A total adds the four requests' decode rates (512 tokens each, temperature 0.6).
+
+| | open-jet's server | this server | this server, `MK_EXACT=0` | open-jet's server again |
+|---|---|---|---|---|
+| 4 short requests at once, total tok/s (2 runs) | 288 / 350 | 328 / 354 | 341 / 357 | 291 / 344 |
+| 4 requests with ~23k-token contexts, total tok/s | 286 | 305 | 302 | 304 |
+| a 20k-token prompt sent while another request decodes: its first token after | 15.7 s | 15.8 s | 15.8 s | 15.7 s |
+| the other request meanwhile | 11.5 tok/s | 12.9 tok/s | 12.8 tok/s | 10.6 tok/s |
+| 1 short request alone, tok/s (2 runs) | 193 / 184 | 190 / 201 | 185 / 205 | 163 / 187 |
+| 1 request with a ~23k-token context alone, tok/s | 161 | 203 | 158 | 173 |
+
+The decoding is the engine's either way, so the totals differ by run-to-run noise (one request alone with a long
+context varies most). Exact mode (`MK_EXACT=1`, the `--agents` default) costs nothing measurable here. Feeding a
+waiting prompt whole instead (`MK_PF_MIX=0 MK_PF_CHUNK=0`; another session that day, open-jet's server 15.7 s and
+11.5 / 10.7 tok/s there) got the 20k-token prompt's first token after 11.0 s, while the other request made 0.6 tok/s
+meanwhile.
+
 ## KV cache presets
 
 `MK_KV` stores K and V below 8 bits, and `MK_KV_WIN=2048` keeps the most recent 2,048 positions in an 8-bit ring next
@@ -215,6 +301,21 @@ nats. The fp16 cache, more precise than q8_0, marks the floor of the measurement
   (2026-10-25). Whole-card VRAM, speed and the 282 questions under each preset: the
   [full run](#full-run-2026-10-30).
 
+### C, D and E side by side
+
+One session on 2026-10-13 (1ed60cd, 4 drafts, A-B-A against q8_0; KL against llama.cpp's reference, relative to
+q8_0's own). Memory is compared at 120k, the launchers' default context: the third column is how much context fits in
+the VRAM q8_0 uses at 120k, not how far a preset was tested.
+
+| Preset | Frees at 120k | Context that fits in q8_0's 120k VRAM | KL: short / 32k / 64k | Decode, ms per cycle at 38k / 101.6k | Prefill speed at 38k / 101.6k |
+|---|---|---|---|---|---|
+| C | 691 MiB | 144k | same / +4% / +2% | +1.2% / +3.7% | -1.3% / -2.7% |
+| D | 1,132 MiB | 165k | same / +1% / +5% | +2.9% / +5.0% | -3.3% / -6.7% |
+| E | 1,381 MiB | 180k | +2% / +5% / +10% | +2.4% / +4.9% | -2.0% / -4.2% |
+
+D' is D with the MTP layer's cache at 8 bits (~70 MB more; the drafts read q8_0 K / V): at 7 drafts it decoded 1.2% /
+2.9% faster than D at 101.6k / 38k with the same output ids and 32k KL as D (2026-10-13, 9dede7f).
+
 ### Preset F
 
 K at 5 bits, stored Hadamard-rotated, and V at 5 bits, with the 2,048 window (`MK_KV='K*=5r,V*=5' MK_KV_WIN=2048`). In
@@ -231,6 +332,8 @@ the real kernels (2026-10-25, 7322fbd):
 - **A larger window did not help:** at 32k, F read 0.00242 / 0.00239 / 0.00245 / 0.00240 with `MK_KV_WIN` 2048 / 2688
   / 3328 / 4608 (rings of 114 / 137 / 159 / 204 MiB), all within the set's noise. Its excess over q8_0 sits in the
   older 5-bit rows.
+- **Prompt speed:** F reads prompts as fast as D: a 101.6k-token prompt in 76.97 s against D's 77.40 s (2026-10-25,
+  fad007f, one session).
 
 ### The full context
 
@@ -344,6 +447,8 @@ the lower of this engine's two passes, which agreed within 0.7%:
 
 Draft acceptance in reasoning mode: open-jet 55.6%, this engine 61.1% with 4 drafts and 51.8% with 7. Upstream has
 since merged some of this engine's kernels (open-jet #24 to #27), so the comparison is with 72ba4a7 as it was.
+`code_bench.py` takes its context prompt from the checkout's own `qwen38_mk.cu`, `prefill.cuh` and `prefill_gemm.cuh`,
+which the device / host split rewrote, so a later run of the script is not comparable with these rows either.
 
 ## Exactness
 
@@ -353,6 +458,16 @@ since merged some of this engine's kernels (open-jet #24 to #27), so the compari
   length, and the verify GEMMs compute every row the same way whatever the number of rows, so the same prompt gives the
   same token ids at 0, 4 and 7 drafts. Every release is checked this way (v2026.10.30: the Windows build's ids at 0 and
   7 drafts equal the Linux build's at 7).
+- **llama.cpp's greedy output depends on the draft depth.** Its greedy answers to the 282 questions at 4 and at 7 MTP
+  drafts (b12024, 2026-10-31) differ on 9: none of the 236 answers under 1,000 tokens, 9 of the 46 longer ones. On
+  MMLU-Pro (3) and MATH-500 (3) the first difference is 1,936 to 4,550 characters in; on MATH-500 with thinking on (3)
+  the reasoning itself went another way (2,228 against 4,795 tokens on one). Asked again twice at 4 drafts on a fresh
+  server, the 9 got the same answer both times (reasoning text included), and on 8 of them the first run's: those 8
+  differences come from the draft depth. The ninth's first answer came after the other questions on the same server and
+  is not reproduced without them (3,692 against 4,405 tokens). A preregistered study of llama.cpp's MTP on one RTX 3090
+  (Hsiu-Chi Tsai, 2026-08-29, [repository](https://github.com/thc1006/qwen3.8-speculative-decoding-rtx3090),
+  [archive](https://doi.org/10.5281/zenodo.22149941)) found its output the same from pass to pass but different from
+  decoding without drafts in 23 to 25 of 25 prompts by 1,600 tokens.
 - **Sampling keeps the distribution of sampling without drafts.** A draft is accepted with probability p(draft) and a
   rejected one is resampled from the rest of the distribution. Checked with chi-square and PIT tests; the counter-based
   random numbers, keyed by seed and position, were checked with a CPU replica of the loop (396k re-drafted positions)
@@ -381,6 +496,18 @@ What it costs (2026-10-14): a follow-up turn re-reads the previous reply (11.6k-
 short set and 99.121% / 0.00231 at 32k with exact reuse, 98.654% / 0.00116 and 99.023% / 0.00232 without. The CLI
 measurements in [against llama.cpp](#against-llamacpp) run without exact reuse (the CLI's default); the launchers'
 server runs with it.
+
+### fp16 range in the prefill GEMMs
+
+The prefill GEMMs add two 64-wide k stages (128 products) in fp16 before the fp32 accumulators, and store their inputs
+as fp16 clamped to +-65504. A debug build with `MK_PF_INFCHK=1` (73fd978; compiled out of the served build) counts,
+per layer and GEMM, the fp16 partial sums that are inf / NaN, the non-finite outputs, and the inputs the clamp
+saturates or turns from NaN into -65504.
+
+| prompt | result | date |
+|---|---|---|
+| a 38,048- and a 101,583-token prompt, `-d 7`, q8_0 KV | every counter 0, in every layer | 2026-10-17 |
+| positive control: an 81-token prompt with a NaN image row | every counter fires; the engine stops with "no finite logit" | 2026-10-17 |
 
 ### Against llama.cpp
 
@@ -524,17 +651,25 @@ On the Ryzen 9 5900XT (32 threads):
 The image and video encoder runs on the CPU, so it takes no VRAM: with an image projector loaded, the idle server's
 VRAM at 120k context did not grow (2026-10-16).
 
+## Wide verify (2026-10-13)
+
+The int8 tensor-core verify pass (wide verify, up to 7 drafts) when it was first served, 72a58cd at 7 drafts, against
+the dp4a verify pass before it, 999fc68 at its most, 4 drafts: greedy decode on the short prompts 17.6% faster, sampled
+with thinking 19.5% faster, decode at 101.6k context 9.2% faster. The dp4a pass summed in another order (greedy output
+still independent of the draft depth) and was neither released nor gated; its build went with the other compile-time
+switches ([CONFIGURATION.md](CONFIGURATION.md#former-flags)).
+
 ## Earlier full runs
 
-Older runs (2026-10-14 and 10-15) are in this file's history at fe21771. The 2026-10-14 run with charts and raw data,
+Older runs (2026-10-14 and 10-15) are in this file's history at fe21771, and the previous llama.cpp column (b11548, the
+best of three sessions on 2026-10-12 / 13) at d034e3a. The 2026-10-14 run with charts and raw data,
 and the gates behind each change up to 2026-10-16, are in the open-jet fork's
 [perf docs](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf/perf), where this engine was developed
 until it moved here.
 
 ### 2026-10-20 (7322fbd)
 
-The same client and settings as the 2026-10-30 run, q8_0 and preset D, one session, fans at 100%. The llama.cpp column
-of the [2026-10-30 table](#full-run-2026-10-30) applies here too.
+The same client and settings as the 2026-10-30 run, q8_0 and preset D, one session, fans at 100%.
 
 | | this, q8_0 KV | this, preset D |
 |---|---|---|
@@ -562,8 +697,8 @@ rows and the timing of its GSM8K and MMLU-Pro sets come from a second pass that 
 - **Parallel agents:** the parallel step of [bench/suite](../bench/suite/README.md) (`parallel_client.py`, its context
   fetched by `fetch.py`); without a server, `python3 bench/slots_bench.py <gguf> all` checks the engine's slots against
   each conversation alone and times them.
-- **Speed, CLI:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_56k.bin --model <gguf>` (the four
-  chat prompts through the CLI; it runs the CLI's default KV cache, so at most 4 drafts); `bench/code_bench.py` and
+- **Speed, CLI:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_56k.bin --model <gguf>` (the
+  four chat prompts through the CLI; it runs the CLI's default KV cache, so at most 4 drafts); `bench/code_bench.py` and
   `bench/think_bench.py` are upstream's scripts; `bench/*.cu` are kernel microbenchmarks.
 - **Accuracy against llama.cpp:**
 

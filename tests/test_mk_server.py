@@ -1,5 +1,4 @@
-"""Tests of server/mk_server.py without a GPU: request parsing, prompt reuse and image handling against fake engines.
-(Moved from open-jet's tests/test_megakernel_backend.py with the server itself.)"""
+"""Tests of server/mk_server.py without a GPU: request parsing, prompt reuse and image handling against fake engines."""
 import base64
 import contextlib
 import http.client
@@ -264,7 +263,7 @@ class MegakernelVisionTests(unittest.TestCase):
         text, media = self._media([img, img])
         self.assertEqual((text, len(media)), (m + m, 2))
         self.assertEqual(media[0][:4], bytes([0x89, 0x50, 0x4E, 0x47]))  # (the decoded data: URL)
-        # a message without images keeps its parts, as before
+        # a message without images keeps its parts
         self.assertIsInstance(self._media([{"type": "text", "text": "a"}])[0], list)
 
     def test_remote_image_urls_are_rejected(self) -> None:
@@ -330,7 +329,7 @@ class MegakernelVisionTests(unittest.TestCase):
         self.assertEqual([c[0] for c in srv.eng.calls], ["reset", "reset", "images", "prefill"])
 
 
-# === sec:harness ===
+# === HTTP harness ===
 # The HTTP handler end to end (make_handler on a local port) over a scripted engine: no GPU, no model.
 
 TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
@@ -466,7 +465,7 @@ class _HttpCase(unittest.TestCase):
         return srv, http_
 
 
-# === sec:b3 ===
+# === api: tool calls cut by max_tokens ===
 TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {
     "type": "object", "properties": {"path": {"type": "string"}}}}}]
 CALL = "<tool_call>\n<function=read_file>\n<parameter=path>\n/etc/hostname\n</parameter>\n</function>\n</tool_call>"
@@ -529,7 +528,7 @@ class ToolCallCutTests(_HttpCase):
                     json.loads(calls[0]["function"]["arguments"])
 
 
-# === sec:b1 ===
+# === srv: image ownership, MK_MAX_IMAGES ===
 class _FakeVisionLib:
     """libqwen38vision's C API over Python objects; using a freed image is recorded (the real library crashes)"""
 
@@ -619,7 +618,7 @@ class ImagePinTests(_HttpCase):
             self.assertEqual(http_.post(self._images([b"i%d" % i for i in range(4)]))[0], 200)
 
 
-# === sec:b2 ===
+# === srv: engine errors in a stream ===
 class StreamErrorTests(_HttpCase):
     """an engine error after the stream started is an SSE error event and [DONE], not a second status line"""
 
@@ -644,7 +643,7 @@ class StreamErrorTests(_HttpCase):
         self.assertEqual((status, json.loads(data)["error"]["type"]), (500, "server_error"))
 
 
-# === sec:b5c ===
+# === srv: client disconnects ===
 class DisconnectTests(_HttpCase):
     """a client that closes its connection stops the generation at the next engine cycle"""
 
@@ -675,7 +674,7 @@ class DisconnectTests(_HttpCase):
                        "stream": True})
 
 
-# === sec:b5a ===
+# === srv: request body limits ===
 class BodyLimitTests(_HttpCase):
     """Content-Length: required, numeric, at most MK_MAX_BODY_MB; a refused body is not read and the connection closes"""
 
@@ -832,7 +831,7 @@ class LingerTests(_HttpCase):
         with mock.patch.object(self.mk, "MAX_BODY_MB", 1), mock.patch.object(self.mk, "LINGER_BYTES", 4 << 20):
             t = time.time()
             line, err = self._upload(http_, 256 << 20, 256 << 20)
-            self.assertIsNone(line)  # (reset after 4 MiB: the client is told by a reset, as before)
+            self.assertIsNone(line)  # (reset after LINGER_BYTES, 4 MiB: past the drain's bound the client gets a reset)
             self.assertLess(time.time() - t, 5.0)
         with mock.patch.object(self.mk, "MAX_BODY_MB", 1), mock.patch.object(self.mk, "LINGER_S", 0.5):
             t = time.time()
@@ -920,7 +919,7 @@ class StopStringTests(_HttpCase):
             for stop in ("END", ["near", " wor"], "ld. T", ["o"], "Hello", "zzz", ["is n", "ear"]):
                 content, _, finish, n, srv = self._reply(stop, stream)
                 want, word = self._cut(full, [stop] if isinstance(stop, str) else stop)
-                self.assertEqual(content, want.rstrip(), (stop, stream))  # (the end of a reply is trimmed, as ever)
+                self.assertEqual(content, want.rstrip(), (stop, stream))  # (the end of a reply is trimmed)
                 self.assertEqual(finish, "stop", (stop, stream))
                 self.assertEqual(srv.stop_word, word, (stop, stream))
                 if word is not None:  # (tokens up to the one that completed the stop string)
@@ -1291,6 +1290,34 @@ class ExtraRouteTests(_HttpCase):
         srv.eng.n_vocab = 0  # (a library without mk_n_vocab)
         self.assertEqual(self._post(http_, "/detokenize", {"tokens": [104]})[0], 400)
 
+    def test_malformed_fields_are_400(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        hi = [{"role": "user", "content": "hi"}]
+        for path, body in (("/v1/chat/completions", {"messages": [1]}), ("/apply-template", {"messages": [None]}),
+                           ("/v1/chat/completions/input_tokens", {"messages": [1]}),
+                           ("/v1/chat/completions", {"messages": hi, "repetition_penalty": "x"}),
+                           ("/v1/chat/completions", {"messages": hi, "max_tokens": 0}),
+                           ("/v1/chat/completions", {"messages": hi, "max_tokens": 0, "stream": True}),
+                           ("/v1/messages", {"messages": hi, "max_tokens": 0})):
+            self.assertEqual(self._post(http_, path, body)[0], 400, (path, body))
+
+    def test_http10_stream_is_not_chunked(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        b = json.dumps({"messages": [{"role": "user", "content": "hi"}], "stream": True}).encode()
+        with socket.create_connection(("127.0.0.1", http_.port), timeout=10) as s:
+            s.sendall(b"POST /v1/chat/completions HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n"
+                      b"Content-Length: %d\r\n\r\n" % len(b) + b)
+            data = b""
+            while True:  # (the body ends when the server closes the connection)
+                d = s.recv(65536)
+                if not d:
+                    break
+                data += d
+        head, _, body = data.partition(b"\r\n\r\n")
+        self.assertNotIn(b"transfer-encoding", head.lower())
+        self.assertIn(b"connection: close", head.lower())
+        self.assertTrue(body.startswith(b"data: {") and body.endswith(b"data: [DONE]\n\n"), body[-80:])
+
     def test_unsupported_routes_are_501_unknown_404(self) -> None:
         _, http_ = self.serve(_ScriptEngine(["ok"]))
         for path in ("/v1/completions", "/completion", "/v1/embeddings", "/infill", "/v1/rerank", "/v1/responses/compact",
@@ -1301,7 +1328,7 @@ class ExtraRouteTests(_HttpCase):
         self.assertEqual(self._post(http_, "/nope", {})[0], 404)
 
 
-# === M8: --chat-template-file / --chat-template ===
+# === api: --chat-template-file / --chat-template ===
 # tests/templates: the chat templates of real GGUFs (tokenizer.chat_template, exact bytes): qwen38_unsloth.jinja =
 # unsloth's Qwen3.8-27B GGUFs (developer role, merged system messages, tool-only turns), qwen38_original.jinja = Qwen's
 # original, as a fine-tune's GGUF ships it (Swift-1.5-Qwen3.8-27B)

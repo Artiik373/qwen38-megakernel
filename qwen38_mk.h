@@ -60,6 +60,7 @@ class MKEngine {
     // (older ones thin out, recent ones stay dense). ck_exact (or -1) is kept at its exact position; the others move
     // down by up to 31 tokens onto the batched prefill's scan grid. Saving changes nothing the prefill computes.
     // Unless ck_exact is inside the batched part, a checkpoint at the end of the prompt is saved too (as prefill()).
+    // MK_EXACT: ck_exact moves onto the grid like the others; no end-of-prompt checkpoint (MK_PF_CAP below 384: none).
     int prefill(const std::vector<int> & tokens, const std::vector<int> & cks, int ck_exact);
     // prefill(tokens, cks, ck_exact) with images inside the prompt (each ends before its last token; batched prefill
     // only). The sequence keeps their positions for its RoPE rows until a reset, rewind or truncate drops them; after a
@@ -74,11 +75,11 @@ class MKEngine {
     // (a verify row counts the drafts before it). 0, 0 (default): off. The engine's own sequence only: parallel slots
     // never apply them.
     void set_penalty(float presence, float frequency);
-    // Draft-depth policy, "key=value,..." (see qwen38_mk.cu); "" restores the default. The env var
+    // Draft-depth policy, "key=value,..." (see engine_impl.h); "" restores the default. The env var
     // MK_POLICY sets it at construction.
     void set_policy(const std::string & spec);
     // KV-cache quantisation emulation (builds with -DMK_KV_EMU=1; accuracy experiments): the MK_KV_EMU_SPEC syntax
-    // (see qwen38_mk.cu), applied to the rows stored from now on. Throws on other builds.
+    // (see engine_impl.h), applied to the rows stored from now on. Throws on other builds.
     void set_kv_emu(const std::string & spec);
     // Drops emitted tokens beyond `len` sequence positions (e.g. those generated after an
     // end-of-turn token within the last cycle) before the next prefill.
@@ -120,15 +121,14 @@ class MKEngine {
     void prefill_progress(int * done, int * total) const;
     // Runs one verify+draft cycle; appends 1..n_draft+1 accepted tokens to `out`.
     int step(std::vector<int> & out);
-    // Debug helper: copy of the last main-model logits row selection (argmax ids) is not kept;
-    // instead expose the final normalised hidden row of the last processed position.
+    // Debug helper: the final normalised hidden row of the last processed position (the logits are not kept).
     std::vector<float> last_hidden();
-    // Test helper (exact-reuse probes): 64-bit digests of the sequence state, layout in qwen38_mk.cu (state_digest).
+    // Test helper (exact-reuse probes): 64-bit digests of the sequence state, layout in engine.cu (state_digest).
     std::vector<unsigned long long> state_digest();
     // Test helper: the draft vocabulary's rows (token ids) as the device holds them, checked against the host's list
     // (throws if they differ); empty without a draft vocabulary.
     std::vector<int> draft_vocab();
-    // MK_EXACT=1 at construction: prefill results independent of the chunking (see qwen38_mk.cu `exact`).
+    // MK_EXACT=1 at construction: prefill results independent of the chunking (see engine_impl.h `exact`).
     bool exact() const;
     // false: no MTP layer (see the constructor's mtp): depth 0 only
     bool has_mtp() const;
@@ -201,7 +201,7 @@ class MKEngine {
     int position() const;
 
     // Parallel slots (open-jet's slot API): n persistent sequences (lanes) of ctx positions each (0: the most that fit),
-    // decoded together by batched launches; returns ctx. MK_WV=1 MK_MAXT > 5 builds, the plain q8 KV cache, a model whose
+    // decoded together by batched launches; returns ctx. Needs the plain q8 KV cache and a model whose
     // delta-net projections are all in the wv layout (plain Q4_K_M). The draft vocabulary is the base list from then on.
     // slot_begin: the slot takes the prompt (sampling as set_sampling), reusing the longest prefix it can (a truncate of
     // emitted tokens, else its newest checkpoint before the divergence); returns the reused tokens, slot_prefill feeds

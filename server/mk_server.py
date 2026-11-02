@@ -359,10 +359,12 @@ class Engine:
         cap = min(len(b) + 16, 1 << 20)  # (a longer text is tokenized twice: the first call returns its count)
         out = (ctypes.c_int * cap)()
         n = run(out, cap)
-        if n < 0:
+        if -2 ** 31 < n < 0:  # (-count: a longer buffer; INT_MIN: an error)
             cap = -n
             out = (ctypes.c_int * cap)()
             n = run(out, cap)
+        if n < 0:
+            raise self._err("tokenize")
         return list(out[:n])
 
     def controls(self):
@@ -967,6 +969,10 @@ class VideoDecoder:
     would be decoded, 4.8 GB of rgb24 each) with MAX_PIXELS_SLACK more, as decoders check their row-aligned size
     (1100 x 1000 counts as 1152 x 1000), so that every frame within the limit decodes."""
     MAX_PIXELS_SLACK = 1 << 23  # (a 64-column and 64-row alignment of frames up to 65535 x 65535)
+    # the demuxers ffmpeg may use (-format_whitelist; "mov,mp4,m4a,..." matches by any of its names): media containers
+    # that read nothing but the file (mov's external tracks, enable_drefs, are off by default). Not DASH / HLS /
+    # concat: a manifest or playlist opens other files and URLs (ffmpeg 6's dash outside -protocol_whitelist too)
+    FORMATS = "mov,mp4,matroska,webm,avi,mpegts,mpeg,ogg,flv,gif"
 
     def __init__(self, exe):
         self.exe = exe
@@ -989,12 +995,13 @@ class VideoDecoder:
         max_frames frames (when the next frame arrives) or a decode over `timeout` seconds"""
         timeout = VIDEO_DECODE_S if timeout is None else timeout
         with tempfile.TemporaryDirectory(prefix="mkvideo") as d:
-            # (a name without an extension and only the file protocol: a "video" that is a playlist or a concat list
-            # cannot make ffmpeg open URLs or other files; ffmpeg 6 refuses an HLS playlist without .m3u8 by itself)
+            # (FORMATS only: a "video" that is a manifest, a playlist or a concat list cannot make ffmpeg open other
+            # files or URLs; the file protocol only and a name without an extension stay as a second layer)
             path = os.path.join(d, "input")
             with open(path, "wb") as f:
                 f.write(data)
             cmd = [self.exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file",
+                   "-format_whitelist", self.FORMATS,
                    "-max_pixels", str(min(IMAGE_MAX_PIXELS + self.MAX_PIXELS_SLACK, 2 ** 31 - 1)), "-i", path,
                    "-an", "-sn", "-vf", f"fps={fps:.6f}", "-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "pipe:1"]
             try:
@@ -1050,6 +1057,10 @@ class VideoDecoder:
             if big:  # (-max_pixels: ffmpeg did not decode a frame, also after others of a smaller size)
                 raise BadRequest(f"video: frames of about {big[1]} x {big[2]} pixels: over the limit of {IMAGE_MAX_PIXELS} "
                                  f"pixels (MK_IMAGE_MAX_PIXELS)")
+            fmt = re.search(r"\[([\w,]+) @ \w+\] Format not on whitelist", err.decode(errors="replace"))
+            if fmt and n == 0:  # (-format_whitelist: a manifest, a playlist, another container)
+                raise BadRequest(f"video: {fmt[1][:40]} input is refused (the containers read: "
+                                 f"{self.FORMATS.replace(',', ', ')})")
             if n == 0:
                 msg = err.decode(errors="replace").strip().splitlines()
                 raise BadRequest("video: no frames decoded" + (f" ({msg[-1][:300]})" if msg else ""))
@@ -1220,6 +1231,8 @@ def normalize_messages(messages, media=None):
     or video), so the prompt around each is llama-server's."""
     out = []
     for m in messages:
+        if not isinstance(m, dict):
+            raise BadRequest("messages: each message must be an object")
         m = dict(m)
         content = m.get("content")
         if isinstance(content, list):
@@ -1500,7 +1513,7 @@ SAMPLER_OFF = {"mirostat": _off(0), "typical_p": _off(1, True), "typ_p": _off(1,
                "min_tokens": _off(0), "n_probs": _off(0)}
 
 
-# llama-server's --reasoning-format values: auto = deepseek (reasoning_content, streamed too: what the server always did),
+# llama-server's --reasoning-format values: auto = deepseek (reasoning_content, streamed too: the default),
 # deepseek-legacy (the content keeps the thinking block too; a stream only there), none (the thinking stays in the content)
 REASONING_FORMATS = ("auto", "deepseek", "deepseek-legacy", "none")
 # the chat_template_kwargs the server hands to the template
@@ -2476,7 +2489,8 @@ class SlotScheduler:
     (mk_slots_step_mixed, MK_PF_MIX rows, default 256; MK_PF_MIX=0: MK_PF_CHUNK tokens between the cycles, default 512,
     0: the whole prompt), so they keep decoding while a long prompt is read; while none decodes, MK_PF_SOLO tokens per call
     (default 0: the whole prompt). With MK_EXACT the chunks change no row (the engine feeds every chunk but a prompt's
-    last as batched rows), so a prompt that arrives while others decode gets the reply it gets alone. A closed job is dropped from the queue, its prefill abandoned at the next chunk, or its slot left out of the
+    last as batched rows, each ending on the 32-token scan grid: up to 31 tokens off the budget), so a prompt that
+    arrives while others decode gets the reply it gets alone. A closed job is dropped from the queue, its prefill abandoned at the next chunk, or its slot left out of the
     next cycle. Open-jet's SlotScheduler (--parallel / --agents), with jobs that can be closed at any point.
 
     With MK_EXACT (exact reuse; --agents sets it), a prompt never reuses the rows a slot decoded: those depend on how many
@@ -2779,8 +2793,8 @@ class Server:
 
         Loading allocates the weights and the KV cache, but the first kernel launches still need
         device memory of their own. When the context is too large for that, loading succeeds, /health
-        answers, and the first request ends the process with a CUDA out-of-memory (CK exits), which
-        the client sees as a dropped connection. Warming up here moves that failure to startup.
+        answers, and then requests fail with a CUDA out-of-memory error. Warming up here moves that
+        failure to startup.
         The prompt must be at least two tokens: only then does prefill take the batched path, whose
         buffers are allocated on first use."""
         toks = self.eng.tokenize("Hello, how are you today?")
@@ -2824,7 +2838,7 @@ class Server:
         a = self.args
         return self.parked is not None and a.side_max > 0 and a.park_mib > 0 and getattr(self.eng, "side_keep", False)
 
-    # ---- host cache: side requests (TODO #15) and parked conversations (#9), switched at request boundaries ----
+    # ---- host cache: side requests and parked conversations, switched at request boundaries ----
     def resume_point(self, seq, committed, cks, cached_spans, toks, spans):
         """how load_prompt would continue `toks` (image spans `spans`) on the cached `seq`: (common prefix, the image
         position that cut it or None, the position it resumes at, 'append' | 'checkpoint' | 'reset')"""
@@ -3220,12 +3234,13 @@ class Server:
                 "image_max_tokens": g(a, "image_max_tokens"), "image_cache": g(v, "cache_max")},
             "limits": {"max_body_mb": MAX_BODY_MB, "max_images": MAX_IMAGES, "max_stop": MAX_STOP,
                        "image_max_pixels": int(os.environ.get("MK_IMAGE_MAX_PIXELS") or 100_000_000)},
-            "env": {k: val for k, val in sorted(os.environ.items()) if k.startswith("MK_")},
+            "env": {k: "(set)" if k == "MK_API_KEY" and val else val  # (not the key: /props ends up in bug reports)
+                    for k, val in sorted(os.environ.items()) if k.startswith("MK_")},
             "busy": self.busy(), "uptime_s": round(time.time() - self.t_start, 1) if self.t_start else 0.0,
         }
 
     def props(self):
-        """llama-server's GET /props fields we have, plus `engine` (engine_info)"""
+        """the fields of llama-server's GET /props that the server has, plus `engine` (engine_info)"""
         b = getattr(self.eng, "build", None) or {}
         params = {"temperature": DEF_TEMP, "top_k": DEF_TOP_K, "top_p": DEF_TOP_P, "min_p": DEF_MIN_P, "seed": -1,
                   "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": -1, "n_predict": -1, "stop": [],
@@ -3242,7 +3257,7 @@ class Server:
         }
 
     def models(self):
-        """GET /v1/models: the one model, with llama-server's meta where we have it"""
+        """GET /v1/models: the one model, with llama-server's meta where the server has it"""
         meta = {"n_ctx": self.args.ctx}
         try:
             meta["size"] = os.path.getsize(self.args.model)
@@ -3260,7 +3275,7 @@ class Server:
                             "details": {"format": "gguf"}}]}
 
     def slots(self):
-        """GET /slots: the one slot (llama-server's fields we have)"""
+        """GET /slots: the one slot (the llama-server fields the server has)"""
         return [{"id": 0, "n_ctx": self.args.ctx, "is_processing": self.busy(),
                  "speculative": bool(getattr(self.eng, "has_mtp", True)) and bool(getattr(self.args, "draft", 0))}]
 
@@ -3410,7 +3425,7 @@ class Server:
         own control tokens (kept), and each piece between them is tokenized with its texts put back, as plain text where
         it has any (parse_special false: the piece is one run of text, as llama.cpp tokenizes the text between special
         tokens, so those texts never become control tokens). Pieces without any, and every prompt without such text
-        in its content, tokenize exactly as before."""
+        in its content, are tokenized with control-token text parsed as special tokens (Engine.tokenize's default)."""
         if not lit:
             return self.eng.tokenize(text)
         _, back, lt = lit
@@ -3657,7 +3672,11 @@ class Server:
             if not -2.0 <= v <= 2.0:
                 raise BadRequest(f"{k} must be in [-2, 2]")
             pen.append(v)
-        if float(body.get("repetition_penalty") or body.get("repeat_penalty") or 1.0) != 1.0:
+        try:
+            rep = float(body.get("repetition_penalty") or body.get("repeat_penalty") or 1.0)
+        except (TypeError, ValueError, OverflowError):
+            raise BadRequest("repetition_penalty must be a number")
+        if rep != 1.0:
             self.warn_once("rep", "repetition_penalty is not supported by the megakernel and is ignored")
         if temp <= 0:
             temp, top_p, top_k, min_p = 0.0, 1.0, TOPK_MAX, 0.0
@@ -3716,11 +3735,13 @@ class Server:
                 self.job = None
 
     def _generate(self, body, emit, gone, thinking, toks, images, media=()):
-        max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
+        max_new = next((body[k] for k in ("max_tokens", "max_completion_tokens", "n_predict") if body.get(k) is not None), -1)
         try:
             max_new = int(max_new)
         except (TypeError, ValueError, OverflowError):
             raise BadRequest("max_tokens must be an integer")
+        if max_new == 0:  # (OpenAI's and Anthropic's minimum is 1)
+            raise BadRequest("max_tokens must be at least 1 (-1: up to the context)")
         asked = max_new
         limit = self.args.ctx - len(toks) - ContextOverflow.RESERVE
         if limit <= 0:
@@ -4153,20 +4174,30 @@ class GatedHandler(BaseHTTPRequestHandler):
     """the handlers' base: the server's Gate decides on each request before it is handled (and before a 100 Continue);
     a refused one gets a 403 and the connection closes (its body is not read). An admitted browser origin gets
     Access-Control-Allow-Origin + Vary: Origin on every response (errors and event streams too), and its CORS preflights
-    (OPTIONS) are answered."""
+    (OPTIONS) are answered. A request with a body its handler does not read (any method but POST: a GET, an OPTIONS)
+    is answered with Connection: close and the connection closes, so that the body is not taken for the next request
+    (behind a proxy: a smuggled one)."""
     protocol_version = "HTTP/1.1"
     cors = None  # the request's admitted Origin: CORS headers on the response
     admitted = None  # the gate's verdict on the request (None: not asked yet)
+    BODY_METHODS = ("POST",)  # the methods whose handlers read the request body
+    unread = False  # the request has a body its handler does not read: the response closes the connection
 
     def log_message(self, *a):
         pass
 
     def handle_one_request(self):
         self.cors = self.admitted = None
+        self.unread = False
         super().handle_one_request()
 
     def parse_request(self):
-        return super().parse_request() and self.admit()
+        if not (super().parse_request() and self.admit()):
+            return False
+        cl = [v.strip() for v in self.headers.get_all("Content-Length") or []]  # (each one: "0" then "80" is a body)
+        self.unread = self.command not in self.BODY_METHODS and bool(self.headers.get_all("Transfer-Encoding")
+                                                                      or any(v != "0" for v in cl))
+        return True
 
     def admit(self):
         """True if the gate lets the request through (asked once per request); else it is answered with a 403 (host,
@@ -4200,6 +4231,8 @@ class GatedHandler(BaseHTTPRequestHandler):
         if self.cors:
             self.send_header("Access-Control-Allow-Origin", self.cors)
             self.send_header("Vary", "Origin")
+        if self.unread and not self.close_connection:  # (send_header sets close_connection: once)
+            self.send_header("Connection", "close")
         super().end_headers()
 
     def do_OPTIONS(self):
@@ -4213,9 +4246,6 @@ class GatedHandler(BaseHTTPRequestHandler):
                 headers.append(("Access-Control-Allow-Headers", want))
             if (self.headers.get("Access-Control-Request-Private-Network") or "").strip().lower() == "true":
                 headers.append(("Access-Control-Allow-Private-Network", "true"))  # (Chrome: a public page to this machine)
-        if self.headers.get("Transfer-Encoding") or (self.headers.get("Content-Length") or "0").strip() != "0":
-            headers.append(("Connection", "close"))  # (a body is not read: it must not be taken for the next request)
-            self.close_connection = True
         self.send_response(200)
         for k, v in headers:
             self.send_header(k, v)
@@ -4405,6 +4435,14 @@ def make_handler(srv):
                     self._json(200, out)
                 except BadRequest as e:
                     self._bad(e, anth)
+                except DISCONNECTS:
+                    self.close_connection = True
+                except Exception as e:  # (answered, not a dropped connection)
+                    log(f"{path} error:", repr(e))
+                    try:
+                        self._error(500, str(e), anth)
+                    except Exception:
+                        pass
                 return
             rid = next(srv.rids)
             if srv.sched is None and srv.busy():
@@ -4547,15 +4585,29 @@ def make_handler(srv):
                              "content": blocks, "stop_reason": anthropic_stop_reason(finish, srv.stop_word),
                              "stop_sequence": srv.stop_word, "usage": anthropic_usage(usage)})
 
+        def _stream_head(self):
+            """ends an event stream's headers: chunked, or for HTTP/1.0 (no chunked) a body that ends with the connection"""
+            if self.request_version == "HTTP/1.0":
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            else:
+                self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+        def _stream_send(self, data, last=False):
+            """one piece of an event stream's body (_stream_head's framing); last: then the end of the body"""
+            if self.request_version == "HTTP/1.0":
+                self.wfile.write(data)
+            else:
+                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
+            self.wfile.flush()
+
         def _anthropic_stream(self, chat, model):
             """Anthropic's SSE: message_start, ping, content blocks (thinking / text deltas as they come, tool_use blocks
             with their input as input_json_delta pieces as it is generated), message_delta, message_stop"""
             mid = "msg_" + uuid.uuid4().hex
             st = {"started": False, "index": -1, "open": None, "ws": ""}  # ws: the thinking's held trailing whitespace
-
-            def send(data, last=False):
-                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
-                self.wfile.flush()
+            send = self._stream_send
 
             def event(name, obj, last=False):
                 send(f"event: {name}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n".encode(), last)
@@ -4567,8 +4619,7 @@ def make_handler(srv):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
+                self._stream_head()
                 n, reused = srv.last_prompt
                 event("message_start", {"type": "message_start", "message": {
                     "id": mid, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None,
@@ -4681,10 +4732,7 @@ def make_handler(srv):
             (response.incomplete after max_output_tokens) with the usage. An error once it has started is
             response.failed (code server_error, invalid_prompt for a bad request). Every event has its sequence_number."""
             st = {"started": False, "seq": 0, "items": [], "open": None, "ws": "", "t": 0.0}
-
-            def send(data, last=False):
-                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
-                self.wfile.flush()
+            send = self._stream_send
 
             def event(obj, last=False):
                 obj["sequence_number"] = st["seq"]
@@ -4702,8 +4750,7 @@ def make_handler(srv):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
+                self._stream_head()
                 event({"type": "response.created", "response": response("in_progress")})
                 event({"type": "response.in_progress", "response": response("in_progress")})
 
@@ -4839,11 +4886,7 @@ def make_handler(srv):
         def _stream(self, body):
             cid, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
             started = [False]
-
-            def send(data, last=False):
-                """one event as a chunk of the body; last: then the end of the body"""
-                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
-                self.wfile.flush()
+            send = self._stream_send
 
             def chunk(delta, finish=None, usage=None, timings=None, progress=None):
                 obj = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": srv.model_id,
@@ -4862,8 +4905,7 @@ def make_handler(srv):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Transfer-Encoding", "chunked")
-                    self.end_headers()
+                    self._stream_head()
                     chunk({"role": "assistant", "content": None})
 
             per_token = bool(body.get("timings_per_token"))  # (llama-server's: the timings so far in every chunk)

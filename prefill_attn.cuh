@@ -191,33 +191,9 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) { MK_VIE
 // Units beyond nfull split each remaining item into S tile ranges whose partial (o, m, l) go to `part`
 // and are merged by pk_attn2_comb: the last wave of equal-sized items is otherwise mostly idle.
 // Microbenchmark: bench/attn_bench.cu.
-constexpr int A2_Q = 16, A2_K = 32, A2_LD = HD + 8, A2_NT = 384;
 constexpr int A2_XCH = 6 * 32 * (2 * 8 + 2 * 16 + 8); // per head pair: maxima, P fragments, partial sums
 constexpr int A2_SMEM = (6 * A2_Q + 2 * A2_K) * A2_LD * 2 + A2_XCH;
-constexpr int A2_PART = 6 * A2_Q * HD + 2 * 6 * A2_Q; // floats per partial: o [96][HD], then (m, l) [96]
 static_assert(A2_SMEM <= 99 * 1024, "pk_attn2 shared memory");
-
-// Host: work split for a chunk of T queries at n0 on `slots` resident CTAs.  The items of the last, partial
-// wave (the highest q tiles of the last kv heads) are split into S tile ranges when that shortens the tail;
-// S = 1 / nfull = all items: no split.  part_floats: capacity of the partials buffer.
-inline void a2_plan(int T, int n0, int slots, size_t part_floats, int & nfull, int & S) {
-    const int nqt = (T + A2_Q - 1) / A2_Q, N = nqt * NKV, rem = slots > 0 ? N % slots : 0;
-    nfull = N;
-    S = 1;
-    if (rem == 0) return;
-    const int qt = (N - rem) % nqt; // smallest tail item
-    const int ntile_min = (n0 + qt * A2_Q + std::min(A2_Q, T - qt * A2_Q) - 1) / A2_K + 1;
-    const int smax = std::min(std::min(32, ntile_min / 2), (int) std::min<size_t>(1024, part_floats / ((size_t) A2_PART * rem)));
-    double best = 1.0; // tail length in item times
-    for (int s = 2; s <= smax; s++) {
-        const double t = (double) ((rem * s + slots - 1) / slots) / s;
-        if (t < best - 0.02) {
-            best = t;
-            S = s;
-        }
-    }
-    if (S > 1) nfull = N - rem;
-}
 
 __device__ __forceinline__ void a2_pair_sync(int hq) { asm volatile("bar.sync %0, 64;" ::"r"(1 + hq) : "memory"); }
 
@@ -767,8 +743,8 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         }
     }
     // this slot's q8_0 K / V through the MK_KV slot pointers (as pk_attn2): slots are packed in kc / vc, so with a q4
-    // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows (C3a); for an all-q8
-    // cache kvp / kvs give exactly the old addresses
+    // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows; for an all-q8
+    // cache kvp / kvs give exactly the [slot][head][ctx][HD] addresses
     // Per tile (kv_src): the slot's main buffer (K q8 or q4..q7, expanded to int8 in its stage by kv_tile_expand during the
     // previous tile; V q8 or q4..q7, converted to fp16 by a8_cv_v) or, with MK_KV_WIN, the q8 ring for tiles at positions
     // >= wsr. kbt(it) / vbt(it) = the K / V format of tile it.

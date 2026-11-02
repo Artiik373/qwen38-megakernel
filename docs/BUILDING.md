@@ -10,10 +10,10 @@ Contents: [prebuilt packages](#prebuilt-packages) - [requirements](#requirements
 ## Prebuilt packages
 
 Each [release](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases) has a Windows x64 zip and a Linux
-x86-64 tarball of the served configuration (`MKFLAGS` as below: wide verify, up to 7 drafts), built from the tagged
-commit. Each holds the engine library, the CLI, the vision library, the tools, llama.cpp b10246's libraries (CPU only:
-the engine uses its tokenizer and image library), the server, the launcher, the docs, the licenses
-(`THIRD_PARTY_NOTICES.md`), `BUILD_INFO.txt` (commit, flags, toolchain) and `QUICKSTART.txt`. They need:
+x86-64 tarball of the served configuration, built from the tagged commit. Each holds the engine library, the CLI, the
+vision library, the tools, llama.cpp b10246's libraries (CPU only: the engine uses its tokenizer and image library),
+the server, the launcher, the docs, the licenses (`THIRD_PARTY_NOTICES.md`), `BUILD_INFO.txt` (commit, flags,
+toolchain) and `QUICKSTART.txt`. They need:
 
 - **GPU:** the engine is compiled for sm_86 (RTX 30-series; tested on an RTX 3090) and needs at least 80 SMs for more
   than 4 drafts. Compute capability 8.9 GPUs (RTX 40-series) can run sm_86 code but are untested; RTX 50-series
@@ -41,13 +41,14 @@ folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Vis
   block per SM and needs at least 80 SMs for more than 4 drafts, 50 for up to 4; the engine checks this at load and
   names the shortfall. Tuned and tested on an RTX 3090 (sm_86, 82 SMs). `make` builds for the installed GPU's
   architecture (sm_89 or sm_120 too), but only sm_86 is tested.
-- **CUDA:** 13.2 is what we build with; older 12.x versions are untested. The Windows build needs a driver that supports
+- **CUDA:** 13.2; older 12.x versions are untested. The Windows build needs a driver that supports
   CUDA 13.2; it links the CUDA runtime statically, so at run time only the driver is needed.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64.
-- **RAM to compile:** most of the build is ptxas on the megakernel, one thread with a large heap. For the served
-  configuration it peaked at 18.8 GiB both on Linux / WSL2, in a 10.5-minute `make -j2`, and natively on Windows, in
-  a 12-minute `build.ps1` (2026-10-30, 6f3b257). The lean build (`MKFLAGS=`, up to 4 drafts) was last measured at
-  about 19 GB (2026-10-17), before the served build was trimmed.
+- **RAM to compile:** most of the build is ptxas on the megakernel (`qwen38_mk.cu`, the device code), one thread with
+  a large heap. For the served configuration it peaked at 18.8 GiB both on Linux / WSL2, in a 10.5-minute `make -j2`,
+  and natively on Windows, in a 12-minute `build.ps1`. A change to the host side alone (`engine.cu`, `engine_impl.h`
+  and the other host files) does not recompile it: `make -j2` rebuilds and links in about 10 s for one host file and
+  30 s for `engine_impl.h` (all seven), with under 0.5 GB per compile.
 - **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `--park-mib` /
   `MK_PARK_MIB` (default 8192 MiB; 1024 MiB for side requests alone when parking is off), allocated as it is needed and
   kept until the server exits. The token embedding table also stays in page-locked host memory instead of VRAM.
@@ -78,10 +79,8 @@ What `make` builds:
   `../llama.cpp/build/bin/libmtmd.so` exists, which is llama.cpp's default; `make vision` builds them explicitly.
 
 Build settings:
-- **The served configuration** is the default: `MKFLAGS=-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1` (wide verify on
-  int8 tensor cores, up to 7 drafts, the fragment-ordered Q6_K layout, the split barrier before the DeltaNet core).
-- **The lean engine:** `make MKFLAGS=`. It verifies at most 5 rows (4 drafts) with dp4a GEMVs; run it with
-  `MK_DRAFT=4` (the launchers default to 7).
+- **The served configuration** needs no flags: `MKFLAGS` is empty by default and takes the debug and experiment flags
+  of [CONFIGURATION.md](CONFIGURATION.md#engine--d-flags), e.g. `make MKFLAGS=-DMK_SPEC_LOG=1`.
 - **One model's types only:** `make MK_TYPES="Q4_K Q5_K Q6_K IQ4_XS Q5_1"` builds the matrix kernels for those weight
   types alone (Q6_K and IQ4_XS are always needed; Q4_K for the default `MK_MTP_Q4` / `MK_DRAFT_Q4` copies). For
   Qwen3.8-27B-18600-NIKI-Q5_K_M that set gives ~65% of the full build's PTX, so ptxas needs less time and RAM; a GGUF
@@ -96,9 +95,9 @@ Build settings:
   the engine flags, which the server reports in `/props`.
 
 Under WSL2, keep the model on the Linux filesystem: GGUF files on `/mnt/c` (or any Windows drive) load several times
-slower. With the model on ext4 the server was ready ~12 s after start (2026-10-16). WSL2's memory comes out of the same
-pool as Windows', so a compile on one side and a loaded model on the other can exhaust it: a native ptxas failed with a
-memory allocation error while a WSL2 GPU job held ~20 GB (2026-10-16).
+slower. With the model on ext4 the server is ready in about 12 s. WSL2's memory comes out of the same pool as
+Windows', so a compile on one side and a loaded model on the other can exhaust it: a native ptxas fails with a memory
+allocation error while a WSL2 GPU job holds ~20 GB.
 
 ## Windows
 
@@ -124,7 +123,7 @@ python -m venv .venv; .venv\Scripts\pip install -r requirements.txt
 - **What `build.ps1` builds:** `qwen38mk.dll` (the server's engine), `qwen38_mk.exe` (CLI), `qwen38vision.dll` and
   `tools\*.exe`, with the Makefile's nvcc flags and `MKFLAGS`. It writes `ptxas.log` and copies llama.cpp's DLLs next
   to the outputs. It finds Visual Studio 2022 itself (vswhere) and sets up its environment.
-- **Parameters:** `-MkFlags ""` builds the lean engine; `-Targets engine|vision|tools` builds one part (`vision`
+- **Parameters:** `-MkFlags` sets `MKFLAGS`; `-Targets engine|vision|tools` builds one part (`vision`
   needs no CUDA compile); `-Arch sm_86` overrides the GPU architecture (default: the first GPU's); `-Llama` points at
   another llama.cpp build; `-Cuda` at the toolkit. An engine object that is newer than the sources and was built with
   the same flags is reused.
@@ -141,7 +140,7 @@ scripts\serve.bat                 :: http://127.0.0.1:8080, 120k context, q8_0 K
 
 `scripts\serve.bat` takes the same settings as `scripts/serve.sh` ([CONFIGURATION.md](CONFIGURATION.md)). Images are
 on when `mmproj-BF16.gguf` sits next to the model or `MK_MMPROJ` names it (`MK_MMPROJ=off` turns them off). From an
-NVMe disk the server was ready ~7 s after start (2026-10-16).
+NVMe disk the server is ready in about 7 s.
 
 ## Model files
 
@@ -178,13 +177,34 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 
 ## Checking a build
 
+- **Every GPU check in one run:** `scripts/gate.sh -m <gguf> --record <dir>` on a build you trust keeps its outputs in
+  `<dir>` as a reference; `scripts/gate.sh -m <gguf> --ref <dir>` on the next build runs the same checks and requires
+  every output to equal the reference's (`make gate MK_MODEL=<gguf> GATE_ARGS="--ref <dir>"` builds first). It runs
+  `make check`, the exactness checks below, MK_EXACT=1 with a prefill cap below two staging slots, sampled CLI runs at
+  0 and 7 drafts (with a presence penalty and a draft-chain policy), the four bench prompts' greedy ids at 0, 4 and 7
+  drafts, parallel slots against solo runs (`bench/slots_bench.py`: 4 and 2 slots, the MTP window, a slot prefilled
+  between the others' steps) and their sampled outputs, the C API checks (`scripts/capi_checks.py`: errors, roll-backs
+  and out-of-memory kept inside the free VRAM), and with `--kld-ref <file>` the KL report against llama.cpp;
+  `--model2 <gguf>` adds a second model. Each check prints ok / FAIL / skip (the C API leg skips when none of its cases
+  can run); the exit status is 1 if one failed, 2 for bad arguments, a stale build or an `--out` that holds a recorded
+  reference. A reference is kept only if all its own checks passed, and holds for the GPU, driver, model files and
+  `MK_*` environment it was recorded with (the manifest names them, `MK_MODEL` and `MK_API_KEY` aside): another model
+  is refused, another environment is a FAIL, and a check the reference did not run is a skip with a NOTE. Linux or
+  WSL2, the GPU to itself, about 16 minutes on an RTX 3090.
+- **Kernels without a model:** `make check` builds and runs the benches' self-checks. `bench/wvgemm_bench check` tests
+  its own tensor-core verify kernel (a counterpart of `wv.cuh`, not the engine's code) for bit-identical output at
+  every token count, and it and the engine's dp4a GEMVs (copied from `mk_shared.cuh` and `qwen38_mk.cu` by
+  `bench/wv_extract.py` first) against fp64 within error bounds (rms 1e-5 and max 1e-4 of the rows' rms; |wv - dp4a|
+  at most 1e-4; a NaN fails). `bench/dattn_bench` with `TINV=1` tests its own, older copies of the decode attention
+  kernels (up to 5 tokens) for bit-identical output across variants and token counts, at 4 and 5 tokens. Either exits
+  1 on a failure.
 - **Server tests:** `python -m pytest -q tests` runs without a GPU, against fake engines (the CI runs it on Python 3.10,
   3.11 and 3.12).
 - **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed and randomly corrupted files under
   AddressSanitizer and UBSan (CPU only, Linux).
 - **Exactness:** `python3 scripts/exactness.py -m <gguf>` (or `make exactness MK_MODEL=<gguf>`; Windows:
   `python scripts\exactness.py -m <gguf>`) checks the README's [exact output](../README.md#exact-output) claims on the
-  GPU: greedy ids identical at 0, 4 and 7 drafts (`--depths 0,4` for a `make MKFLAGS=` build) and without the MTP
+  GPU: greedy ids identical at 0, 4 and 7 drafts and without the MTP
   layer, the exact-reuse state digest and ids independent of the prefill chunk size, and a warm server's follow-up,
   edited and sampled replies equal to a fresh server's (a check whose runs drafted nothing or reused nothing fails: it
   would prove nothing). It needs the GPU to itself (11 model loads), prints PASS / FAIL per check, exits 1 on a failure
@@ -204,7 +224,9 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 
 ## Files
 
-- `qwen38_mk.cu`, `qwen38_mk.h`, `prefill*.cuh`, `wv*.cuh`, `loader.cuh`, `gguf.h`: the engine
+- `qwen38_mk.cu`, `prefill*.cuh`, `wv.cuh`, `wv_dev.cuh`: the engine's device code; `engine.cu`, `engine_impl.h` and
+  the other host files of the Makefile's `HOST_SRC`, `loader.cuh`, `wv_host.cuh`: its host side; `mk_shared.cuh`,
+  `mk_launch.h`, `qwen38_mk.h` (the API), `gguf.h`: shared ([ENGINE.md](ENGINE.md#files) has what each file holds)
 - `capi.cpp`: the C API of `libqwen38mk.so` / `qwen38mk.dll` (and the keep-warm thread)
 - `main.cu`: the `qwen38_mk` CLI; `logit_stats.h`: the accuracy comparison shared by the CLI and the tools
 - `server/mk_server.py`: the HTTP server

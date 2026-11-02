@@ -17,7 +17,7 @@
 #   MK_CORS_ORIGINS     web origins whose pages may call the server (comma-separated, e.g. http://localhost:5173):
 #                       requests from pages of other origins get a 403
 #   MK_API_KEY          require this key on every request but /health (clients send it as their API key); default none
-#   MK_DRAFT            MTP drafts per cycle (default 7; a `make MKFLAGS=` build takes at most 4)
+#   MK_DRAFT            MTP drafts per cycle (default 7)
 #   MK_EXACT_REUSE=0    turn exact reuse off: a reused prompt then appends the previous reply instead of re-prefilling it
 #                       (faster follow-up turns, but not bit-identical to the same request sent fresh)
 #   MK_SIDE_MAX         side requests: a first-turn prompt of at most this many tokens (default 8192; 0 = off) that would
@@ -66,8 +66,11 @@ CT=()
 SA=(${MK_TEMP:+--temp "$MK_TEMP"} ${MK_TOP_P:+--top-p "$MK_TOP_P"} ${MK_TOP_K:+--top-k "$MK_TOP_K"}
     ${MK_MIN_P:+--min-p "$MK_MIN_P"})
 if [ -n "${MK_MMPROJ+x}" ]; then MMPROJ="$MK_MMPROJ"
-else MMPROJ=$(ls "$(dirname "$MODEL")/mmproj-BF16.gguf" "$HOME/models/mmproj-BF16.gguf" "$HOME/models/mmproj-Qwen3.8-27B-BF16.gguf" \
-                    2>/dev/null | head -n1 || true)
+else
+    MMPROJ=
+    for f in "$(dirname "$MODEL")/mmproj-BF16.gguf" "$HOME/models/mmproj-BF16.gguf" "$HOME/models/mmproj-Qwen3.8-27B-BF16.gguf"; do
+        if [ -f "$f" ]; then MMPROJ="$f"; break; fi
+    done
 fi
 VA=() VS=off
 if [ -n "$MMPROJ" ] && [ -f "$MMPROJ" ] && [ -f "$HERE/libqwen38vision.so" ]; then

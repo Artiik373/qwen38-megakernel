@@ -1,7 +1,6 @@
 # Windows build (the Makefile's targets with MSVC 2022 + nvcc): qwen38mk.dll (server engine), qwen38_mk.exe (CLI),
 # qwen38vision.dll (CPU image encoder), tools\*.exe. The engine is compiled with the same nvcc flags as the Makefile.
-#   .\build.ps1                         everything, the served configuration (MKFLAGS = wide verify, up to 7 drafts)
-#   .\build.ps1 -MkFlags ""             the lean engine (up to 4 drafts)
+#   .\build.ps1                         everything, the served configuration
 #   .\build.ps1 -Targets vision         only the vision library + its tools (no CUDA compile)
 # -Llama: llama.cpp built with CMake (BUILD_SHARED_LIBS=ON; default ..\llama.cpp). -Cuda: the CUDA toolkit (default
 # $env:CUDA_PATH). -Arch: e.g. sm_86 (default: the first GPU's compute capability).
@@ -9,7 +8,7 @@ param(
     [string] $Llama = (Join-Path $PSScriptRoot "..\llama.cpp"),
     [string] $Cuda = $env:CUDA_PATH,
     [string] $Arch = "",
-    [string] $MkFlags = "-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1",
+    [string] $MkFlags = "",
     [ValidateSet("all", "engine", "vision", "tools")] [string[]] $Targets = @("all")
 )
 $ErrorActionPreference = "Stop"
@@ -40,13 +39,18 @@ $cl = @("/nologo", "/O2", "/EHsc", "/MD", "/std:c++17", "/D_CRT_SECURE_NO_WARNIN
 
 function Run([string] $exe, [string[]] $a, [string] $errFile = "") {
     Write-Host "> $exe $($a -join ' ')" -ForegroundColor DarkGray
-    if ($errFile) {
-        # stdout and stderr both to the file (nvcc reports compile errors on stdout, ptxas -v on stderr)
-        & $exe @a *> $errFile
-        if ($LASTEXITCODE -ne 0) { Get-Content $errFile | Where-Object { $_ -match "error" } | Select-Object -First 20; throw "$exe failed ($LASTEXITCODE), see $errFile" }
-    } else {
-        & $exe @a
-        if ($LASTEXITCODE -ne 0) { throw "$exe failed ($LASTEXITCODE)" }
+    # (the exit code decides: under Stop, a warning on stderr is a terminating error once the output is redirected)
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        # with errFile: stdout and stderr both to the file (nvcc reports compile errors on stdout, ptxas -v on stderr)
+        if ($errFile) { & $exe @a *> $errFile } else { & $exe @a }
+    } finally {
+        $ErrorActionPreference = $eap
+    }
+    if ($LASTEXITCODE -ne 0) {
+        if ($errFile) { Get-Content $errFile | Where-Object { $_ -match "error" } | Select-Object -First 20 }
+        throw "$exe failed ($LASTEXITCODE)$(if ($errFile) { ", see $errFile" })"
     }
 }
 
@@ -65,23 +69,35 @@ function Copy-LlamaDlls([string] $dir) {
 New-Item -ItemType Directory -Force build_win | Out-Null
 if (& $want "engine") {
     Run "cl.exe" ($cl + @("/c", "compat_win32.cpp", "/Fobuild_win\compat_win32.obj"))
-    # ptxas register / spill report for every phase function goes to ptxas.log (as with make)
-    $nv = @("-O3", "-std=c++17", "-arch=$Arch", "-lineinfo", "-Xptxas", "-dlcm=cg", "-Xptxas", "-v", "-Xcompiler", $hostFlags) +
-          ($MkFlags -split "\s+" | Where-Object { $_ }) + $llInc + @("-c", "qwen38_mk.cu", "-o", "build_win\qwen38_mk.obj")
-    # the 20-minute compile is skipped when the object is newer than every engine source and was built with these flags
-    $obj, $stamp = "build_win\qwen38_mk.obj", "build_win\qwen38_mk.flags"
-    $newest = (Get-ChildItem *.cu, *.cuh, *.h | Measure-Object -Property LastWriteTime -Maximum).Maximum
-    $fresh = (Test-Path $obj) -and (Test-Path $stamp) -and ((Get-Content $stamp -Raw).Trim() -eq ($nv -join " ")) -and
-             ((Get-Item $obj).LastWriteTime -gt $newest)
-    if ($fresh) {
-        Write-Host "qwen38_mk.obj is up to date"
-    } else {
+    $nvBase = @("-O3", "-std=c++17", "-arch=$Arch", "-lineinfo", "-Xptxas", "-dlcm=cg", "-Xptxas", "-v", "-Xcompiler", $hostFlags) +
+              ($MkFlags -split "\s+" | Where-Object { $_ }) + $llInc
+    # an object is rebuilt unless it is newer than its sources (the Makefile's lists) and was built with these flags: a
+    # change on the host side does not redo the device TU's 20-minute compile
+    function Build-Cu([string] $src, [string[]] $deps, [string] $log) {
+        $name = [IO.Path]::GetFileNameWithoutExtension($src)
+        $obj, $stamp = "build_win\$name.obj", "build_win\$name.flags"
+        $nv = $nvBase + @("-c", $src, "-o", $obj)
+        $newest = (Get-Item (@($src) + $deps) | Measure-Object -Property LastWriteTime -Maximum).Maximum
+        $fresh = (Test-Path $obj) -and (Test-Path $stamp) -and ((Get-Content $stamp -Raw).Trim() -eq ($nv -join " ")) -and
+                 ((Get-Item $obj).LastWriteTime -gt $newest)
+        if ($fresh) {
+            Write-Host "$name.obj is up to date"
+            return
+        }
         Remove-Item $stamp -ErrorAction SilentlyContinue
         $t0 = Get-Date
-        Run $nvcc $nv "ptxas.log"
+        Run $nvcc $nv $log
         Set-Content -Encoding ascii $stamp ($nv -join " ")
-        Write-Host ("qwen38_mk.cu compiled in {0:n0} s" -f ((Get-Date) - $t0).TotalSeconds)
+        Write-Host ("$src compiled in {0:n0} s" -f ((Get-Date) - $t0).TotalSeconds)
     }
+    # the device code and its launchers; ptxas register / spill report for every phase function goes to ptxas.log (as with make)
+    Build-Cu "qwen38_mk.cu" @("mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "prefill.cuh",
+                              "prefill_gemm.cuh", "prefill_attn.cuh", "wv.cuh", "wv_dev.cuh") "ptxas.log"
+    # the host side, same flags (the shared definitions must agree)
+    $hostSrc = @("engine.cu", "ck_pool.cu", "loader.cu", "prefill_host.cu", "state_files.cu", "host_store.cu", "lanes.cu")
+    $hostHdr = @("engine_impl.h", "mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "loader.cuh", "wv_host.cuh")
+    foreach ($s in $hostSrc) { Build-Cu $s $hostHdr "" }
+    $engineObj = @("build_win\qwen38_mk.obj") + ($hostSrc | ForEach-Object { "build_win\" + [IO.Path]::GetFileNameWithoutExtension($_) + ".obj" })
     Write-Def "capi.cpp" "mk_" "qwen38mk.dll" "build_win\qwen38mk.def"
     # the build's commit and engine flags for capi.cpp's mk_build_info (the server's /props)
     $commit = "unknown"
@@ -96,9 +112,11 @@ if (& $want "engine") {
     Set-Content -Encoding ascii "build_win\mk_build_info.h" @("#define MK_BUILD_COMMIT `"$commit`"",
         "#define MK_BUILD_FLAGS `"$(($MkFlags -split '\s+' | Where-Object { $_ }) -join ' ')`"")
     $link = @("-O3", "-std=c++17", "-arch=$Arch", "-Xcompiler", $hostFlags) + $llInc
-    Run $nvcc ($link + @("-shared", "-Ibuild_win", "capi.cpp", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") + $llLib +
-               @("-Xlinker", "/DEF:build_win\qwen38mk.def", "-o", "qwen38mk.dll"))
-    Run $nvcc ($link + @("main.cu", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") + $llLib + @("-o", "qwen38_mk.exe"))
+    # /EHc-: libllama's extern "C" API throws C++ exceptions, and under nvcc's -EHsc MSVC drops capi.cpp's catches around
+    # its calls (/EHs does not undo the c; cl warns D9025)
+    Run $nvcc ($link + @("-Xcompiler", "/EHc-", "-shared", "-Ibuild_win", "capi.cpp") + $engineObj + @("build_win\compat_win32.obj") +
+               $llLib + @("-Xlinker", "/DEF:build_win\qwen38mk.def", "-o", "qwen38mk.dll"))
+    Run $nvcc ($link + @("main.cu") + $engineObj + @("build_win\compat_win32.obj") + $llLib + @("-o", "qwen38_mk.exe"))
     Copy-LlamaDlls $PSScriptRoot
 }
 if (& $want "tools") {

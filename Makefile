@@ -3,12 +3,12 @@ NVCC ?= /usr/local/cuda/bin/nvcc
 # the first GPU's architecture (sm_86 RTX 30, sm_89 RTX 40, sm_120 RTX 50); sm_86 if nvidia-smi is missing
 ARCH ?= $(or $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '. '),86)
 ARCH := sm_$(patsubst sm_%,%,$(ARCH))
-# engine configuration: wide tensor-core verify, up to 7 drafts (-d 7), fragment-ordered Q6_K = the served build.
-# ptxas peaks at ~19 GiB of RAM with it (2026-10-30); `make MKFLAGS=` builds the lean engine (up to 4 drafts: -d 4).
-MKFLAGS ?= -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1
+# the engine's extra -D flags: none for the served build; debug / experiment builds, e.g. MKFLAGS=-DMK_SPEC_LOG=1.
+# ptxas peaks at ~19 GiB of RAM (2026-10-30).
+MKFLAGS ?=
 # MK_TYPES: build the matrix kernels for these weight types only (default: every type), e.g. for one model
-#   make MK_TYPES="Q4_K Q5_K Q6_K IQ4_XS Q5_1"   (Q6_K and IQ4_XS always; Q4_K for MK_MTP_Q4 / MK_DRAFT_Q4, the defaults)
-# Less ptxas time and RAM; a GGUF with another type is refused at load. Rebuild from clean when it changes (make clean).
+#   make MK_TYPES="Q4_K Q5_K Q6_K IQ4_XS Q5_1"   (Q6_K and IQ4_XS always; Q4_K for MK_DRAFT_Q4 and the MTP head)
+# Less ptxas time and RAM; a GGUF with another type is refused at load.
 MK_TYPES ?=
 MK_TYPES_ALL = Q4_K Q5_K Q6_K Q8_0 IQ4_XS IQ4_NL Q3_K IQ3_S Q5_1
 ifneq ($(filter-out $(MK_TYPES_ALL),$(MK_TYPES)),)
@@ -55,12 +55,26 @@ tools/vit_check: vision/vit_check.cpp vision/vit_cpu.o
 tools/vision_ref: tools/vision_ref.cpp logit_stats.h
 	g++ -O2 -std=c++17 -pthread $(VISION_INC) $< $(VISION_LIBS) -o $@
 
-# ptxas register / spill report for every phase function goes to ptxas.log
-qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh loader.cuh wv.cuh wv_host.cuh
+# the engine's compile flags, rewritten only when they change: another MKFLAGS or ARCH rebuilds the engine's objects
+build/nvflags: FORCE
+	@mkdir -p build
+	@echo '$(NVCC) $(NVFLAGS)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
+# the device code and its launchers; ptxas register / spill report for every phase function goes to ptxas.log
+qwen38_mk.o: qwen38_mk.cu mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh wv.cuh wv_dev.cuh \
+		build/nvflags
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
-qwen38_mk: qwen38_mk.o main.cu logit_stats.h
-	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -I$(LLAMA)/include -I$(LLAMA)/ggml/include main.cu qwen38_mk.o \
+# the host side (no device code: a change here does not rebuild qwen38_mk.o); the same flags, so the shared definitions agree
+HOST_SRC = engine.cu ck_pool.cu loader.cu prefill_host.cu state_files.cu host_store.cu lanes.cu
+HOST_HDR = engine_impl.h mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h loader.cuh wv_host.cuh
+HOST_OBJ = $(HOST_SRC:.cu=.o)
+$(HOST_OBJ): %.o: %.cu $(HOST_HDR) build/nvflags
+	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c $< -o $@
+
+qwen38_mk: qwen38_mk.o $(HOST_OBJ) main.cu logit_stats.h
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -I$(LLAMA)/include -I$(LLAMA)/ggml/include main.cu qwen38_mk.o $(HOST_OBJ) \
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 
 # the build's commit and engine flags (capi.cpp mk_build_info, the server's /props); rewritten only when they change
@@ -72,8 +86,8 @@ build/mk_build_info.h: FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 # engine + tokenizer as a shared library with a C API (capi.cpp), used by server/mk_server.py
-libqwen38mk.so: qwen38_mk.o capi.cpp qwen38_mk.h build/mk_build_info.h
-	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -Ibuild -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk.o \
+libqwen38mk.so: qwen38_mk.o $(HOST_OBJ) capi.cpp qwen38_mk.h build/mk_build_info.h
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -Ibuild -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk.o $(HOST_OBJ) \
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 
 tools/vocab_freq: tools/vocab_freq.cpp
@@ -93,7 +107,33 @@ tests/gguf_fuzz: tests/gguf_fuzz.cpp gguf.h
 exactness: qwen38_mk libqwen38mk.so
 	python3 scripts/exactness.py $(if $(MK_MODEL),-m $(MK_MODEL)) $(EXACTNESS_ARGS)
 
-clean:
-	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz
+# The benches' GPU self-checks without a model (the GPU to itself). wvgemm_bench check: its own tensor-core verify
+# kernel (a counterpart of wv.cuh, not the engine's code) bit-identical at every T, and it and the engine's dp4a GEMVs
+# within error bounds of fp64; wv_ref.cuh, its copy of the engine's dp4a code, is regenerated from mk_shared.cuh +
+# qwen38_mk.cu every time and rewritten only when it changes. dattn_bench TINV=1: its own copies of the decode
+# attention kernels (not regenerated: older than the engine's, up to T 5) bit-identical to each other and T-invariant.
+bench/wv_ref.cuh: FORCE
+	@python3 bench/wv_extract.py qwen38_mk.cu $@.tmp > /dev/null
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-.PHONY: all vision clean exactness FORCE
+bench/wvgemm_bench: bench/wvgemm_bench.cu bench/wv_ref.cuh
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -lineinfo $< -o $@
+
+bench/dattn_bench: bench/dattn_bench.cu
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -Xptxas -dlcm=cg $< -o $@
+
+check: bench/wvgemm_bench bench/dattn_bench
+	bench/wvgemm_bench check
+	TINV=1 bench/dattn_bench 4096 4 3 0 1 2
+	TINV=1 bench/dattn_bench 101600 5 3 0 1 2
+
+# every GPU check of a build in one run (scripts/gate.sh; the GPU to itself, ~16 min on an RTX 3090):
+#   make gate MK_MODEL=<gguf> GATE_ARGS="--record DIR"   (a reference)   or   GATE_ARGS="--ref DIR"
+gate: qwen38_mk libqwen38mk.so
+	scripts/gate.sh $(if $(MK_MODEL),-m $(MK_MODEL)) $(GATE_ARGS)
+
+clean:
+	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o $(HOST_OBJ) ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz \
+		bench/wvgemm_bench bench/dattn_bench
+
+.PHONY: all vision clean exactness check gate FORCE
