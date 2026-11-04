@@ -46,7 +46,7 @@ done
 [ -f "$CAPI" ] || die "no file $CAPI (--capi)"
 [ -n "$REC" ] && [ -n "$REF" ] && die "--record and --ref exclude each other"
 for l in $LEGS; do [[ " $LEGS_ALL " == *" $l "* ]] || die "unknown leg $l (legs: $LEGS_ALL)"; done
-BIN=$REPO/qwen38_mk; LIB=$REPO/libqwen38mk.so; DV=$REPO/draft_vocab_32k.bin
+BIN=$REPO/qwen38_mk; LIB=$REPO/libqwen38mk.so; DV=$REPO/draft_vocab_56k.bin
 [ -x "$BIN" ] && [ -f "$LIB" ] || die "build qwen38_mk and libqwen38mk.so first (make)"
 stale=$(find "$REPO" -maxdepth 1 \( -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.cpp' \) \( -newer "$BIN" -o -newer "$LIB" \) | head -3)
 [ -z "$stale" ] || die "the binaries are older than $(echo $stale | xargs -n1 basename | tr '\n' ' ')- run make"

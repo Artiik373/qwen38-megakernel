@@ -20,30 +20,30 @@ Built on the megakernel from [open-jet](https://github.com/L-Forster/open-jet) b
 
 ## Speed
 
-Against llama.cpp's `llama-server` (b12024, tuned, at 4 MTP drafts, its fastest setting), same session, same client,
-prompts and model file. RTX 3090, unsloth's UD-Q4_K_XL, 120k context, q8_0 KV cache, release v2026.10.30 at its default
-7 drafts.
+Against llama.cpp's `llama-server` (b12024, tuned, q8_0 KV cache, at 4 MTP drafts, its fastest setting), same session,
+same client, prompts and model file. RTX 3090, unsloth's UD-Q4_K_XL, 120k context, release v2026.11.03 at its default 7
+drafts, with the q8_0 KV cache and with [preset F](#the-full-262k-context-on-24-gb).
 
-| | llama.cpp | qwen38-megakernel | |
+| | llama.cpp | qwen38-megakernel, q8_0 | qwen38-megakernel, preset F |
 |---|---|---|---|
-| greedy decode, short prompts | 86.8 tok/s | **156.9 tok/s** | 1.8x |
-| sampled decode, thinking on | 72.8 tok/s | **138.5 tok/s** | 1.9x |
-| decode at 38k context | 66.1 tok/s | **119.7 tok/s** | 1.8x |
-| decode at 101.6k context | 54.4 tok/s | **109.2 tok/s** | 2.0x |
-| read a 101.6k-token prompt | 95.9 s | **75.1 s** | 1.3x |
-| first token, short prompt | 117 ms | **66 ms** | 1.8x |
-| edit an earlier message in an 11.7k-token chat | 266 ms | **76 ms** | 3.5x |
-| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,563 s | **230 right, 1,676 s** | 1.5x |
+| greedy decode, short prompts | 86.5 tok/s | **165.3 tok/s** (1.9x) | **160.1 tok/s** (1.9x) |
+| sampled decode, thinking on | 72.4 tok/s | **145.9 tok/s** (2.0x) | **146.7 tok/s** (2.0x) |
+| decode at 38k context | 65.7 tok/s | **126.9 tok/s** (1.9x) | **108.6 tok/s** (1.7x) |
+| decode at 101.6k context | 54.5 tok/s | **115.4 tok/s** (2.1x) | **116.7 tok/s** (2.1x) |
+| read a 101.6k-token prompt | 96.7 s | **72.5 s** (1.3x) | **75.2 s** (1.3x) |
+| first token, short prompt | 118 ms | **61 ms** (1.9x) | **61 ms** (1.9x) |
+| edit an earlier message in an 11.7k-token chat | 247 ms | **71 ms** (3.5x) | **72 ms** (3.4x) |
+| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,570 s | **230 right, 1,607 s** (1.6x) | **229 right, 1,647 s** (1.6x) |
+| VRAM, idle at 120k context | 22.8 GiB | **21.1 GiB** | **19.8 GiB** |
 
-It does this in 1.5 GiB less VRAM (21.2 against 22.7 GiB, idle at 120k). With drafting off on both sides it's still 7%
-faster on short prompts and 41% faster at 101.6k context, so the gain isn't only speculation. Token-weighted rates,
-the 7-draft llama.cpp column, the no-draft table and the method are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The
-question totals for this engine come from its [full run](docs/BENCHMARKS.md#full-run-2026-10-30); every other row is
-one session.
+With drafting off on both sides it's still 11% faster on short prompts and 46% faster at 101.6k context, so the gain
+isn't only speculation. Preset F's replies differ from q8_0's, so its decode rows aren't like-for-like. Token-weighted
+rates, the no-draft table and the method are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Every row is one session.
 
 ## What you get
 
-- **Speculative decoding with the model's own MTP head**, up to 7 drafts per step, verified on the GPU.
+- **Speculative decoding with the model's own MTP head**, up to 7 drafts per step (15 with the opt-in
+  [deep-pass build](docs/EXPERIMENTAL.md#the-deep-pass), q8_0 KV cache only), verified on the GPU.
 - **[Exact output](#exact-output):** greedy output is identical at any draft count, from a cached conversation or a
   fresh one, on Windows or Linux.
 - **[The full 262k context on 24 GB](#the-full-262k-context-on-24-gb)** with near-lossless low-bit KV presets.
@@ -51,9 +51,14 @@ one session.
   switching between conversations.
 - **[OpenAI, Anthropic and Responses APIs](#works-with-your-coding-agent)**, tested with 11 coding agents and chat UIs.
 - **Images and video**, encoded on the CPU, so they take no VRAM.
-- **Several agents at once:** `--agents 4` serves 380 tok/s in total on short prompts (Q4_K_M), 319 with ~23k tokens
-  of context each ([parallel agents](docs/BENCHMARKS.md#parallel-agents)).
+- **Several agents at once:** `--agents 4` serves 424 tok/s in total on short prompts (Q4_K_M), 366 with ~23k tokens
+  of context each, against 137 and 97 for llama.cpp's `llama-server --parallel 4` measured the day before, sampled
+  ([parallel agents](docs/BENCHMARKS.md#parallel-agents)).
 - **Prebuilt packages** for Windows and Linux.
+- **[In active development](docs/EXPERIMENTAL.md):** the [deep pass](docs/EXPERIMENTAL.md#the-deep-pass) (up to 15 drafts per step, q8_0 KV
+  cache only for now; low-bit KV presets with it are on the list) and int8 decode attention
+  ([`-DMK_ATT_I8=1`](docs/CONFIGURATION.md#engine--d-flags), q8_0 KV cache). Both are opt-in source builds, not in the
+  packages yet.
 
 ## Quick start
 
@@ -69,7 +74,7 @@ model as below and run `scripts/serve.sh` or `scripts\serve.bat`. What they need
 git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout b10246
 cmake -S ../llama.cpp -B ../llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
 cmake --build ../llama.cpp/build -j
-make -j2                          # the served configuration: about 11 minutes, up to ~19 GiB of RAM in ptxas
+make -j2                          # the served configuration: about 14 minutes, up to ~21 GiB of RAM in ptxas
 pip install -r requirements.txt
 hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.gguf --local-dir ~/models
 scripts/serve.sh                  # http://127.0.0.1:8080: 120k context, 7 drafts, exact reuse, images on
@@ -143,14 +148,14 @@ attention puts most of its weight and where low-bit storage costs accuracy.
 | | q8_0 (default) | preset D | preset F |
 |---|---|---|---|
 | K / V bits (newest 2k positions at 8) | 8 / 8 | 6 / 5 | 5, rotated / 5 |
-| VRAM, idle server at 120k context | 21.3 GiB (21.2 in the llama.cpp session above) | 20.1 GiB | 20.0 GiB |
+| VRAM, idle server at 120k context | 21.1 GiB | 20.0 GiB | 19.8 GiB |
 | full 262,144-token context on 24 GB | no | yes | yes |
 | KL against llama.cpp at 32k / 100k context | 0.00219 / 0.00217 | 0.00236 / 0.00226 | 0.00242 / 0.00218 |
 | 282 benchmark questions | 230 right | 230 right | 229 right |
-| read a 101.6k-token prompt | 75.2 s | 78.1 s | 77.9 s |
+| read a 101.6k-token prompt | 72.5 s | 75.6 s | 75.2 s |
 
-At the full context a 260,896-token prompt reads in about 5.5 minutes, decode at that depth runs at 66 tok/s, and 4 of
-4 needle-in-a-haystack questions came back right. A conversation shorter than the window never leaves 8 bits, so
+At the full context, preset F reads a 260,896-token prompt in about 5.2 minutes and decodes at that depth at 70 tok/s,
+and 4 of 4 needle-in-a-haystack questions came back right. A conversation shorter than the window never leaves 8 bits, so
 preset D's output there is q8_0's.
 
 ```sh
@@ -207,9 +212,9 @@ also need the context window set by hand, some the image flag or the thinking le
 
 ## How it's fast
 
-- **One kernel launch per decode cycle.** The main model pass over up to 8 tokens, lm_head, draft verification, the
-  MTP catch-up and the next drafts (about 340 phases) run in one persistent cooperative kernel. The host only reads
-  back the accepted tokens.
+- **One kernel launch per decode cycle.** The main model pass over up to 8 tokens (16 in the experimental deep-pass
+  build), lm_head, draft verification, the MTP catch-up and the next drafts (about 340 phases) run in one persistent
+  cooperative kernel. The host only reads back the accepted tokens.
 - **Verification on int8 tensor cores.** The main pass runs as int8 GEMMs, so a cycle that verifies 8 tokens costs
   about 29 ms against 22 ms for one.
 - **Weights stay in their GGUF k-quant encoding**, re-laid-out at load for aligned loads (values unchanged) and read
@@ -228,7 +233,7 @@ The full tour: [docs/ENGINE.md](docs/ENGINE.md).
   SMs at any draft count. Making its batched passes work on 50-79 SMs (A10, L4, RTX A5000) is open, and a pull request
   is welcome.
 - **CUDA 13.2** (older 12.x versions are untested), Linux, WSL2 or Windows 10 / 11 x64.
-- **RAM:** ~20 GiB free to compile the served configuration. At run time, page-locked host memory for parked
+- **RAM:** ~22 GiB free to compile the served configuration. At run time, page-locked host memory for parked
   conversations up to `MK_PARK_MIB` (8 GiB by default, allocated as needed).
 - **llama.cpp b10246** next to this repository, **Python 3.10+** with jinja2, an x86-64 CPU with AVX2 + FMA for the
   fast image encoder, and ffmpeg for video (optional).
