@@ -792,6 +792,18 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     // block_count NLA: the 64 layers + the MTP layer; NL: a conversion without the MTP layer
     if ((file.ints["qwen35.block_count"] != NLA && file.ints["qwen35.block_count"] != NL) || file.ints["qwen35.embedding_length"] != D)
         throw std::runtime_error("unexpected model dimensions (this kernel is specialised for the 27B)");
+    // compiled in (the RoPE tables, the RMS norms): a model of these shapes with other values would load and answer wrong
+    for (const auto & [key, want] : {std::pair<const char *, float>{"qwen35.rope.freq_base", ROPE_BASE},
+                                     std::pair<const char *, float>{"qwen35.attention.layer_norm_rms_epsilon", EPS}}) {
+        const auto it = file.floats.find(key);
+        if (it == file.floats.end()) {
+            fprintf(stderr, "[mk] warning: the model has no %s: this kernel takes it as %g\n", key, want);
+        } else if (it->second != want) {
+            char msg[160];
+            snprintf(msg, sizeof msg, "the model's %s is %g, this kernel is built for %g", key, it->second, want);
+            throw std::runtime_error(msg);
+        }
+    }
     if (ctx > ctx_limit())
         throw std::runtime_error("context of " + std::to_string(ctx) + " positions exceeds the model's context length (" +
                                  std::to_string(ctx_limit()) + ", qwen35.context_length)");
@@ -1204,6 +1216,40 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
     if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
     fprintf(stderr, "[mk] stock2: K6 %d, K8 %d (nt %d)\n", hb.k6, k8, k8_nt);
+    {
+        // [name, default, largest]: past what a matrix holds the loops stop at its end, so the largest values mean "all"
+        struct L2Env { const char * name; int * v; int def, hi; };
+        L2Tune l2{};
+        const L2Env l2env[] = {
+            {"MK_L2_DN", &l2.dn, DN_PF_ITEM, 65536},
+            {"MK_L2_ATTN", &l2.attn, ATT_PFO_L, 256},
+            {"MK_L2_ATTN_CTX", &l2.attn_ctx, 2 * ATT_BUCKET, 1 << 30},
+            {"MK_L2_TOP", &l2.top, 1, 20},
+            {"MK_L2_CK", &l2.ck, MK_CK_PFL, 32},
+            {"MK_L2_MTP", &l2.mtp, MTP_PFL, 64},
+            {"MK_L2_MTP_R", &l2.mtpr, MTP_PFR, 128},
+            {"MK_L2_MTP_KEEP", &l2.keep, 0, 1},
+        };
+#if MK_L2_TUNE
+        std::string l2s;
+        for (const L2Env & e : l2env) {
+            *e.v = e.def;
+            if (const char * s = getenv(e.name); s && *s) {
+                char * end;
+                const long x = strtol(s, &end, 10);
+                if (*end || x < 0 || x > e.hi)
+                    throw std::runtime_error(std::string(e.name) + "=" + s + ": an integer from 0 to " + std::to_string(e.hi));
+                *e.v = (int) x;
+            }
+            l2s += std::string(" ") + e.name + "=" + std::to_string(*e.v);
+        }
+        CK(mkl::set_cL2(&l2, sizeof(l2)));
+        fprintf(stderr, "[mk] MK_L2_TUNE:%s\n", l2s.c_str());
+#else
+        for (const L2Env & e : l2env)
+            if (getenv(e.name)) fprintf(stderr, "[mk] %s ignored: the L2 budgets are constants in this build (-DMK_L2_TUNE=1: make MKFLAGS=..., build.ps1 -MkFlags ...)\n", e.name);
+#endif
+    }
     fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
     fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
     hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)

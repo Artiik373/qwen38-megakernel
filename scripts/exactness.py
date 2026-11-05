@@ -103,9 +103,9 @@ def sha256(path):
 
 
 def build_info():
-    info = os.path.join(HERE, "BUILD_INFO.txt")  # (release packages)
+    info = os.path.join(HERE, "BUILD_INFO.txt")  # (release packages; PowerShell's utf8 starts it with a BOM)
     if os.path.isfile(info):
-        with open(info, encoding="utf-8", errors="replace") as f:
+        with open(info, encoding="utf-8-sig", errors="replace") as f:
             return f.readline().strip()
     try:
         r = subprocess.run(["git", "-C", HERE, "describe", "--always", "--dirty"], capture_output=True, text=True, timeout=30)
@@ -173,6 +173,10 @@ class Server:
                 self.p.kill()
                 self.p.wait()
         self.logf.close()
+        # (Windows: a venv's python.exe is a launcher, and its child, the server, is still exiting when the launcher is gone)
+        end = time.monotonic() + 120
+        while port_open(self.chk.a.port) and time.monotonic() < end:
+            time.sleep(0.5)
 
     def chat(self, messages, opts):
         body = dict(messages=messages, max_tokens=128, stream=False, chat_template_kwargs={"enable_thinking": False}, **opts)

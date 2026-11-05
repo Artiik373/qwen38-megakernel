@@ -59,7 +59,7 @@ on when the vision projector is found. These are the settings worth knowing:
 | Drafts per cycle | `MK_DRAFT` | `-d` | 7 | 0 turns speculation off; 8-15 only with the opt-in [deep-pass build](EXPERIMENTAL.md#the-deep-pass) and no `MK_KV` preset (so not above 240k with `serve.bat`, which picks preset F there) |
 | Listen address | `MK_HOST` | `--host` | 127.0.0.1 | `0.0.0.0` for other machines on the LAN (then also `MK_ALLOW_HOSTS`) |
 | Host names, web pages | `MK_ALLOW_HOSTS`, `MK_CORS_ORIGINS` | `--allow-host`, `--cors-origin` | none | a LAN name or a reverse proxy; a browser UI on another origin |
-| API key | `MK_API_KEY` | `--api-key` | none | other machines on the LAN: clients then send it as their API key |
+| API key | `MK_API_KEY` | `--api-key` | none | other machines on the LAN: clients then send it as their API key (listening beyond this machine without one: a warning at startup) |
 | Images and video | `MK_MMPROJ` | `--mmproj` | `mmproj-BF16.gguf` next to the model | another projector file, or images off |
 | Exact reuse | `MK_EXACT_REUSE=0` turns it off | `--exact-reuse` | on | off: a follow-up turn appends to the previous reply instead of re-reading it (faster, but not bit-identical to the same request sent fresh) |
 | Keep-warm | `MK_KEEP_WARM_S` | (engine) | 120 s | 0: no extra draw after a request (an RTX 3090 held ~165 W instead of 30-35 W), but a reply after a pause starts at low clocks |
@@ -234,8 +234,9 @@ These variables are read by the launchers themselves and turned into options:
 Everything else is read from the environment by the server or the engine, so it works the same with or without a
 launcher: `MK_KV`, `MK_KV_WIN`, `MK_KEEP_WARM_S`, `MK_DRAFT_Q4`, `MK_MTP`, `MK_NO_MTP`, `MK_SIDE_MAX`, `MK_PARK_MIB`,
 `MK_ALLOW_HOSTS`, `MK_CORS_ORIGINS`, `MK_API_KEY`, `MK_CHAT_TEMPLATE_KWARGS`, `MK_CONTENT_SPECIALS`,
-`MK_REASONING_FORMAT`, `MK_TIMEOUT_S`, `MK_MAX_BODY_MB`, `MK_MAX_IMAGES`, `MK_IMAGE_MAX_PIXELS`, `MK_MAX_VIDEO_FRAMES`,
-`MK_FFMPEG` (all listed at the top of `scripts/serve.sh`) and every engine variable below.
+`MK_REASONING_FORMAT`, `MK_TIMEOUT_S`, `MK_REQUEST_TIMEOUT_S`, `MK_MAX_BODY_MB`, `MK_MAX_INFLIGHT_MB`,
+`MK_MAX_CONNECTIONS`, `MK_MAX_IMAGES`, `MK_IMAGE_MAX_PIXELS`, `MK_MAX_VIDEO_FRAMES`, `MK_FFMPEG` (all listed at the top
+of `scripts/serve.sh`) and every engine variable below.
 
 The launchers do not pass `--park-min`, `--park-cks`, `--ck-every`, `--ck-msgs`, `--ck-pin`, `--image-min-tokens`,
 `--image-cache`, `--video-cache`, `--vision-threads`, `--vision-backend`, `--chat-template`, `--lib`, `--vision-lib`
@@ -309,7 +310,10 @@ Read by the server only (there is no option for them):
 | Variable | Default | What it does |
 |---|---|---|
 | `MK_TIMEOUT_S` | `600` | seconds a connection's read or write may make no progress before the connection closes (llama-server's `--timeout`; `0`: none): idle keep-alive connections, stalled requests, a client that stopped reading a reply |
+| `MK_REQUEST_TIMEOUT_S` | `300` | seconds a request may take to arrive, from its first byte to the last of its body, before the connection closes (`0`: no limit): a client sending a byte at a time never hits `MK_TIMEOUT_S`. Generating the reply does not count |
 | `MK_MAX_BODY_MB` | `128` | largest request body in MB, Content-Length or chunked; larger ones get a 413 |
+| `MK_MAX_INFLIGHT_MB` | `256` | request bodies in memory at once in MB, all connections (at least `MK_MAX_BODY_MB`); a body past it gets a 503 |
+| `MK_MAX_CONNECTIONS` | `256` | open connections; a connection past it gets a 503 |
 | `MK_MAX_IMAGES` | `32` | images per request; more get a 400 |
 | `MK_MAX_VIDEO_FRAMES` | `256` | video frames per request, all of its videos (64 s at 4 fps) |
 | `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed in each decode cycle's pass beside the decoding slots (`mk_slots_step_mixed`), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. With `MK_EXACT` (the `--agents` default) a chunk before the prompt's last ends on the 32-token scan grid (up to 31 tokens off this budget) and the chunking changes no reply |
@@ -317,11 +321,11 @@ Read by the server only (there is no option for them):
 | `MK_PF_SOLO` | `0` | `--agents`: prompt tokens fed per call while no slot decodes (`0`: the whole prompt); with `MK_EXACT`, on the 32-token grid as `MK_PF_MIX` |
 | `MK_IMAGE_MAX_PIXELS` | `100000000` | largest image or video frame in pixels, checked from the file header before decoding; also read by the vision library. The server reads it only with `--mmproj` |
 
-`MK_MAX_BODY_MB`, `MK_MAX_IMAGES`, `MK_MAX_VIDEO_FRAMES` and `MK_IMAGE_MAX_PIXELS` must be positive integers, the three
-`MK_PF_*` integers >= 0: anything else ends the server at startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB`,
-`MK_AGENTS` and `MK_TIMEOUT_S` accept `0` (off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is
-given, and with `--agents` sets `MK_EXACT=1` and `MK_PF_CAP=1024` unless they are set; it reports `MK_CK_SLOTS` in
-`/props`.
+`MK_MAX_BODY_MB`, `MK_MAX_INFLIGHT_MB`, `MK_MAX_CONNECTIONS`, `MK_MAX_IMAGES`, `MK_MAX_VIDEO_FRAMES` and
+`MK_IMAGE_MAX_PIXELS` must be positive integers, the three `MK_PF_*` integers >= 0: anything else ends the server at
+startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB`, `MK_AGENTS`, `MK_TIMEOUT_S` and `MK_REQUEST_TIMEOUT_S` accept `0`
+(off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and with `--agents` sets `MK_EXACT=1`
+and `MK_PF_CAP=1024` unless they are set; it reports `MK_CK_SLOTS` in `/props`.
 llama-server's `LLAMA_ARG_*` variables are not read.
 
 ## Engine environment variables
@@ -510,6 +514,7 @@ it.
 |---|---|---|---|---|---|
 | `MK_MAXD` | `8` | `8` | the most tokens of one decode verify pass: `8` (up to 7 drafts) or `16`, the [deep-pass build](EXPERIMENTAL.md#the-deep-pass): `-d` up to 15, cycles of 9-16 tokens verified as one 16-row pass, drafts 8-15 only with the q8_0 cache and no `MK_KV` / `MK_KV_WIN`. Needs `-DMK_PAR_RMAX` >= 16 (its default) | [EXPERIMENTAL.md](EXPERIMENTAL.md#the-deep-pass) | opt-in (in development) |
 | `MK_ATT_I8` | `0` | `0` | experiment build ([EXPERIMENTAL.md](EXPERIMENTAL.md#int8-decode-attention)): int8 Q K^T in the decode attention of the all-q8_0 slots, used when the environment variable `MK_ATT_I8=1` is set. One score helper serves every attention kernel, so draft depths and parallel slots stay exact with it; at 40.5k tokens of context attention took 12% less time per 8-row pass, 3-5 rows unchanged (2026-11-02). In active development and on the list for the served build; not part of it yet, its KL divergence gate is not settled | changes | experiment (in development) |
+| `MK_L2_TUNE` | `0` | `0` | experiment build ([EXPERIMENTAL.md](EXPERIMENTAL.md#l2-prefetch-budgets)): the L2 prefetch budgets read from the `MK_L2_*` environment variables, to tune them on a GPU with another L2 size. Without it the device code is unchanged. Hints only: no value changes a token. On an RTX 3090 no setting beat the defaults (2026-11-04) | same | experiment (in development) |
 | `MK_FD_NOINL` | `0x1c` | `0x1c` | bit mask of the token counts whose ffn_down rows run out of line (T 2-4); inline they spilled and the phase ran 0.17-0.25 ms per pass slower | same | served |
 | `MK_NSEQ` | `4` | `4` | the most parallel slots the engine opens (`--agents` 1 to this): the lanes of a batched launch, each with its own views of the row buffers | same | served |
 | `MK_PAR_RMAX` | `16` | `16` | rows of a batched slot pass (16 beat 24 at 3-4 slots: 345 vs 322 tok/s at 4, temperature 0.6); a value up to 8 makes the passes 8 rows (not with `MK_MAXD=16`). The wide pass also needs every main matrix but ffn gate / up in the wide-verify layout and enough SMs | same | served |
@@ -622,7 +627,7 @@ These are for measuring and checking, not for serving. Each one's usage text is 
 | `bench/think_bench.py` (thinking-mode decode, both engines) | `--seeds N` (2), `-n N` (1024) |
 | `bench/wv_extract.py` | `[qwen38_mk.cu] [out.cuh]`: copies the engine's dp4a GEMV code from `mk_shared.cuh` and `qwen38_mk.cu` into `bench/wv_ref.cuh` for `wvgemm_bench` (`make check` runs it first) |
 | `scripts/gate.sh` (every GPU check of a build: [checking a build](BUILDING.md#checking-a-build)) | `-m GGUF` (default `MK_MODEL`), `--record DIR` (keep the outputs as a reference) or `--ref DIR` (every output, and the inherited `MK_*` environment, must equal the reference's; a check it did not run is a skip), `--out DIR` (default `gate-out`; one holding a recorded reference is refused), `--legs LIST` (default `benches,exactness,pfcap,cli,tinv,slots,capi,kld`), `--model2 GGUF`, `--kld-ref FILE` (the kld leg), `--capi FILE` (default `scripts/capi_checks.py`), `--capi-cases "CASE ..."` (one or more), `--python PY` (with jinja2), `--port N` (default 18190), `--timeout S` (per run, default 1800); exit 1 if a check failed, 2 for bad arguments, a stale build or a refused `--out` |
-| `scripts/capi_checks.py` (the C API: engine errors and roll-backs, out-of-memory inside the free VRAM, penalties, policies) | `LIB MODEL DRAFT_VOCAB [CASE ...]`: the given cases (default: all), each in its own process, PASS / FAIL / SKIP, exit 1 on a FAIL and 2 for an unknown case; env `CAPI_DEVOOM=0` (skip the device out-of-memory cases), `CAPI_COMMIT_MIN_GB` (Windows commit those wait for, default 45) |
+| `scripts/capi_checks.py` (the C API: engine errors and roll-backs, out-of-memory inside the free VRAM, penalties, policies, a slot listed twice, a model's values the kernel does not have) | `LIB MODEL DRAFT_VOCAB [CASE ...]`: the given cases (default: all), each in its own process, PASS / FAIL / SKIP, exit 1 on a FAIL and 2 for an unknown case; env `CAPI_DEVOOM=0` (skip the device out-of-memory cases), `CAPI_COMMIT_MIN_GB` (Windows commit those wait for, default 45) |
 | `bench/suite/fetch.py` (downloads the benchmark items and checks each against `bench/suite/items.json`) | `--data DIR` (default `bench/suite/data`), `--sets NAME ...` (default all, and `pf101k`), `--check` (check the files already there, download nothing) |
 | `bench/suite/speed_client.py` (decode, prefill, first token, follow-up turns, prompt edits, VRAM; one server) | `--label L`, `--out FILE` (JSON lines, appended), `--url URL` (default `http://127.0.0.1:8080`), `--mode all\|edit` (default all; edit: the warm-up and the edit scenarios only), `--data DIR`, `--gpu N\|none` (nvidia-smi GPU for the VRAM and clock records, default 0) |
 | `bench/suite/qa_client.py` (the 282 questions) | `--label`, `--out`, `--url`, `--data`, `--limit N` (the first N items of each set only), then set names (default all) |
@@ -670,6 +675,7 @@ a value acts when it is set to anything.
 | `MK_KV_EMU_SPEC` | `-DMK_KV_EMU=1` builds: the layers and formats to emulate, as `MK_KV` items `<K\|V\|*><slot>=<bits 2-8><modes>` (modes `r` Hadamard rotation, `s` random signs + rotation, `a` q4_0-style scale, `l` Lloyd-Max codebook with an rms scale, `n` one scale per 256-value row, `t` / `T` variants of `s`; `8` without modes = plain q8_0) plus `sink=N` (positions below N stay q8_0) and `win=N` (an emulated recent window) |
 | `MK_SPEC_LOG_FILE=path` | `-DMK_SPEC_LOG=1` builds: append one JSON line per decode cycle |
 | `MK_ATT_I8=1` | `-DMK_ATT_I8=1` builds: int8 Q K^T in the decode attention of the all-q8_0 slots ([Engine -D flags](#engine--d-flags)); other builds print that it is ignored |
+| `MK_L2_DN`, `MK_L2_ATTN`, `MK_L2_ATTN_CTX`, `MK_L2_TOP`, `MK_L2_CK`, `MK_L2_MTP`, `MK_L2_MTP_R`, `MK_L2_MTP_KEEP` | `-DMK_L2_TUNE=1` builds: the L2 prefetch budgets ([EXPERIMENTAL.md](EXPERIMENTAL.md#l2-prefetch-budgets)); other builds print that they are ignored |
 | `MK_KV_WIN_ALL=1` | with `MK_KV_WIN`: rings for the q8_0 sides too; their rows are the same q8_0 rows, so the output must stay byte-identical (a test of the ring paths) |
 | `MK_GSB=N` | CLI `--bench-phases`: the grid-barrier benchmark on N blocks instead, every form: `0` upstream's (the engine's), `1`-`3` flag-broadcast and relaxed-polling variants (measured slower: 0.61-0.94 us against 0.51-0.55 us per barrier) |
 | `MK_GSB_REPS` | repeats of the barrier benchmark (at least 3, default 15) |
