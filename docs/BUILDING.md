@@ -173,8 +173,13 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 | any other quantization | refused at load, naming the first tensor it cannot read (use llama.cpp) |
 
 - **Tensor types:** every projection of the trunk and the MTP layer can be Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS, Q3_K, IQ3_S,
-  IQ4_NL or Q5_1 (Q5_1: input projections only); `token_embd` Q4_K, Q5_K, Q6_K or Q8_0; `output` Q6_K or Q8_0; `ssm_alpha` / `ssm_beta` also F32, F16 or
+  IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, Q2_K, IQ1_M, IQ4_NL or Q5_1 (Q5_1: input projections only); `token_embd` Q4_K, Q5_K, Q6_K, Q8_0 or IQ2_S; `output` Q6_K, Q8_0 or Q4_K; `ssm_alpha` / `ssm_beta` also F32, F16 or
   BF16. How each is read, and the few other cases: [ENGINE.md](ENGINE.md#the-gguf).
+- **NVFP4 safetensors:** `-m <checkpoint dir>` (or its `model.safetensors`) loads a Hugging Face compressed-tensors NVFP4
+  checkpoint of Qwen3_5ForCausalLM directly, with no weight conversion (`NVF4` is in `MK_TYPES`; ~14 GB of weights on
+  the device). The tokenizer needs a vocab-only GGUF beside it, `<dir>/tokenizer.gguf` (no weights; make it with
+  `python llama.cpp/convert_hf_to_gguf.py <dir> --vocab-only --outfile <dir>/tokenizer.gguf`). Such a checkpoint has no
+  MTP layer: depth 0, or `--mtp some.gguf`. Details: [ENGINE.md](ENGINE.md#the-gguf).
 - **The MTP layer** (`blk.64`) is what the engine drafts with. Some conversions drop it. Without one the engine loads
   with a notice and decodes without drafting (depth 0, about a third of the drafted speed), with no MTP weights and no
   MTP KV slot; `--no-mtp` (`MK_NO_MTP=1`) does the same for a file that has one. `--mtp FILE` (`MK_MTP=FILE` in the

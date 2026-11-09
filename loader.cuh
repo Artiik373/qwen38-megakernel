@@ -191,6 +191,7 @@ class Prefetch {
         for (const gguf::Tensor * t : v) {
             const size_t a = pc_.size();
             for (size_t o = 0; o < t->nbytes; o += PIECE) pc_.push_back({t->data + o, std::min(PIECE, (size_t) t->nbytes - o)});
+            for (size_t o = 0; o < t->nv_scale_bytes; o += PIECE) pc_.push_back({t->nv_scale + o, std::min(PIECE, (size_t) t->nv_scale_bytes - o)});
             ix_[t->data] = {a, pc_.size()};
         }
         done_.reset(new std::atomic<uint8_t>[pc_.size() + 1]);

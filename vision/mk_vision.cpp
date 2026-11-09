@@ -28,10 +28,13 @@
 #endif
 #ifdef _WIN32
 #include "win32.h"
+#else
+#include <dlfcn.h>
 #endif
 
 // image decoding for both backends: llama.cpp's vendored stb_image (llama-server's decode: stbi_load_from_memory, 3
-// channels) with PNG, JPEG, GIF and BMP only; its TGA / HDR / PIC loaders have unfixed bugs (GHSL-2023-147 / -149)
+// channels) with PNG, JPEG, GIF and BMP only; its TGA / HDR / PIC loaders have unfixed bugs (GHSL-2023-147 / -149).
+// WebP (browser screenshots): the system's libwebp, see webp_api
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -42,6 +45,57 @@
 
 namespace {
 thread_local std::string g_err;
+
+// libwebp (libwebp.so.7), loaded at the first WebP image: no build dependency. Without it (or on Windows) a WebP image
+// is refused like any other undecodable one. Still images only (an animated WebP fails WebPGetInfo).
+struct WebpApi {
+    int (*info)(const uint8_t *, size_t, int *, int *);
+    uint8_t * (*rgb)(const uint8_t *, size_t, int *, int *);
+    void (*free)(void *);
+};
+const WebpApi * webp_api() {
+    static const WebpApi api = [] {
+        WebpApi a{};
+#ifndef _WIN32
+        if (void * h = dlopen("libwebp.so.7", RTLD_NOW | RTLD_LOCAL)) {
+            a.info = reinterpret_cast<decltype(a.info)>(dlsym(h, "WebPGetInfo"));
+            a.rgb = reinterpret_cast<decltype(a.rgb)>(dlsym(h, "WebPDecodeRGB"));
+            a.free = reinterpret_cast<decltype(a.free)>(dlsym(h, "WebPFree"));
+            if (!a.info || !a.rgb || !a.free) a = WebpApi{};
+        }
+#endif
+        return a;
+    }();
+    return api.info ? &api : nullptr;
+}
+bool is_webp(const unsigned char * d, size_t len) { return len >= 12 && !memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WEBP", 4); }
+
+// the image's size from its header, nothing decoded (len <= INT_MAX)
+bool image_info(const unsigned char * d, size_t len, int * w, int * h) {
+    if (is_webp(d, len)) {
+        const WebpApi * wp = webp_api();
+        return wp && wp->info(d, len, w, h);
+    }
+    int comp = 0;
+    return stbi_info_from_memory(d, (int) len, w, h, &comp);
+}
+// decoded RGB pixels (3 bytes each), released with RgbFree; null if the decode fails
+struct RgbFree {
+    bool webp;
+    void operator()(unsigned char * p) const {
+        if (webp) webp_api()->free(p);
+        else stbi_image_free(p);
+    }
+};
+using Rgb = std::unique_ptr<unsigned char, RgbFree>;
+Rgb image_rgb(const unsigned char * d, size_t len, int * nx, int * ny) {
+    if (is_webp(d, len)) {
+        const WebpApi * wp = webp_api();
+        return Rgb(wp ? wp->rgb(d, len, nx, ny) : nullptr, RgbFree{true});
+    }
+    int nc = 0;
+    return Rgb(stbi_load_from_memory(d, (int) len, nx, ny, &nc, 3), RgbFree{false});
+}
 
 bool g_verbose = false;
 void log_filtered(ggml_log_level level, const char * text, void *) {
@@ -269,10 +323,12 @@ int mkv_backend(const mkv_ctx * c) { return c->backend; }
 
 mkv_image * mkv_image_load(mkv_ctx * c, const unsigned char * data, size_t len) {
     g_err.clear();
-    // the header first (both backends decode with stb_image): an image over MK_IMAGE_MAX_PIXELS is refused undecoded
-    int w = 0, h = 0, comp = 0;
-    if (!data || len == 0 || len > (size_t) INT_MAX || !stbi_info_from_memory(data, (int) len, &w, &h, &comp)) {
-        g_err = len > (size_t) INT_MAX ? "cannot decode the image (over 2 GB)" : "cannot decode the image (PNG, JPEG, GIF or BMP)";
+    // the header first: an image over MK_IMAGE_MAX_PIXELS is refused undecoded
+    int w = 0, h = 0;
+    if (!data || len == 0 || len > (size_t) INT_MAX || !image_info(data, len, &w, &h)) {
+        g_err = len > (size_t) INT_MAX ? "cannot decode the image (over 2 GB)"
+                : is_webp(data, len) && !webp_api() ? "cannot decode the image (WebP needs libwebp.so.7)"
+                                                    : "cannot decode the image (PNG, JPEG, GIF, BMP or WebP)";
         return nullptr;
     }
     if (w <= 0 || h <= 0 || (long long) w * h > c->max_pixels) {
@@ -282,23 +338,20 @@ mkv_image * mkv_image_load(mkv_ctx * c, const unsigned char * data, size_t len) 
     }
 #ifndef MKV_NO_VIT
     if (c->backend == MKV_BACKEND_CPU) {
-        int nx = 0, ny = 0, nc = 0;
-        unsigned char * rgb = stbi_load_from_memory(data, (int) len, &nx, &ny, &nc, 3);
+        int nx = 0, ny = 0;
+        const Rgb rgb = image_rgb(data, len, &nx, &ny);
         if (!rgb || nx <= 0 || ny <= 0 || (long long) nx * ny > c->max_pixels) {
-            if (rgb) stbi_image_free(rgb);
             g_err = "cannot decode the image";
             return nullptr;
         }
         auto * im = new mkv_image;
         try {
-            c->vit->preprocess(rgb, nx, ny, im->pix, im->tw, im->th);
+            c->vit->preprocess(rgb.get(), nx, ny, im->pix, im->tw, im->th);
         } catch (const std::exception & e) {
             g_err = e.what();
-            stbi_image_free(rgb);
             delete im;
             return nullptr;
         }
-        stbi_image_free(rgb);
         im->nx = im->tw / 32;
         im->ny = im->th / 32;
         im->n = im->nx * im->ny;
@@ -308,15 +361,14 @@ mkv_image * mkv_image_load(mkv_ctx * c, const unsigned char * data, size_t len) 
     g_err = mtmd_size_error("image", w, h, c->min_tokens, c->max_tokens);
     if (!g_err.empty()) return nullptr;
     // (not mtmd_helper_bitmap_init_from_buf: its stb has every loader, and a failed decode goes to an ffmpeg on PATH)
-    int nx = 0, ny = 0, nc = 0;
-    unsigned char * rgb = stbi_load_from_memory(data, (int) len, &nx, &ny, &nc, 3);
+    int nx = 0, ny = 0;
+    Rgb rgb = image_rgb(data, len, &nx, &ny);
     if (!rgb || nx <= 0 || ny <= 0 || (long long) nx * ny > c->max_pixels) {
-        if (rgb) stbi_image_free(rgb);
         g_err = "cannot decode the image";
         return nullptr;
     }
-    mtmd_bitmap * bm = mtmd_bitmap_init((uint32_t) nx, (uint32_t) ny, rgb);
-    stbi_image_free(rgb);
+    mtmd_bitmap * bm = mtmd_bitmap_init((uint32_t) nx, (uint32_t) ny, rgb.get());
+    rgb.reset();
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
     const char * marker = mtmd_default_marker();
     mtmd_input_text txt = {marker, strlen(marker), false, true};

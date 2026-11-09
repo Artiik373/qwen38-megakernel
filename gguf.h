@@ -18,6 +18,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <exception>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <cmath>
 
 #ifdef _WIN32
 #include "compat_win32.h"
@@ -32,8 +37,8 @@ inline int mk_open(const char * path, int flags) { return open(path, flags); }
 namespace gguf {
 
 enum GType : uint32_t {
-    F32 = 0, F16 = 1, Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14,
-    IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23, BF16 = 30
+    F32 = 0, F16 = 1, Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14,
+    IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, IQ1_M = 29, BF16 = 30, NVFP4 = 40
 };
 
 struct Tensor {
@@ -43,6 +48,12 @@ struct Tensor {
     uint64_t offset = 0;
     const uint8_t * data = nullptr;
     uint64_t nbytes = 0;
+    // NVFP4 (safetensors source): data = packed e2m1 [rows, K/2]; nv_scale = UE4M3 group scales [rows, K/16];
+    // value = e2m1 * ue4m3 / nv_gs. Row r / 16-column group g of this tensor are source row (*nv_rows)[r] / group (*nv_cols)[g].
+    const uint8_t * nv_scale = nullptr;
+    uint64_t nv_scale_bytes = 0;
+    float nv_gs = 1;
+    std::shared_ptr<const std::vector<uint32_t>> nv_rows, nv_cols;
 };
 
 inline uint64_t type_row_bytes(uint32_t type, uint64_t n) {
@@ -60,7 +71,14 @@ inline uint64_t type_row_bytes(uint32_t type, uint64_t n) {
         case Q3_K: return n / 256 * 110;
         case IQ3_S: return n / 256 * 110;
         case IQ4_XS: return n / 256 * 136;
+        case Q2_K: return n / 256 * 84;
+        case IQ2_XXS: return n / 256 * 66;
+        case IQ2_XS: return n / 256 * 74;
+        case IQ3_XXS: return n / 256 * 98;
+        case IQ2_S: return n / 256 * 82;
+        case IQ1_M: return n / 256 * 56;
         case IQ4_NL: return n / 32 * 18;
+        case NVFP4: return n / 2; // values only: the UE4M3 group scales are a second array (Tensor::nv_scale)
         default: throw std::runtime_error("unsupported ggml type " + std::to_string(type));
     }
 }
@@ -70,7 +88,8 @@ inline uint64_t type_block(uint32_t type) {
     switch (type) {
         case F32: case F16: case BF16: return 1;
         case Q4_0: case Q4_1: case Q5_0: case Q5_1: case Q8_0: case IQ4_NL: return 32;
-        case Q4_K: case Q5_K: case Q6_K: case Q3_K: case IQ3_S: case IQ4_XS: return 256;
+        case Q4_K: case Q5_K: case Q6_K: case Q3_K: case IQ3_S: case IQ4_XS: case Q2_K: case IQ2_XXS: case IQ2_XS: case IQ3_XXS:
+        case IQ2_S: case IQ1_M: case NVFP4: return 256;
         default: return 0;
     }
 }
@@ -96,10 +115,20 @@ struct File {
     std::map<std::string, std::string> strs;
     std::map<std::string, float> floats; // float32 kvs (rope.freq_base, layer_norm_rms_epsilon)
     std::map<std::string, uint64_t> arrs; // element count of each array kv (e.g. tokenizer.ggml.tokens: the vocabulary)
+    std::map<std::string, std::vector<int32_t>> iarrs; // int32 arrays kept in full: *.attention.compress_ratios (QSA)
 
     static constexpr uint64_t MAX_ALIGNMENT = 1u << 20; // general.alignment: a power of two up to this
 
+    std::vector<std::unique_ptr<uint8_t[]>> owned; // buffers of tensors built at load (safetensors source)
+    bool owned_st = false;
+    static bool is_safetensors_path(const std::string & p);
+    void open_safetensors(const std::string & path);
+
     explicit File(const std::string & path) {
+        if (is_safetensors_path(path)) {
+            open_safetensors(path);
+            return;
+        }
         int fd = mk_open(path.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path);
         struct stat st;
@@ -132,7 +161,8 @@ struct File {
     void release() {
         if (base) munmap((void *) base, size);
         base = nullptr;
-        for (auto & t : tensors) t.second.data = nullptr;
+        for (auto & t : tensors) t.second.data = nullptr, t.second.nv_scale = nullptr;
+        owned.clear();
     }
 
     const Tensor & get(const std::string & name) const {
@@ -192,6 +222,12 @@ struct File {
                 arrs[key] = n;
                 if (const uint64_t eb = scalar_bytes(et)) {
                     if (n > (size - pos) / eb) fail("array " + key + " of " + std::to_string(n) + " elements runs past the end");
+                    const bool cr = key.size() >= 15 && key.compare(key.size() - 15, 15, "compress_ratios") == 0;
+                    if ((et == 5 && cr) || ((et == 4 || et == 5) && key == "dflash.target_layers")) { // QSA: per-layer block size (0: dense); DSpine: the target layers it reads
+                        auto & v = iarrs[key];
+                        v.resize((size_t) n);
+                        if (n) memcpy(v.data(), base + pos, (size_t) (n * 4));
+                    }
                     pos += (size_t) (n * eb);
                 } else if (et == 8) {
                     if (n > (size - pos) / 8) fail("array " + key + " of " + std::to_string(n) + " strings runs past the end");
@@ -252,7 +288,7 @@ struct File {
         const uint64_t data_size = size - data_start;
         for (auto & t : infos) {
             const uint64_t bl = type_block(t.type);
-            if (!bl) fail("tensor " + t.name + " has unsupported ggml type " + std::to_string(t.type));
+            if (!bl || t.type == NVFP4) fail("tensor " + t.name + " has unsupported ggml type " + std::to_string(t.type));
             if (t.ne[0] % bl != 0) fail("tensor " + t.name + ": a row of " + std::to_string(t.ne[0]) + " is not whole blocks");
             uint64_t rows = 1;
             for (size_t d = 1; d < t.ne.size(); d++) rows *= t.ne[d]; // (< 2^63: checked above)
@@ -271,3 +307,7 @@ struct File {
 };
 
 } // namespace gguf
+
+// safetensors source (File::open_safetensors); needs the complete File
+#include "safetensors.h"
+

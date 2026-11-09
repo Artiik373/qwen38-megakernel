@@ -39,7 +39,7 @@ __host__ __device__ constexpr bool wv_type(int t) {
     return t == T_Q4K || t == T_Q5K || t == T_IQ4X || t == T_IQ4NL || t == T_Q8_0 || t == T_Q5_1;
 }
 // per-16 weight scales (the ffn_down offset types): split MMAs only
-__host__ __device__ constexpr bool wv_s16(int t) { return t == T_Q6K || t == T_Q3K; }
+__host__ __device__ constexpr bool wv_s16(int t) { return t == T_Q6K || t == T_Q3K || t == T_IQ2S || t == T_Q2K || t == T_NVF4; }
 
 // unit (tile, super-block sb) of an FM matrix, BS bytes per row and super-block
 __device__ __forceinline__ const uint8_t * wv_unit(const Mat & m, int tile, int sb, int BS) {
@@ -208,7 +208,7 @@ template <> struct WV<T_Q8_0> { // repacked: per unit 32 B (A 16 | B 16); fp16 d
 // block). Values are fed with offset 32 (MIN 2: the accumulator input is MAGIC - 32 qsum, wv_fill's min2 mx), so the
 // weight is fA q'. Q6_K / Q3_K carry per-16 scales (S16): split MMAs only (X16), where h = tq >> 1 is the thread's chunk.
 // frag / wsc take the thread's tq / h (MIN 2 types only: wv_sb).
-__host__ __device__ constexpr bool wv_min2(int t) { return t == T_Q6K || t == T_Q3K || t == T_IQ3S; }
+__host__ __device__ constexpr bool wv_min2(int t) { return t == T_Q6K || t == T_Q3K || t == T_IQ3S || t == T_IQ3XXS || t == T_IQ2S; }
 // the meta pair (Q6_K / Q3_K) of super-block sb of row r of the tile
 __device__ __forceinline__ const uint8_t * wv_tpair(const Mat & m, int tile, int r, int sb) {
     return reinterpret_cast<const uint8_t *>(m.d) + (((size_t) tile * (m.K >> 9) + (sb >> 1)) * 16 + r) * (2 * Q6_META);
@@ -409,6 +409,160 @@ template <> struct WV<T_IQ3S> {
         }
         w0 = w[0];
         w1 = w[1];
+    }
+};
+// IQ3_XXS: the values of IQ3_S (grid entries 512 + the index byte: no high bit), meta 8 B per block: scales[4] (byte p:
+// sub-block 2p | 2p + 1 << 4) | fp16 d | pad. Weight d / 2 (2 ls + 1) +- g / 2, g / 2 <= 31: fed 32 + s g / 2 (offset 32), per-32 scales.
+template <> struct WV<T_IQ3XXS> {
+    static constexpr int MIN = 2, BS = Q3_BLK;
+    static constexpr bool S16 = false;
+    struct Raw { int2 sd; int2 ix[4]; int sg[4]; };
+    using Sc = WV<T_IQ3S>::Sc;
+    static __device__ __forceinline__ void load(Raw & r, const Mat & m, int tile, int row, int sb, int tq) {
+        const uint8_t * blk = wv_tblk(m, tile, row, sb, Q3_BLK);
+        r.sd = ldw2(wv_tmeta(m, tile, row, sb, IQ3XXS_META));
+#pragma unroll
+        for (int p = 0; p < 4; p++) {
+            const int u = 2 * p + (tq >> 1);
+            r.ix[p] = ldw2(blk + 8 * u);
+            r.sg[p] = ldw1(blk + 64 + 4 * u);
+        }
+    }
+    static __device__ __forceinline__ void scales(const Raw & r, Sc & s) {
+        s.sc = (unsigned) r.sd.x;
+        s.d = __half2float(__ushort_as_half((unsigned short) (r.sd.y & 0xffff))) * 0.5f;
+        s.nd = -WV_FMAGIC * s.d;
+    }
+    static __device__ __forceinline__ void wsc2(const Sc & s, int k, int h, float & fA) { WV<T_IQ3S>::wsc2(s, k, h, fA); }
+    template <bool GS = false>
+    static __device__ __forceinline__ void frag2(const Raw & r, int k, int tq, int & w0, int & w1) {
+        const int p = k >> 1, part = k & 1;
+        const unsigned x = part ? (unsigned) r.ix[p].y : (unsigned) r.ix[p].x, sv = (unsigned) r.sg[p];
+        const int c0 = 2 * (tq & 1), hs = 4 * part;
+        int w[2];
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int c = c0 + i;
+            const unsigned g = iq3s_grid(((x >> (8 * c)) & 0xffu) + 512u);
+            const unsigned mk = ((sv >> (c + hs)) & 0x01010101u) * 0xffu;
+            w[i] = (int) (0x20202020u + (g ^ mk) - mk);
+        }
+        w0 = w[0];
+        w1 = w[1];
+    }
+};
+// IQ2 (XXS / XS / S, repack_iq2s): values 64 B per block, unit u' = 2p + h at 8u' (A idx low [2], B idx low [2], A sign u16, B
+// sign u16: the full 8-bit sign byte per 8-weight group), meta 20 B per block: qh[8] (byte u': A0, A1, B0, B1 index high
+// bits) | sc[8] (byte u': A ls | B ls << 4) | fp16 d | base. Weight d / 8 (2 ls + 1) +- g, g <= 43: fed 32 +- g (offset 32,
+// signed bytes), per-16 scales (S16: the thread's chunk h = tq >> 1 picks unit u' = 2p + h, its 8-weight group tq & 1).
+template <> struct WV<T_IQ2S> {
+    static constexpr int MIN = 2, BS = IQ2_BLK;
+    static constexpr bool S16 = true;
+    struct Raw { int2 qh; int2 sc; int dd; int2 rec[4]; };
+    struct Sc { int2 sc; float d, nd; };
+    static __device__ __forceinline__ void load(Raw & r, const Mat & m, int tile, int row, int sb, int tq) {
+        const uint8_t * blk = wv_tblk(m, tile, row, sb, IQ2_BLK);
+        const uint8_t * mp = wv_tmeta(m, tile, row, sb, IQ2_META);
+        r.qh = make_int2(ldw1(mp), ldw1(mp + 4)); // (20-B meta stride: 4-B aligned only)
+        r.sc = make_int2(ldw1(mp + 8), ldw1(mp + 12));
+        r.dd = ldw1(mp + 16);
+#pragma unroll
+        for (int p = 0; p < 4; p++) r.rec[p] = ldw2(blk + 8 * (2 * p + (tq >> 1)));
+    }
+    static __device__ __forceinline__ void scales(const Raw & r, Sc & s) {
+        s.sc = r.sc;
+        s.d = __half2float(__ushort_as_half((unsigned short) (r.dd & 0xffff))) * 0.125f;
+        s.nd = -WV_FMAGIC * s.d;
+    }
+    // chunk (sub-block k, h): the nibble k & 1 of byte u' = 2 (k >> 1) + h of sc[8]
+    static __device__ __forceinline__ void wsc2(const Sc & s, int k, int h, float & fA) {
+        const int u = 2 * (k >> 1) + h;
+        const unsigned w = (unsigned) (u < 4 ? s.sc.x : s.sc.y) >> (8 * (u & 3));
+        const int v = 1 + 2 * (int) ((w >> (4 * (k & 1))) & 0xfu);
+        fA = fmaf(s.d, __int_as_float(WV_MAGIC + v), s.nd);
+    }
+    template <bool GS = false>
+    static __device__ __forceinline__ void frag2(const Raw & r, int k, int tq, int & w0, int & w1) {
+        const int p = k >> 1, part = k & 1, u = 2 * p + (tq >> 1), c = tq & 1;
+        const unsigned qh = (unsigned) (u < 4 ? r.qh.x : r.qh.y) >> (8 * (u & 3));
+        const unsigned vx = (unsigned) r.rec[p].x, vy = (unsigned) r.rec[p].y;
+        const unsigned base = (unsigned) r.dd >> 16;
+        const unsigned lo = ((part ? vx >> 16 : vx) >> (8 * c)) & 0xffu;
+        const unsigned hi = ((qh >> (4 * part + 2 * c)) & 3u) + base;
+        const uint64_t gv = iq2_grid(lo | (hi << 8));
+        const unsigned sv = ((part ? vy >> 16 : vy) >> (8 * c)) & 0xffu;
+        const unsigned m0 = mk0(sv), m1 = mk1(sv);
+        w0 = (int) ((0xA0A0A0A0u + ((unsigned) gv ^ m0) - m0) ^ 0x80808080u);
+        w1 = (int) ((0xA0A0A0A0u + ((unsigned) (gv >> 32) ^ m1) - m1) ^ 0x80808080u);
+    }
+};
+// Q2_K (repack_q2k): values 64 B per block, unit u' = 2p + h at 8u': A word | B word (byte m bits 2j = element 4j + m, as the
+// Q3_K lows), meta 20 B per block: scales[16] | fp16 d | fp16 dmin. Weight d sc q - dmin m, q in 0..3: MIN 1 with per-16
+// scales (S16): fA = d sc, gA = dmin m of the chunk 4p + 2 part + h, the min term -gA (dx qsum) of the thread's chunk h.
+template <> struct WV<T_Q2K> {
+    static constexpr int MIN = 1, BS = Q2_BLK;
+    static constexpr bool S16 = true;
+    struct Raw { int sc[4]; int dd; int2 lo[4]; };
+    struct Sc { int sc[4]; float d, dm; };
+    static __device__ __forceinline__ void load(Raw & r, const Mat & m, int tile, int row, int sb, int tq) {
+        const uint8_t * blk = wv_tblk(m, tile, row, sb, Q2_BLK);
+        const uint8_t * mp = wv_tmeta(m, tile, row, sb, Q2_META);
+#pragma unroll
+        for (int k = 0; k < 4; k++) r.sc[k] = ldw1(mp + 4 * k);
+        r.dd = ldw1(mp + 16);
+#pragma unroll
+        for (int p = 0; p < 4; p++) r.lo[p] = ldw2(blk + 8 * (2 * p + (tq >> 1)));
+    }
+    static __device__ __forceinline__ void scales(const Raw & r, Sc & s) {
+#pragma unroll
+        for (int k = 0; k < 4; k++) s.sc[k] = r.sc[k];
+        s.d = __half2float(__ushort_as_half((unsigned short) (r.dd & 0xffff)));
+        s.dm = __half2float(__ushort_as_half((unsigned short) ((unsigned) r.dd >> 16)));
+    }
+    static __device__ __forceinline__ void wsc2m(const Sc & s, int k, int h, float & fA, float & gA) {
+        const int c0 = 4 * (k >> 1) + 2 * (k & 1); // byte c0 + h of sc[16]
+        const unsigned w = (unsigned) s.sc[c0 >> 2] >> (8 * h);
+        const unsigned v = (w >> (8 * (c0 & 3))) & 0xffu;
+        fA = s.d * (float) (int) (v & 0xfu);
+        gA = s.dm * (float) (int) (v >> 4);
+    }
+    static __device__ __forceinline__ void frag2(const Raw & r, int k, int tq, int & w0, int & w1) {
+        const unsigned x = (k & 1) ? (unsigned) r.lo[k >> 1].y : (unsigned) r.lo[k >> 1].x;
+        const int j0 = 2 * (tq & 1);
+        w0 = (int) ((x >> (2 * j0)) & 0x03030303u);
+        w1 = (int) ((x >> (2 * j0 + 2)) & 0x03030303u);
+    }
+};
+// NVFP4 (repack_nvf4): values 128 B per block, unit u' = 2p + h at 16 B (A word 0 | B word 0 | A word 1 | B word 1; word = 8
+// e2m1 codes, low nibbles the ints 2c, high 2c + 1 of the 16-weight half), meta 20 B: 16 UE4M3 scale bytes (group g = byte
+// g; A = 4p + h, B = 4p + 2 + h) | fp32 tensor scale / 2. Signed doubled ints, MIN 0, per-16 scales (S16): the thread's
+// chunk h = tq >> 1 picks unit u' = 2p + h, its 8-weight word tq & 1.
+template <> struct WV<T_NVF4> {
+    static constexpr int MIN = 0, BS = NV_BLK;
+    static constexpr bool S16 = true;
+    struct Raw { int sc[4]; int gs; int2 rec[4]; };
+    struct Sc { int sc[4]; float gsh; };
+    static __device__ __forceinline__ void load(Raw & r, const Mat & m, int tile, int row, int sb, int tq) {
+        const uint8_t * blk = wv_tblk(m, tile, row, sb, NV_BLK);
+        const uint8_t * mp = wv_tmeta(m, tile, row, sb, NV_META);
+#pragma unroll
+        for (int k = 0; k < 4; k++) r.sc[k] = ldw1(mp + 4 * k); // (20-B meta stride: 4-B aligned only)
+        r.gs = ldw1(mp + 16);
+#pragma unroll
+        for (int p = 0; p < 4; p++) r.rec[p] = ldw2(blk + 16 * (2 * p + (tq >> 1)) + 8 * (tq & 1));
+    }
+    static __device__ __forceinline__ void scales(const Raw & r, Sc & s) {
+#pragma unroll
+        for (int k = 0; k < 4; k++) s.sc[k] = r.sc[k];
+        s.gsh = __int_as_float(r.gs);
+    }
+    static __device__ __forceinline__ void wsc2(const Sc & s, int k, int h, float & fA) {
+        fA = nv_ue4m3(((unsigned) s.sc[k >> 1] >> (8 * (2 * (k & 1) + h))) & 0xffu) * s.gsh;
+    }
+    static __device__ __forceinline__ void frag2(const Raw & r, int k, int, int & w0, int & w1) {
+        const int2 v = nv_lut16((unsigned) ((k & 1) ? r.rec[k >> 1].y : r.rec[k >> 1].x));
+        w0 = v.x;
+        w1 = v.y;
     }
 };
 
@@ -619,8 +773,8 @@ __device__ __forceinline__ void wv_sb(const typename WV<TYPE>::Raw & r0, const t
     for (int k = 0; k < 8; k++) {
         int a[4];
         float fA0, gA0, fA1, gA1;
-        if constexpr (W::MIN == 2) { // offset types: the thread's tq / chunk h select its bytes / scales
-            if constexpr (TYPE == T_IQ3S) {
+        if constexpr (W::MIN == 2 || TYPE == T_NVF4) { // offset types and NVFP4: the thread's tq / chunk h select its bytes / scales
+            if constexpr (TYPE == T_IQ3S || TYPE == T_IQ3XXS || TYPE == T_IQ2S) {
                 W::template frag2<GS>(r0, k, tq, a[0], a[2]);
                 W::template frag2<GS>(r1, k, tq, a[1], a[3]);
             } else {
@@ -630,6 +784,11 @@ __device__ __forceinline__ void wv_sb(const typename WV<TYPE>::Raw & r0, const t
             W::wsc2(s0, k, tq >> 1, fA0);
             W::wsc2(s1, k, tq >> 1, fA1);
             gA0 = gA1 = 0.f;
+        } else if constexpr (TYPE == T_Q2K) { // per-16 scales and mins (X16): the thread's chunk h = tq >> 1
+            W::frag2(r0, k, tq, a[0], a[2]);
+            W::frag2(r1, k, tq, a[1], a[3]);
+            W::wsc2m(s0, k, tq >> 1, fA0, gA0);
+            W::wsc2m(s1, k, tq >> 1, fA1, gA1);
         } else {
             W::frag(r0, k, a[0], a[2]);
             W::frag(r1, k, a[1], a[3]);
@@ -826,6 +985,10 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
             case T_Q6K: return wv_tile<T_Q6K, T, X16>(m, tile, sb0, nsb, ldu);
             MK_IF(MK_TY_Q3K, case T_Q3K: return wv_tile<T_Q3K, T, X16>(m, tile, sb0, nsb, ldu);)
             MK_IF(MK_TY_IQ3S, case T_IQ3S: return wv_tile<T_IQ3S, T, X16>(m, tile, sb0, nsb, ldu);)
+            MK_IF(MK_TY_IQ3XXS, case T_IQ3XXS: return wv_tile<T_IQ3XXS, T, X16>(m, tile, sb0, nsb, ldu);)
+            MK_IF(MK_TY_IQ2S, case T_IQ2S: return wv_tile<T_IQ2S, T, X16>(m, tile, sb0, nsb, ldu);)
+            MK_IF(MK_TY_Q2K, case T_Q2K: return wv_tile<T_Q2K, T, X16>(m, tile, sb0, nsb, ldu);)
+            MK_IF(MK_TY_NVF4, case T_NVF4: return wv_tile<T_NVF4, T, X16>(m, tile, sb0, nsb, ldu);)
             default: break;
         }
     }
@@ -847,7 +1010,7 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
 // main-layer Q6_K is FM, Q6F_UNIT in both MMA forms (the scale streams of Q8_0 / Q3_K / IQ3_S in Mat::d not counted)
 __host__ __device__ constexpr int wv_ubytes(int t) {
     return t == T_Q6K ? Q6F_UNIT
-                      : 16 * (t == T_Q5K ? 176 : t == T_Q5_1 ? 192 : t == T_IQ4X ? 136 : t == T_Q8_0 ? 256 : t == T_Q3K || t == T_IQ3S ? Q3_BLK : 144);
+                      : 16 * wv_bs(t);
 }
 __device__ __forceinline__ void pf_l2n(const void * p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
 // Phase top: the warp's first weight unit (tile, sb) of m to L2, one 128-B line per lane (the whole unit, <= 32 lines),
@@ -881,22 +1044,24 @@ template <int T, int IT, class Out>
 __device__ __forceinline__ void gemv_pairs_dp(const Mat & m, int lo, int hi, Out out) {
     switch (m.type) {
         MK_IF(MK_TY_Q3K, case T_Q3K: gemv_pairs<T, IT, T_Q3K, 2>(m, lo, hi, out); break;)
-#if MK_TY_IQ3S
-        default: gemv_pairs<T, IT, T_IQ3S, 2>(m, lo, hi, out); break;
-#else
+        MK_IF(MK_TY_IQ3S, case T_IQ3S: gemv_pairs<T, IT, T_IQ3S, 2>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_IQ3XXS, case T_IQ3XXS: gemv_pairs<T, IT, T_IQ3XXS, 2>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_IQ2S, case T_IQ2S: gemv_pairs<T, IT, T_IQ2S, 2>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_Q2K, case T_Q2K: gemv_pairs<T, IT, T_Q2K, 2>(m, lo, hi, out); break;)
+        MK_IF(MK_TY_NVF4, case T_NVF4: gemv_pairs<T, IT, T_NVF4, 2>(m, lo, hi, out); break;)
         default: MK_UNBUILT();
-#endif
     }
 }
 template <int T>
 __device__ __forceinline__ LaneT<T> rows16_dp(const Mat & m, int j) {
     switch (m.type) {
         MK_IF(MK_TY_Q3K, case T_Q3K: return rows16<T, T_Q3K, 2>(m, j);)
-#if MK_TY_IQ3S
-        default: return rows16<T, T_IQ3S, 2>(m, j);
-#else
+        MK_IF(MK_TY_IQ3S, case T_IQ3S: return rows16<T, T_IQ3S, 2>(m, j);)
+        MK_IF(MK_TY_IQ3XXS, case T_IQ3XXS: return rows16<T, T_IQ3XXS, 2>(m, j);)
+        MK_IF(MK_TY_IQ2S, case T_IQ2S: return rows16<T, T_IQ2S, 2>(m, j);)
+        MK_IF(MK_TY_Q2K, case T_Q2K: return rows16<T, T_Q2K, 2>(m, j);)
+        MK_IF(MK_TY_NVF4, case T_NVF4: return rows16<T, T_NVF4, 2>(m, j);)
         default: MK_UNBUILT();
-#endif
     }
 }
 
@@ -908,11 +1073,12 @@ __device__ __forceinline__ void resid_dp(const Mat & W, const QBuf & in, float *
     } else {
         switch (W.type) {
             MK_IF(MK_TY_Q3K, case T_Q3K: resid32<T, IT, T_Q3K>(W, in, x, add, wnext, sm); break;)
-#if MK_TY_IQ3S
-            default: resid32<T, IT, T_IQ3S>(W, in, x, add, wnext, sm); break;
-#else
+            MK_IF(MK_TY_IQ3S, case T_IQ3S: resid32<T, IT, T_IQ3S>(W, in, x, add, wnext, sm); break;)
+            MK_IF(MK_TY_IQ3XXS, case T_IQ3XXS: resid32<T, IT, T_IQ3XXS>(W, in, x, add, wnext, sm); break;)
+            MK_IF(MK_TY_IQ2S, case T_IQ2S: resid32<T, IT, T_IQ2S>(W, in, x, add, wnext, sm); break;)
+            MK_IF(MK_TY_Q2K, case T_Q2K: resid32<T, IT, T_Q2K>(W, in, x, add, wnext, sm); break;)
+            MK_IF(MK_TY_NVF4, case T_NVF4: resid32<T, IT, T_NVF4>(W, in, x, add, wnext, sm); break;)
             default: MK_UNBUILT();
-#endif
         }
     }
 }
@@ -1759,6 +1925,10 @@ __device__ __forceinline__ void wv_tile_any_st(const Mat & m, int tile, int sb0,
             case T_Q6K: a = wv_tile_st<T_Q6K, T, X16>(m, tile, sb0, nsb, us, a); return;
             MK_IF(MK_TY_Q3K, case T_Q3K: a = wv_tile_st<T_Q3K, T, X16>(m, tile, sb0, nsb, us, a); return;)
             MK_IF(MK_TY_IQ3S, case T_IQ3S: a = wv_tile_st<T_IQ3S, T, X16>(m, tile, sb0, nsb, us, a); return;)
+            MK_IF(MK_TY_IQ3XXS, case T_IQ3XXS: a = wv_tile_st<T_IQ3XXS, T, X16>(m, tile, sb0, nsb, us, a); return;)
+            MK_IF(MK_TY_IQ2S, case T_IQ2S: a = wv_tile_st<T_IQ2S, T, X16>(m, tile, sb0, nsb, us, a); return;)
+            MK_IF(MK_TY_Q2K, case T_Q2K: a = wv_tile_st<T_Q2K, T, X16>(m, tile, sb0, nsb, us, a); return;)
+            MK_IF(MK_TY_NVF4, case T_NVF4: a = wv_tile_st<T_NVF4, T, X16>(m, tile, sb0, nsb, us, a); return;)
             default: break;
         }
     }
@@ -1895,11 +2065,12 @@ __device__ __noinline__ LaneT<8> rows16_x8(const Mat & m, int j, int grp) {
 __device__ __forceinline__ LaneT<8> rows16_dp_x8(const Mat & m, int j, int grp) {
     switch (m.type) {
         MK_IF(MK_TY_Q3K, case T_Q3K: return rows16_x8<T_Q3K>(m, j, grp);)
-#if MK_TY_IQ3S
-        default: return rows16_x8<T_IQ3S>(m, j, grp);
-#else
+        MK_IF(MK_TY_IQ3S, case T_IQ3S: return rows16_x8<T_IQ3S>(m, j, grp);)
+        MK_IF(MK_TY_IQ3XXS, case T_IQ3XXS: return rows16_x8<T_IQ3XXS>(m, j, grp);)
+        MK_IF(MK_TY_IQ2S, case T_IQ2S: return rows16_x8<T_IQ2S>(m, j, grp);)
+        MK_IF(MK_TY_Q2K, case T_Q2K: return rows16_x8<T_Q2K>(m, j, grp);)
+        MK_IF(MK_TY_NVF4, case T_NVF4: return rows16_x8<T_NVF4>(m, j, grp);)
         default: MK_UNBUILT();
-#endif
     }
 }
 
@@ -2341,6 +2512,10 @@ __device__ __forceinline__ void wv_ck_x16_any(const Mat & m, const QBuf & in, in
         case T_Q6K: wv_ck_x16<T_Q6K, T, K>(m, in, tile, kc, have, wnext, role); return;
         MK_IF(MK_TY_Q3K, case T_Q3K: wv_ck_x16<T_Q3K, T, K>(m, in, tile, kc, have, wnext, role); return;)
         MK_IF(MK_TY_IQ3S, case T_IQ3S: wv_ck_x16<T_IQ3S, T, K>(m, in, tile, kc, have, wnext, role); return;)
+        MK_IF(MK_TY_IQ3XXS, case T_IQ3XXS: wv_ck_x16<T_IQ3XXS, T, K>(m, in, tile, kc, have, wnext, role); return;)
+        MK_IF(MK_TY_IQ2S, case T_IQ2S: wv_ck_x16<T_IQ2S, T, K>(m, in, tile, kc, have, wnext, role); return;)
+        MK_IF(MK_TY_Q2K, case T_Q2K: wv_ck_x16<T_Q2K, T, K>(m, in, tile, kc, have, wnext, role); return;)
+        MK_IF(MK_TY_NVF4, case T_NVF4: wv_ck_x16<T_NVF4, T, K>(m, in, tile, kc, have, wnext, role); return;)
         MK_IF(MK_TY_Q4K, case T_Q4K: wv_ck_x16<T_Q4K, T, K>(m, in, tile, kc, have, wnext, role); return;)
         MK_IF(MK_TY_Q5K, case T_Q5K: wv_ck_x16<T_Q5K, T, K>(m, in, tile, kc, have, wnext, role); return;)
         MK_IF(MK_TY_IQ4NL, case T_IQ4NL: wv_ck_x16<T_IQ4NL, T, K>(m, in, tile, kc, have, wnext, role); return;)

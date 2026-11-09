@@ -271,7 +271,10 @@ constexpr int SM_ATTN_MAX = SM_ATTN > SM_ATTN_Q8 ? SM_ATTN : SM_ATTN_Q8;
 constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN_MAX ? SM_MISC + 2048 : SM_ATTN_MAX);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
 
-enum { T_F32 = 0, T_Q5_1 = 7, T_Q8_0 = 8, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ4NL = 20, T_IQ3S = 21, T_IQ4X = 23 };
+enum { T_F32 = 0, T_Q5_1 = 7, T_Q8_0 = 8, T_Q2K = 10, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ3XXS = 18, T_IQ4NL = 20,
+       T_IQ3S = 21, T_IQ2S = 22, T_IQ4X = 23, T_NVF4 = 40 };
+// T_NVF4: NVFP4 (e2m1 values, UE4M3 scale per 16 weights, one fp32 scale per tensor), read from a safetensors checkpoint
+// T_IQ2S is the kernel type of IQ2_XXS / IQ2_XS / IQ2_S (one layout, loader.cu); IQ1_M is re-encoded to Q6_K at load
 // Matrix weight types the kernels are built for (Makefile MK_TYPES, e.g. "Q4_K Q5_K Q6_K IQ4_XS Q5_1": shorter ptxas, less
 // RAM). Unset: every type. MK_TY_<type> is 1 / 0; the dispatch switches drop the others (trap) and the loader refuses them.
 #ifndef MK_TYPESET
@@ -284,6 +287,10 @@ enum { T_F32 = 0, T_Q5_1 = 7, T_Q8_0 = 8, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_
 #define MK_TY_Q3K 1
 #define MK_TY_IQ3S 1
 #define MK_TY_Q5_1 1
+#define MK_TY_Q2K 1
+#define MK_TY_IQ3XXS 1
+#define MK_TY_IQ2S 1
+#define MK_TY_NVF4 1
 #endif
 #ifndef MK_TY_Q4K
 #define MK_TY_Q4K 0
@@ -312,13 +319,26 @@ enum { T_F32 = 0, T_Q5_1 = 7, T_Q8_0 = 8, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_
 #ifndef MK_TY_Q5_1
 #define MK_TY_Q5_1 0
 #endif
+#ifndef MK_TY_Q2K
+#define MK_TY_Q2K 0
+#endif
+#ifndef MK_TY_IQ3XXS
+#define MK_TY_IQ3XXS 0
+#endif
+#ifndef MK_TY_IQ2S
+#define MK_TY_IQ2S 0
+#endif
+#ifndef MK_TY_NVF4
+#define MK_TY_NVF4 0
+#endif
 #if !MK_TY_Q6K || !MK_TY_IQ4XS
 #error "MK_TYPES: Q6_K and IQ4_XS are required (the fixed-type paths: output, the switches' fallbacks)"
 #endif
 __host__ __device__ constexpr bool mk_built(int t) {
     return (t == T_Q4K && MK_TY_Q4K) || (t == T_Q5K && MK_TY_Q5K) || (t == T_Q6K && MK_TY_Q6K) || (t == T_Q8_0 && MK_TY_Q8_0) ||
            (t == T_IQ4X && MK_TY_IQ4XS) || (t == T_IQ4NL && MK_TY_IQ4NL) || (t == T_Q3K && MK_TY_Q3K) ||
-           (t == T_IQ3S && MK_TY_IQ3S) || (t == T_Q5_1 && MK_TY_Q5_1);
+           (t == T_IQ3S && MK_TY_IQ3S) || (t == T_Q5_1 && MK_TY_Q5_1) || (t == T_Q2K && MK_TY_Q2K) ||
+           (t == T_IQ3XXS && MK_TY_IQ3XXS) || (t == T_IQ2S && MK_TY_IQ2S) || (t == T_NVF4 && MK_TY_NVF4);
 }
 #define MK_IF_0(...)
 #define MK_IF_1(...) __VA_ARGS__
@@ -345,6 +365,9 @@ struct LayerW {
     // gated attention
     Mat q, k, v, o;
     const float *qn, *kn;
+    // QSA indexer (nullptr ix_q: dense attention layer): q_proj [IXH*IXD][D], k_proj [IXD][D] (fp32, as stored), per-head
+    // q norm, pooled-key norm and raw-key pre-norm weights [IXD] (stored 1+w: plain RMSNorm)
+    const float *ix_q, *ix_k, *ix_qn, *ix_kn, *ix_kpre;
     // ffn
     Mat fg, fu, fd;
 };
@@ -360,7 +383,8 @@ struct ModelW {
     // draft head reads instead; 0 rows: off. Rows past it (tokens dv_add appended) come from lm_head.
     const uint8_t * dq4;
     int dq4_n;
-    int embd_t; // token_embd's type: T_Q4K, T_Q5K, T_Q6K or T_Q8_0 (ggml rows, embd_rb<type>() bytes)
+    int embd_t; // token_embd's type: T_Q4K, T_Q5K, T_Q6K, T_Q8_0 or T_IQ2S (ggml rows, embd_rb<type>() bytes)
+    int qsa_r, qsa_topk, qsa_heads, qsa_dim; // QSA: block size, selected tokens, indexer heads and key width (qsa_r 0: not a QSA model)
 };
 
 // Quantised activation vector(s) in the "unit" layout consumed by the GEMV:
@@ -523,6 +547,43 @@ constexpr int GS_GO = 32;
 constexpr int Q6_BLK = 192, Q6_META = 18;
 constexpr int Q3_BLK = 96;
 constexpr int IQ3S_META = 16;
+constexpr int IQ3XXS_META = 8; // native IQ3_XXS: scales[4] | fp16 d | pad
+constexpr int IQ2_BLK = 64, IQ2_META = 20; // native IQ2_XXS / IQ2_XS / IQ2_S (T_IQ2S): values 64 B, meta 20 B per 256-block
+constexpr int Q2_BLK = 64, Q2_META = 20;   // native Q2_K: values 64 B, meta 20 B per 256-block
+// native NVFP4 (T_NVF4): per 256-block 128 B of values (unit u' = 2p + h, 16 B: A word 0 | B word 0 | A word 1 | B word 1, a
+// word = 8 e2m1 codes, the low nibbles the ints 2c of the 16-weight half, the high nibbles the ints 2c + 1) and a 20-B meta
+// entry: UE4M3 scale bytes of the 16 groups of 16 weights | fp32 (tensor scale / 2): weight = scale (code2 / 2) tensor scale
+constexpr int NV_BLK = 128, NV_META = 20;
+#ifdef __CUDACC__
+// 8 e2m1 codes (nibbles of q4) -> doubled ints {0,1,2,3,4,6,8,12}, bit 3 = sign: .x the low nibbles (bytes m = 0..3), .y the high
+__device__ __forceinline__ int2 nv_lut16(unsigned q4) {
+    const unsigned sel = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+    unsigned tmp[2];
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const unsigned qs = (q4 >> (16 * i)) & 0x7777u;
+        const unsigned lo = __byte_perm(0x03020100u, 0x0C080604u, qs);
+        const unsigned hi = __byte_perm(0xFDFEFF00u, 0xF4F8FAFCu, qs);
+        tmp[i] = __byte_perm(lo, hi, sel >> (16 * i));
+    }
+    return make_int2((int) __byte_perm(tmp[0], tmp[1], 0x6420), (int) __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+// UE4M3 byte (bias 7, no inf, 0x7f = NaN: never produced) -> float
+__device__ __forceinline__ float nv_ue4m3(unsigned s) {
+    s &= 0x7fu;
+    return (s >> 3) ? __uint_as_float((((s >> 3) + 120u) << 23) | ((s & 7u) << 20)) : (float) (s & 7u) * 0.001953125f;
+}
+#endif
+// bytes of one 256-block of a type's value stream (the wv layout's unit is 16 of them) and of its tile-major meta entry
+// (Q6_K / Q3_K: the 36-B pair of blocks); FM types (Q4_K, Q5_K, Q5_1, IQ4_XS, Q6_K) have their own units
+__host__ __device__ constexpr int wv_bs(int t) {
+    return t == T_Q8_0 ? 256 : t == T_Q5K ? 176 : t == T_Q5_1 ? 192 : t == T_IQ4X ? 136 : t == T_Q6K ? Q6_BLK
+         : t == T_Q3K || t == T_IQ3S || t == T_IQ3XXS ? Q3_BLK : t == T_IQ2S ? IQ2_BLK : t == T_Q2K ? Q2_BLK : t == T_NVF4 ? NV_BLK : 144;
+}
+__host__ __device__ constexpr int wv_mb(int t) {
+    return t == T_Q6K || t == T_Q3K ? 2 * Q6_META : t == T_IQ3XXS ? IQ3XXS_META : t == T_IQ2S ? IQ2_META : t == T_Q2K ? Q2_META
+         : t == T_NVF4 ? NV_META : IQ3S_META;
+}
 constexpr int Q51_BLK = 192; // repacked Q5_1 bytes per 256-block (repack_q51, rows_q51)
 constexpr int EMB_UB = 16; // units per embed block
 // Grid size (one block per SM): phases that hand one block to each item (embed_prologue U_D / EMB_UB blocks per row,
@@ -583,7 +644,8 @@ enum { CHK_Q, CHK_K, CHK_V, CHK_O, CHK_QKV, CHK_GATE, CHK_SOUT, CHK_GU, CHK_UP, 
 constexpr int CHK_LAYERS = 66; // 64 trunk layers, 64 = the MTP block, 65 = the output head
 #endif
 constexpr int BM = 128, BN = 128, BK = 64;
-constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8, TIQ4 = 23, TIQ4NL = 20, TQ3K = 11, TIQ3S = 21, TQ51 = 7;
+constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8, TIQ4 = 23, TIQ4NL = 20, TQ3K = 11, TIQ3S = 21, TQ51 = 7, TIQ3XXS = 18,
+              TIQ2S = 22, TQ2K = 10, TNVF4 = 40;
 struct WMat { // device view of one weight matrix (mirrors Mat)
     const uint8_t * w;
     const __half * d;
@@ -606,7 +668,8 @@ constexpr unsigned long long mk_abi_sig() {
                                     MK_PF_INFCHK, MK_ATT_I8, MK_L2_TUNE,
                                     // MK_TYPES (the host's loader refuses the types the device has no kernels for)
                                     MK_TY_Q4K | MK_TY_Q5K << 1 | MK_TY_Q6K << 2 | MK_TY_Q8_0 << 3 | MK_TY_IQ4XS << 4 |
-                                        MK_TY_IQ4NL << 5 | MK_TY_Q3K << 6 | MK_TY_IQ3S << 7 | MK_TY_Q5_1 << 8,
+                                        MK_TY_IQ4NL << 5 | MK_TY_Q3K << 6 | MK_TY_IQ3S << 7 | MK_TY_Q5_1 << 8 | MK_TY_Q2K << 9 |
+                                        MK_TY_IQ3XXS << 10 | MK_TY_IQ2S << 11 | MK_TY_NVF4 << 12,
 #ifdef __CUDA_ARCH_LIST__
                                     __CUDA_ARCH_LIST__, // (nvcc: the -arch list, e.g. 860)
 #endif

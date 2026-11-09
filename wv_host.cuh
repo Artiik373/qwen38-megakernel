@@ -83,9 +83,8 @@ inline size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, con
         });
     };
     // Q4_K / IQ4_NL 144, Q5_K 176, Q5_1 192, Q8_0 256 (+ 16-B scale entries); ffn_down: Q6_K 192 / Q3_K 96 (+ 36-B meta
-    // pairs), IQ3_S 96 (+ 16-B meta per block)
-    const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q5_1 ? 192 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
-    const int MB = type == T_Q6K || type == T_Q3K ? 2 * Q6_META : 16;
+    // pairs), IQ3_S 96 (+ 16-B meta per block), IQ3_XXS 96 (+ 8), IQ2 family / Q2_K 64 (+ 20): wv_bs / wv_mb
+    const int BS = wv_bs(type), MB = wv_mb(type);
     tm(w, out, rb, BS);
     if (meta_n) tm(meta, out_meta, (int) (meta_n / N), MB);
     return meta_n;
@@ -143,8 +142,7 @@ inline bool wv_dev_ok(int type, int N, int K, int rb, size_t meta_n, std::map<in
         }
         return nb % it->second.G == 0 && rb % 8 == 0 && rb == nb / it->second.G * it->second.seg;
     }
-    const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q5_1 ? 192 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
-    const int MB = type == T_Q6K || type == T_Q3K ? 2 * Q6_META : 16;
+    const int BS = wv_bs(type), MB = wv_mb(type);
     const size_t mrow = meta_n ? meta_n / N : 0;
     return rb % BS == 0 && BS % 4 == 0 && rb % 4 == 0 && (!meta_n || (meta_n % N == 0 && mrow % MB == 0 && MB % 4 == 0 && mrow % 4 == 0));
 }

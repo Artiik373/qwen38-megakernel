@@ -12,11 +12,11 @@ MKFLAGS ?=
 #   make MK_TYPES="Q4_K Q5_K Q6_K IQ4_XS Q5_1"   (Q6_K and IQ4_XS always; Q4_K for MK_DRAFT_Q4 and the MTP head)
 # Less ptxas time and RAM; a GGUF with another type is refused at load.
 MK_TYPES ?=
-MK_TYPES_ALL = Q4_K Q5_K Q6_K Q8_0 IQ4_XS IQ4_NL Q3_K IQ3_S Q5_1
+MK_TYPES_ALL = Q4_K Q5_K Q6_K Q8_0 IQ4_XS IQ4_NL Q3_K IQ3_S Q5_1 Q2_K IQ3_XXS IQ2_S NVF4
 ifneq ($(filter-out $(MK_TYPES_ALL),$(MK_TYPES)),)
 $(error MK_TYPES: unknown $(filter-out $(MK_TYPES_ALL),$(MK_TYPES)) (known: $(MK_TYPES_ALL)))
 endif
-MK_TYDEFS = $(if $(strip $(MK_TYPES)),-DMK_TYPESET $(foreach t,$(MK_TYPES),-DMK_TY_$(subst Q4_K,Q4K,$(subst Q5_K,Q5K,$(subst Q6_K,Q6K,$(subst Q3_K,Q3K,$(subst IQ4_XS,IQ4XS,$(subst IQ4_NL,IQ4NL,$(subst IQ3_S,IQ3S,$(t))))))))=1))
+MK_TYDEFS = $(if $(strip $(MK_TYPES)),-DMK_TYPESET $(foreach t,$(MK_TYPES),-DMK_TY_$(subst Q4_K,Q4K,$(subst Q5_K,Q5K,$(subst Q6_K,Q6K,$(subst Q3_K,Q3K,$(subst Q2_K,Q2K,$(subst IQ3_XXS,IQ3XXS,$(subst IQ2_S,IQ2S,$(subst IQ4_XS,IQ4XS,$(subst IQ4_NL,IQ4NL,$(subst IQ3_S,IQ3S,$(t)))))))))))=1))
 # ptxas / host options as single tokens (-Xptxas=a,b): ccache does not know that nvcc's -Xptxas takes the next word, so
 # with "-Xptxas -v" it moves -v out of its pair and its `nvcc -E` fails ("Unknown option '-fPIC'"): no caching at all.
 NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas=-dlcm=cg,-v -Xcompiler=-fPIC $(MKFLAGS) $(MK_TYDEFS)
@@ -70,13 +70,13 @@ build/nvflags: FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 # the device code and its launchers; ptxas register / spill report for every phase function goes to ptxas.log
-qwen38_mk.o: qwen38_mk.cu mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh wv.cuh wv_dev.cuh \
+qwen38_mk.o: qwen38_mk.cu mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h safetensors.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh wv.cuh wv_dev.cuh dspine.h dspine.cuh \
 		build/nvflags
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -MD -MF $@.d -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
 # the host side (no device code: a change here does not rebuild qwen38_mk.o); the same flags, so the shared definitions agree
-HOST_SRC = engine.cu ck_pool.cu loader.cu prefill_host.cu state_files.cu host_store.cu lanes.cu
-HOST_HDR = engine_impl.h mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h loader.cuh wv_host.cuh
+HOST_SRC = engine.cu ck_pool.cu loader.cu prefill_host.cu state_files.cu host_store.cu lanes.cu dspine.cu
+HOST_HDR = engine_impl.h mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h safetensors.h loader.cuh wv_host.cuh dspine.h
 HOST_OBJ = $(HOST_SRC:.cu=.o)
 $(HOST_OBJ): %.o: %.cu $(HOST_HDR) build/nvflags
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -MD -MF $@.d -c $< -o $@

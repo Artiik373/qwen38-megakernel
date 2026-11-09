@@ -331,6 +331,7 @@ void MKEngine::kv_sizes(size_t * per_token, size_t * rings, size_t * state, size
 bool MKEngine::side_begin() {
     Impl & I = *p_;
     if (I.sw_on) throw std::runtime_error("side_begin: a side request is already running");
+    I.dsp_invalidate(); // (the drafter's ring belongs to the sequence that leaves)
     const auto t0 = std::chrono::steady_clock::now();
     I.hs_quiesce();
     I.sw_book = I.book_get();
@@ -356,6 +357,7 @@ bool MKEngine::side_begin() {
 int MKEngine::side_end() {
     Impl & I = *p_;
     if (!I.sw_on) throw std::runtime_error("side_end: no side request is running");
+    I.dsp_invalidate();
     const auto t0 = std::chrono::steady_clock::now();
     I.hs_quiesce();
     if (I.sw_broken) {
@@ -370,6 +372,7 @@ int MKEngine::side_end() {
 int MKEngine::side_end_park(int max_checkpoints, int * id) {
     Impl & I = *p_;
     if (!I.sw_on) throw std::runtime_error("side_end_park: no side request is running");
+    I.dsp_invalidate();
     *id = 0;
     I.hs_park_ms = 0;
     I.hs_park_bytes = 0;
@@ -448,6 +451,7 @@ bool MKEngine::side_active() const { return p_->sw_on; }
 int MKEngine::park(int max_checkpoints) {
     Impl & I = *p_;
     if (I.sw_on) throw std::runtime_error("park: a side request is running");
+    I.dsp_invalidate();
     if (I.seq.empty()) return 0;
     I.hs_quiesce();
     return I.park_entry(max_checkpoints);
@@ -456,6 +460,7 @@ int MKEngine::park(int max_checkpoints) {
 bool MKEngine::unpark(int id) {
     Impl & I = *p_;
     if (I.sw_on) throw std::runtime_error("unpark: a side request is running");
+    I.dsp_invalidate();
     auto it = I.parked.find(id);
     if (it == I.parked.end()) return false;
     const auto t0 = std::chrono::steady_clock::now();

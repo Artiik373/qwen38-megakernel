@@ -53,7 +53,7 @@ on when the vision projector is found. These are the settings worth knowing:
 
 | What | Launcher variable (`serve.sh` / `serve.bat`) | Server option | Default | When to change it |
 |---|---|---|---|---|
-| Model file | `MK_MODEL` | `-m` | `$HOME/models/Qwen3.8-27B-UD-Q4_K_XL.gguf` (Windows: `%USERPROFILE%\models\...`) | another GGUF or another folder |
+| Model file | `MK_MODEL` | `-m` | `$HOME/models/Qwen3.8-27B-UD-Q4_K_XL.gguf` (Windows: `%USERPROFILE%\models\...`) | another GGUF or another folder; a safetensors NVFP4 checkpoint directory (needs `tokenizer.gguf` beside its weights, see [BUILDING.md](BUILDING.md)) |
 | Port, context | 1st and 2nd argument | `--port`, `-c` | 8080, 120000 | context up to 262,144 tokens with preset D or F (`serve.bat` picks F above 240k) |
 | KV cache preset | `MK_KV`, `MK_KV_WIN` | (engine) | q8_0 | [preset D](#kv-cache-presets) frees ~1.1 GB at 120k and fits the full 262,144-token context; near-lossless, not bit-identical. Above 240k `serve.bat` uses preset F unless `MK_KV` is set |
 | Drafts per cycle | `MK_DRAFT` | `-d` | 7 | 0 turns speculation off; 8-15 only with the opt-in [deep-pass build](EXPERIMENTAL.md#the-deep-pass) and no `MK_KV` preset (so not above 240k with `serve.bat`, which picks preset F there) |
@@ -263,6 +263,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--draft-vocab` | - | `draft_vocab_56k.bin` in the repo | the draft head's vocabulary (56k frequent tokens, [ENGINE.md](ENGINE.md); tokens of the current conversation are added; `draft_vocab_32k.bin` until 2026-10-29: 3.7% slower on average) | drafts only |
 | `--mtp FILE` | `MK_MTP` (engine) | the model file's MTP layer | the MTP draft layer from another GGUF of the same model (checked against it) | drafts only |
 | `--no-mtp` | `MK_NO_MTP=1` (engine) | off | no MTP layer: plain decoding at depth 0, no MTP weights or KV slot | drafts only |
+| `--dspine FILE` | `MK_DSPINE` (engine) | off | the DSpine drafter ([Qwen3.8-27B-DSpine-b16-GGUF](https://huggingface.co/aj9o9/Qwen3.8-27B-DSpine-b16-GGUF): Q4_K_M, Q8_0 or BF16; Q4_K_M and Q8_0 accept the same) instead of the MTP layer: one 16-row block per cycle, 16 x 16 lattice walk, drafts verified as fixed drafts. `--draft` 0-7; 8-15 (the block size is 16) need the deep build, `MKFLAGS=-DMK_MAXD=16 make` (a plain `MK_MAXD=16` environment variable does nothing). More than 4 drafts work with `--kv q8` and with `--kv f16` (f16: attention for 6 or more rows runs in two head-group passes, so K / V are read twice; no `MK_KV` and no `MK_KV_WIN` needed either way for 8-15). About 1.3 GB of weights, 170 MB ring, 105 MB prefill staging. Not with `--agents` (refused); the drafter sees the last 8192 prompt positions. `MK_DSPINE_TIME=1` prints the ms per stage and the acceptance per draft position | drafts only |
 | `--lib` | - | `libqwen38mk.so` / `qwen38mk.dll` in the repo root | the engine library | - |
 | `--kv` | - | `auto` (launchers `q8`) | KV cache format: `f16`, `q8` (q8_0), `auto` (q8_0 when fp16 does not fit next to ~1.5 GB of working memory, or when `MK_KV` is set; with `--agents` q8_0, which the slots need) | changes (f16 vs q8_0) |
 | `--agents N` | `MK_AGENTS` | `0`: one request at a time | up to N requests (1-4) at once, each in a parallel slot of the engine with its own context (`-c`, at most the model's context length, 262,144), decoded together in one batched launch per cycle; images, video and the presence / frequency penalties get a 400, side requests, parking and pinned checkpoints are off ([SERVER.md](SERVER.md#several-agents-at-once---agents)) | greedy: the reply alone, bit for bit (a prompt fed in chunks beside other slots: see `MK_PF_MIX`); sampled: the same distribution, not the same tokens beside other requests |
@@ -361,6 +362,7 @@ on (even `0`). The measurement and test switches are in [their own section](#mea
 | `MK_MTP_Q4` | `1` | the MTP layer's matrices stored wider than Q4_K are re-quantized to Q4_K at load (-107 MiB), IQ4_NL too. Always on: `0` (as stored) and `ab` (both copies) are refused ([why](ENGINE.md#the-gguf)) | drafts only | served |
 | `MK_MTP` | unset | the MTP layer from another GGUF of the same model (as `--mtp`; the CLI's and server's options win) | drafts only | option |
 | `MK_NO_MTP` | unset | `1`: no MTP layer, plain decoding at depth 0 (as `--no-mtp`) | drafts only | option |
+| `MK_DSPINE` | unset | the DSpine drafter GGUF (as `--dspine`; the MTP layer is then off) | drafts only | option |
 | `MK_MTP_KVC` | `1` | the MTP catch-up rows before the last 5 compute K / V only; `0`: the full pass. +0.9% at 38k, +0.7% at 101.6k | same (identical drafts) | served |
 
 ### MK_POLICY keys
@@ -576,7 +578,7 @@ Generation job (the command line's job, and the defaults of every `--batch` line
 | `-p TEXT`, `-f FILE` | a prime-number coding prompt | the prompt (wrapped in the chat template unless `--raw`) |
 | `--prompt-ids FILE` | - | the prompt as whitespace-separated token ids (checked against the vocabulary) |
 | `-n N` | `256` | tokens to generate |
-| `-d N` | `2` | drafts per cycle: 0-7, or 0-15 in a [deep-pass build](EXPERIMENTAL.md#the-deep-pass) (more than 4 needs `--kv q8`, more than 7 also no `MK_KV`) |
+| `-d N` | `2` | drafts per cycle: 0-7, or 0-15 in a [deep-pass build](EXPERIMENTAL.md#the-deep-pass) (more than 4 needs `--kv q8`, more than 7 also no `MK_KV`; with `--dspine` `--kv f16` also works) |
 | `--raw` | off | the prompt as given, without the chat template |
 | `--think [xhigh\|medium\|low]` | off; `xhigh` when given without a value | thinking on; `xhigh` and `low` add the template's reasoning-effort system line, `medium` adds none |
 | `--turn2 TEXT`, `--turn2-file FILE` | - | a second user turn appended after the first reply (the follow-up path) |

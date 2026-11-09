@@ -5335,6 +5335,9 @@ def main():
     ap.add_argument("--mtp", default=None,
                     help="the MTP draft layer from another GGUF of the same model (default: the model file's; env MK_MTP)")
     ap.add_argument("--no-mtp", action="store_true", help="no MTP layer: plain decoding, depth 0 (env MK_NO_MTP=1)")
+    ap.add_argument("--dspine", default=None,
+                    help="the DSpine drafter GGUF (Qwen3.8-27B-DSpine-b16): replaces the MTP layer; --draft up to 7 (15 with MK_MAXD=16); "
+                         "not with --agents (env MK_DSPINE)")
     ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), LIB_MK))
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
                     help="KV cache format (auto: q8_0 only when the fp16 cache does not fit; with --agents: q8_0)")
@@ -5427,6 +5430,8 @@ def main():
                     help="ffmpeg executable (or its directory) for video input (env MK_FFMPEG; default: ffmpeg on PATH, "
                          "else the imageio-ffmpeg package's)")
     args = ap.parse_args()
+    if args.dspine:
+        os.environ["MK_DSPINE"] = args.dspine  # (read by the engine's constructor)
     if args.parallel < 0 or args.agents < 0:
         ap.error("--agents / --parallel: expected a number of slots >= 0")
     if args.ctx is None:  # (--agents: the most that fits in each slot; --parallel, as open-jet's: 32768 each)
@@ -5505,7 +5510,9 @@ def main():
     MAX_CONNECTIONS = env_int("MK_MAX_CONNECTIONS", MAX_CONNECTIONS)
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     MAX_VIDEO_FRAMES = env_int("MK_MAX_VIDEO_FRAMES", MAX_VIDEO_FRAMES)
-    n_train, longest = gguf_text_limits(args.model)
+    tok = os.path.join(args.model, "tokenizer.gguf") if os.path.isdir(args.model) else (
+        os.path.join(os.path.dirname(args.model), "tokenizer.gguf") if args.model.endswith(".safetensors") else args.model)
+    n_train, longest = gguf_text_limits(tok)
     REASONING_MAX_BYTES = max(n_train or 0, args.ctx) * (longest or 256)
     if args.mmproj:  # (the vision library checks images against it; the video decoder, frames)
         IMAGE_MAX_PIXELS = env_int("MK_IMAGE_MAX_PIXELS", IMAGE_MAX_PIXELS)

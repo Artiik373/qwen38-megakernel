@@ -15,6 +15,7 @@
 
 #include <cuda_runtime.h>
 
+#include "gguf.h"
 #include "llama.h"
 #include "qwen38_mk.h"
 
@@ -270,7 +271,7 @@ void * mk_new_mtp(const char * model, int ctx, int n_draft, const char * draft_v
         llama_model_params mp = llama_model_default_params();
         mp.vocab_only = true;
         h = new Handle;
-        h->lm = llama_model_load_from_file(model, mp);
+        h->lm = llama_model_load_from_file(gguf::tokenizer_path(model).c_str(), mp);
         if (!h->lm) throw std::runtime_error("failed to load the vocabulary");
         h->vocab = llama_model_get_vocab(h->lm);
         h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode, mtp ? mtp : "");

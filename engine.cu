@@ -726,9 +726,9 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
         if (!why.empty()) throw std::runtime_error("n_draft > " + std::to_string(MAXT - 1) + " (the deep pass) needs " + why);
     }
 #endif
-    // the wide pass (T >= 6) runs the pipelined q8-cache decode attention only (attn_core<T > 5>: attn_core_w48q, or
-    // attn_core_w48m for the low-bit MK_KV sides)
-    if (n_draft > 4 && !p_->hb.kvq8) throw std::runtime_error("n_draft > 4 needs the q8 KV cache (--kv q8)");
+    // the wide pass (T >= 6) runs the pipelined q8-cache decode attention (attn_core<T > 5>: attn_core_w48q, or
+    // attn_core_w48m for the low-bit MK_KV sides); with DSpine the fp16 cache runs attn_core_t (two head-group passes)
+    if (n_draft > 4 && !p_->hb.kvq8 && !p_->dspine) throw std::runtime_error("n_draft > 4 needs the q8 KV cache (--kv q8)");
     reset();
     if (const char * pol = getenv("MK_POLICY")) set_policy(pol);
 #if MK_SPEC_LOG
@@ -807,6 +807,7 @@ void MKEngine::set_kv_emu(const std::string & spec) { p_->set_kv_emu(spec); }
 
 void MKEngine::reset() {
     p_->pcnt_clear();
+    p_->dsp_invalidate();
     p_->reset();
     p_->demoted = 0;
     p_->seq.clear();
@@ -827,6 +828,14 @@ void MKEngine::prefill_progress(int * done, int * total) const {
 int MKEngine::position() const { return p_->hctl.n; }
 
 void MKEngine::set_n_draft(int n) {
+    if (p_->dspine) { // DSpine: the launches carry no MTP drafts (Impl::ndraft 0); n_draft_max is the drafter's block depth
+        if (n < 0 || n > p_->n_draft_cap)
+            throw std::runtime_error("set_n_draft: 0 .. " + std::to_string(p_->n_draft_cap) + " (the engine's construction depth, at most MAXD - 1)");
+        p_->n_draft_max = n;
+        p_->ndraft = p_->nd_avail = 0;
+        n_draft_ = n;
+        return;
+    }
     if (!p_->has_mtp && n > 0) { // (no MTP block: depth 0, a notice once)
         static bool told = false;
         if (!told) fprintf(stderr, "[mk] n_draft %d -> 0 (no MTP layer)\n", n);
@@ -1085,15 +1094,21 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
     while (i < feed.size()) {
         const int T = att_cap_T(c.dn_c, (int) std::min<size_t>(MAXT_PF, feed.size() - i));
         const bool last = i + T == feed.size();
+        const int p0 = c.dn_c;
         c.n = c.dn_c;
         for (int k = 0; k < T; k++) c.tok[k] = feed[i + k];
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
-        p_->ndraft = p_->depth_top(c.n);
+        p_->ndraft = p_->dspine ? 0 : p_->depth_top(c.n);
         p_->launch(MODE_PREFILL, T, last ? 1 : 0);
         CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        if (p_->dspine) p_->dsp_cap_inject(p0, T); // (the launch's rows are all committed prompt rows)
         i += T;
     }
-    p_->nd_avail = p_->ndraft > 0 ? std::min(p_->ndraft, c.nd_prod) : 0;
+    if (p_->dspine) {
+        p_->nd_avail = p_->dsp_draft(p_->depth_top(c.n));
+    } else {
+        p_->nd_avail = p_->ndraft > 0 ? std::min(p_->ndraft, c.nd_prod) : 0;
+    }
     p_->all_acc = true;
     p_->last_acc = p_->nd_avail;
     CK(cudaGetLastError());
@@ -1317,7 +1332,7 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
     // T >= 6 runs as one MAXT-row pass (padding rows): the whole n + 1 .. n + MAXT must lie in one partition, else at most 5
     int T = att_cap_T(c.n, 1 + nd_avail);
 #if MK_MAXD > 8
-    if (T > MAXT && pol.tier > 0.f) { // the deep pass only when drafts MAXT.. are worth it (Policy::tier)
+    if (T > MAXT && pol.tier > 0.f && !dspine) { // the deep pass only when drafts MAXT.. are worth it (Policy::tier; not for DSpine: no MTP confidences)
         float cp = 1.f, e = 0.f;
         for (int k = 0; k < T - 1; k++) {
             cp *= c.dconf[k];
@@ -1336,15 +1351,35 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
     int nd = top;
     if (pol.depth == 0) nd = (!all_acc && top > 3) ? top - 1 : top;
     else if (pol.depth == 2) nd = std::min(top, std::max(std::min(pol.dmin, top), 1 + last_acc));
-    ndraft = nd;
+    ndraft = dspine ? 0 : nd; // (DSpine: the launch carries no MTP drafts; the drafter below fills tok[1 ..])
 #if MK_SPEC_LOG
     const int n0 = c.n;
     int drafts[MAXD];
     for (int i = 1; i < T; i++) drafts[i] = c.tok[i];
 #endif
+    const int n_old = c.n;
     launch(MODE_DECODE, T, 0);
     ctl_fetch(c);
-    nd_avail = nd > 0 ? std::min(nd, c.nd_prod) : 0;
+    if (dspine) { // rows 0 .. n_acc of this launch are committed: their features go into the drafter's ring, then the next block
+        static const bool dprof = getenv("MK_DSPINE_TIME") != nullptr; // acceptance per draft position, every 50 cycles
+        if (dprof) {
+            static int tried[16], hit[16], cyc;
+            for (int i = 1; i < T && i < 16; i++) {
+                tried[i]++;
+                if (c.n_acc >= i) hit[i]++;
+            }
+            if (++cyc % 50 == 0) {
+                fprintf(stderr, "[dspine] accept by draft position:");
+                for (int i = 1; i < 16; i++)
+                    if (tried[i]) fprintf(stderr, " %d:%.0f%%(%d)", i, 100.0 * hit[i] / tried[i], tried[i]);
+                fprintf(stderr, "\n");
+            }
+        }
+        dsp_cap_inject(n_old, c.n_acc + 1);
+        nd_avail = nd > 0 ? dsp_draft(nd) : 0;
+    } else {
+        nd_avail = nd > 0 ? std::min(nd, c.nd_prod) : 0;
+    }
 #if MK_SPEC_LOG
     slog_cycle(n0, T, drafts, c);
 #endif
@@ -1378,7 +1413,7 @@ std::vector<int> MKEngine::draft_vocab() {
     return v;
 }
 
-bool MKEngine::has_mtp() const { return p_->has_mtp; }
+bool MKEngine::has_mtp() const { return p_->has_mtp || p_->dspine != nullptr; }
 
 // state_digest (test helper for the exact-reuse probes; slow, host-side hashing): 64-bit words
 //   [0] 0x4d4b444701, [1] n = committed position (dn_c), [2] mtp_valid, [3] kvrc (0: no MK_KV_WIN ring),

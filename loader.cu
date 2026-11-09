@@ -26,12 +26,13 @@ void put_q6k(uint8_t * blk, const int * q, const int8_t * sc, uint16_t dbits) {
     memcpy(blk + 208, &dbits, 2);
 }
 
-// Q3_K or IQ3_S row -> Q6_K with the same values. Both store a small integer times d times an integer
-// sub-block scale (Q3_K: d (sc - 32) q, q in [-4, 3], per 16; IQ3_S: d (1 + 2 s) q, |q| <= 15, per 32),
-// so q = value / (d * scale) is exact and Q6_K holds it with the same d and scale. f: the row dequantized.
+// Q3_K, IQ3_S or IQ1_M row -> Q6_K with the same values. All store a small integer times d times an integer
+// sub-block scale (Q3_K: d (sc - 32) q, q in [-4, 3], per 16; IQ3_S: d (1 + 2 s) q, |q| <= 15, per 32; IQ1_M:
+// d (1 + 2 s) (g +- 1/8) per 16, g in {-1, 0, 1}: q = 8 g +- 1 against d / 8), so q = value / (d * scale) is exact and
+// Q6_K holds it with the same d (IQ1_M: d / 8) and scale. f: the row dequantized.
 void reencode_q6k(uint32_t type, const uint8_t * src, const float * f, uint8_t * out, int64_t K) {
     for (int64_t b = 0; b < K / 256; b++) {
-        const uint8_t * blk = src + b * 110;
+        const uint8_t * blk = src + b * (type == gguf::IQ1_M ? 56 : 110);
         const float * y = f + b * 256;
         uint16_t dbits;
         int8_t sc[16];
@@ -45,6 +46,12 @@ void reencode_q6k(uint32_t type, const uint8_t * src, const float * f, uint8_t *
             aux[0] = (aux[0] & m2) | (((tmp >> 0) & m1) << 4);
             aux[1] = (aux[1] & m2) | (((tmp >> 2) & m1) << 4);
             for (int i = 0; i < 16; i++) sc[i] = (int8_t) ((int) reinterpret_cast<const uint8_t *>(aux)[i] - 32);
+        } else if (type == gguf::IQ1_M) { // qs[32] | qh[16] | scales[8] (4 x u16: 3 bits per 16 weights, the top nibbles hold d)
+            uint16_t s16[4];
+            memcpy(s16, blk + 48, 8);
+            const uint16_t d16 = (uint16_t) ((s16[0] >> 12) | ((s16[1] >> 8) & 0x00f0) | ((s16[2] >> 4) & 0x0f00) | (s16[3] & 0xf000));
+            dbits = ggml_fp32_to_fp16(ggml_fp16_to_fp32(d16) * 0.125f);
+            for (int i = 0; i < 16; i++) sc[i] = (int8_t) (1 + 2 * ((s16[i / 4] >> (6 * ((i / 2) & 1) + 3 * (i & 1))) & 7));
         } else { // IQ3_S: fp16 d | qs[64] | qh[8] | signs[32] | scales[4] (4 bits per 32)
             memcpy(&dbits, blk, 2);
             for (int i = 0; i < 16; i++) sc[i] = (int8_t) (1 + 2 * ((blk[106 + i / 4] >> (4 * ((i / 2) & 1))) & 0xf));
@@ -202,9 +209,10 @@ bool repack_q3k(const uint8_t * src, uint8_t * q, uint8_t * meta, int nb, const 
     return true;
 }
 
-// ggml's iq3s_grid, recovered with ggml's own IQ3_S dequantization (d = 1, scale 1, no signs: index -> 4 magnitudes)
+// ggml's iq3s_grid (d = 1, scale 1, no signs: index -> 4 magnitudes), then iq3xxs_grid (same, g / 2: the stored grid
+// halves ggml's magnitudes {4, 12, .., 62}, whose 32 +- value would not fit the byte)
 std::vector<uint32_t> iq3s_grid_host() {
-    std::vector<uint32_t> g(512);
+    std::vector<uint32_t> g(768);
     const auto * tr = ggml_get_type_traits(GGML_TYPE_IQ3_S);
     uint8_t blk[110] = {};
     const uint16_t one = 0x3c00;
@@ -222,6 +230,22 @@ std::vector<uint32_t> iq3s_grid_host() {
             v |= (uint32_t) gm << (8 * m);
         }
         g[idx] = v;
+    }
+    const auto * trx = ggml_get_type_traits(GGML_TYPE_IQ3_XXS);
+    uint8_t xblk[98] = {};
+    for (int idx = 0; idx < 256; idx++) {
+        memset(xblk, 0, sizeof xblk);
+        memcpy(xblk, &one, 2);
+        xblk[2] = (uint8_t) idx; // qs[0]: index 0 of sub-block 0
+        trx->to_float(xblk, y, 256);
+        uint32_t v = 0;
+        for (int m = 0; m < 4; m++) {
+            const int gm = (int) (4.f * y[m]);
+            if ((float) gm != 4.f * y[m] || gm < 4 || gm > 62 || gm & 1)
+                throw std::runtime_error("iq3xxs_grid: unexpected IQ3_XXS dequantization");
+            v |= (uint32_t) (gm >> 1) << (8 * m);
+        }
+        g[512 + idx] = v;
     }
     return g;
 }
@@ -264,6 +288,215 @@ bool repack_iq3s(const uint8_t * src, uint8_t * q, uint8_t * meta, int nb, const
             const float db = d * (float) (1 + 2 * ((mt[8 + p] >> (4 * isb)) & 0xf));
             const float v = db * (float) g * (sgn ? -1.f : 1.f);
             if (memcmp(&v, &y[b * 256 + e], 4) != 0) return false;
+        }
+    }
+    return true;
+}
+
+// GGUF IQ3_XXS row (98 B blocks: fp16 d | qs[64] | aux32[4], aux word l = the scales' 4 ls then the 28-bit ksigns of
+// sub-block l, ksigns(i) = i | (popcount(i) & 1) << 7) -> the native layout of rows_iq3xxs: the values of IQ3_S (96 B
+// per block: index bytes only, no high bit) + meta (8 B per block: scales[4] | fp16 d | pad). Self-check against y as
+// repack_iq3s (ggml's order of operations, stored g / 2).
+bool repack_iq3xxs(const uint8_t * src, uint8_t * q, uint8_t * meta, int nb, const float * y, const std::vector<uint32_t> & grid) {
+    for (int b = 0; b < nb; b++) {
+        const uint8_t * blk = src + b * 98, * qs = blk + 2, * aux = blk + 66;
+        uint8_t * o = q + (size_t) b * 96, * mt = meta + (size_t) b * 8;
+        memset(o, 0, 96);
+        memset(mt, 0, 8);
+        for (int w = 0; w < 8; w++) { // unit 2p + hh
+            const int p = w >> 1, hh = w & 1;
+            for (int isb = 0; isb < 2; isb++) {
+                const int ib = 2 * p + isb; // the 32-weight sub-block of A (isb 0) or B (isb 1)
+                memcpy(o + 8 * w + 4 * isb, qs + 8 * ib + 4 * hh, 4);
+                uint32_t a32;
+                memcpy(&a32, aux + 4 * ib, 4);
+                for (int i = 0; i < 16; i++) { // the sub-block's weights 16 hh + i: 7 sign bits per 8 weights, the 8th is parity
+                    const int off = 16 * hh + i, l = off >> 3, j = off & 7;
+                    const unsigned ks = (a32 >> (7 * l)) & 127u;
+                    const unsigned sg = (ks | ((unsigned) (__builtin_popcount(ks) & 1) << 7)) >> j & 1u;
+                    o[64 + 4 * w + (i & 3)] |= (uint8_t) (sg << (4 * isb + (i >> 2)));
+                }
+                if (hh == 0) mt[p] |= (uint8_t) ((a32 >> 28) << (4 * isb));
+            }
+        }
+        memcpy(mt + 4, blk, 2);
+        uint16_t dbits;
+        memcpy(&dbits, blk, 2);
+        const float d = ggml_fp16_to_fp32(dbits);
+        for (int e = 0; e < 256; e++) {
+            const int p = e >> 6, r = e & 63, isb = r >> 5, w = 2 * p + ((r >> 4) & 1), i = r & 15, m = i & 3, c = i >> 2;
+            const unsigned g2 = (grid[512 + o[8 * w + 4 * isb + c]] >> (8 * m)) & 0xffu;
+            const int sgn = (o[64 + 4 * w + m] >> (4 * isb + c)) & 1;
+            const float db = d * 0.25f * (float) (1 + 2 * ((mt[p] >> (4 * isb)) & 0xf));
+            const float v = db * (float) (2 * (int) g2) * (sgn ? -1.f : 1.f);
+            if (memcmp(&v, &y[b * 256 + e], 4) != 0) return false;
+        }
+    }
+    return true;
+}
+
+// ggml's iq2s_grid (1024), iq2xs_grid (512) and iq2xxs_grid (256) tables, 8 int8 magnitudes each, recovered with ggml's
+// own dequantization (d = 1, zero scale, no signs: index -> 8 magnitudes g, y = 0.125 g so g = 8 y). Union layout for
+// the IQ2 kernel: S at 0 (1024), XS at 1024 (512), XXS at 1536 (256); 1792 entries of 8 bytes.
+std::vector<uint64_t> iq2_grid_host() {
+    std::vector<uint64_t> g(1792, 0);
+    float y[256];
+    const uint16_t one = 0x3c00; // fp16 1.0
+    const auto rec = [&](ggml_type t, int base, int n, const std::function<void(int, uint8_t *)> & set) {
+        const auto * tr = ggml_get_type_traits(t);
+        for (int idx = 0; idx < n; idx++) {
+            uint8_t blk[82] = {};
+            memcpy(blk, &one, 2);
+            set(idx, blk);
+            tr->to_float(blk, y, 256);
+            uint64_t v = 0;
+            for (int j = 0; j < 8; j++) {
+                const int gm = (int) (8.f * y[j]);
+                if ((float) gm != 8.f * y[j] || gm < -128 || gm > 127)
+                    throw std::runtime_error("iq2_grid: unexpected dequantization");
+                v |= (uint64_t) (uint8_t) (int8_t) gm << (8 * j);
+            }
+            g[base + idx] = v;
+        }
+    };
+    // IQ2_S: 10-bit index = qs[0] (low 8) | qh[0] bits 0-1 << 8. Block: d | qs[64] (32 idx low + 32 signs) | qh[8] | scales[8].
+    rec(GGML_TYPE_IQ2_S, 0, 1024, [](int idx, uint8_t * b) {
+        b[2] = (uint8_t) idx; // qs[0]
+        b[66] = (uint8_t) ((idx >> 8) & 3); // qh[0] bits 0-1
+    });
+    // IQ2_XS: 9-bit index in qs[0] (uint16 low 9 bits). Block: d | qs[64] | scales[8].
+    rec(GGML_TYPE_IQ2_XS, 1024, 512, [](int idx, uint8_t * b) {
+        b[2] = (uint8_t) idx; // qs[0] low byte
+        b[3] = (uint8_t) (idx >> 8); // qs[0] high bit
+    });
+    // IQ2_XXS: 8-bit index in qs[0] (uint16 low 8 bits). Block: d | qs[64].
+    rec(GGML_TYPE_IQ2_XXS, 1536, 256, [](int idx, uint8_t * b) {
+        b[2] = (uint8_t) idx; // qs[0] low byte
+    });
+    return g;
+}
+
+// ggml's ksigns_iq2xs: the 7 stored sign bits plus the parity bit (bit 7) -> the 8 sign bits of a group of 8 weights
+inline uint8_t ks8(unsigned v7) { return (uint8_t) (v7 | ((unsigned) (__builtin_popcount(v7) & 1) << 7)); }
+
+// One kernel for IQ2_XXS (66 B) / IQ2_XS (74 B) / IQ2_S (82 B): the gguf row -> values (64 B per block, one 8-byte record
+// per unit u' = 2p + hh: A idx low [2], B idx low [2], A sign u16, B sign u16 (the two 8-weight groups' full 8-bit sign
+// bytes, group 0 in the low byte: ksigns of the 7-bit value for XXS / XS, the stored byte for S)) + meta (20 B per block:
+// qh[8] (byte u', bits 2c.. = A0, A1, B0, B1), sc[8] (A ls | B ls << 4), fp16 d, base (S 0 / XS 4 / XXS 6), pad). The grid
+// index is lo | (qh + base) << 8 against the 1792-entry union grid. Self-check against y as repack_iq3xxs.
+bool repack_iq2s(ggml_type t, const uint8_t * src, uint8_t * q, uint8_t * meta, int nb, const float * y, const std::vector<uint64_t> & grid) {
+    const int bsz = t == GGML_TYPE_IQ2_XXS ? 66 : t == GGML_TYPE_IQ2_XS ? 74 : 82;
+    const int base = t == GGML_TYPE_IQ2_XS ? 4 : t == GGML_TYPE_IQ2_S ? 0 : 6;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t * blk = src + (size_t) b * bsz;
+        uint8_t * o = q + (size_t) b * 64, * mt = meta + (size_t) b * 20;
+        int idx[8][4]; // idx[sub-block][l]
+        uint8_t s7[8][4]; // 8-bit sign byte per (sub-block, l)
+        uint8_t scnib[8][2]; // scale nibble [sub-block][chunk]
+        const uint8_t * qs = blk + 2, * scales = blk + (bsz - 8);
+        uint16_t dbits;
+        memcpy(&dbits, blk, 2);
+        const float d = ggml_fp16_to_fp32(dbits);
+        if (t == GGML_TYPE_IQ2_XXS) {
+            for (int sb = 0; sb < 8; sb++) {
+                const uint8_t * qq = qs + 8 * sb;
+                const uint32_t aux1 = (uint32_t) qq[4] | (uint32_t) qq[5] << 8 | (uint32_t) qq[6] << 16 | (uint32_t) qq[7] << 24;
+                scnib[sb][0] = scnib[sb][1] = (uint8_t) (aux1 >> 28);
+                for (int l = 0; l < 4; l++) {
+                    idx[sb][l] = qq[l];
+                    s7[sb][l] = ks8((aux1 >> (7 * l)) & 127);
+                }
+            }
+        } else if (t == GGML_TYPE_IQ2_XS) {
+            for (int sb = 0; sb < 8; sb++) {
+                for (int l = 0; l < 4; l++) {
+                    const uint16_t v = (uint16_t) qs[8 * sb + 2 * l] | (uint16_t) (uint8_t) qs[8 * sb + 2 * l + 1] << 8;
+                    idx[sb][l] = v & 511;
+                    s7[sb][l] = ks8(v >> 9);
+                }
+                scnib[sb][0] = (uint8_t) (scales[sb] & 0xf);
+                scnib[sb][1] = (uint8_t) (scales[sb] >> 4);
+            }
+        } else { // IQ2_S
+            const uint8_t * signs = qs + 32, * qh = blk + 66;
+            for (int sb = 0; sb < 8; sb++) {
+                for (int l = 0; l < 4; l++) {
+                    idx[sb][l] = (int) qs[4 * sb + l] | ((qh[sb] << (8 - 2 * l)) & 0x300);
+                    s7[sb][l] = signs[4 * sb + l];
+                }
+                scnib[sb][0] = (uint8_t) (scales[sb] & 0xf);
+                scnib[sb][1] = (uint8_t) (scales[sb] >> 4);
+            }
+        }
+        memset(o, 0, 64);
+        memset(mt, 0, 20);
+        for (int w = 0; w < 8; w++) { // unit 2p + hh
+            const int p = w >> 1, hh = w & 1;
+            const int sa = 2 * p, sbn = 2 * p + 1; // A and B sub-blocks
+            o[8 * w + 0] = (uint8_t) (idx[sa][2 * hh] & 0xff);
+            o[8 * w + 1] = (uint8_t) (idx[sa][2 * hh + 1] & 0xff);
+            o[8 * w + 2] = (uint8_t) (idx[sbn][2 * hh] & 0xff);
+            o[8 * w + 3] = (uint8_t) (idx[sbn][2 * hh + 1] & 0xff);
+            uint16_t sgna = s7[sa][2 * hh] | (uint16_t) s7[sa][2 * hh + 1] << 8;
+            uint16_t sgnb = s7[sbn][2 * hh] | (uint16_t) s7[sbn][2 * hh + 1] << 8;
+            memcpy(o + 8 * w + 4, &sgna, 2);
+            memcpy(o + 8 * w + 6, &sgnb, 2);
+            mt[w] = (uint8_t) (((idx[sa][2 * hh] >> 8) & 3) | (((idx[sa][2 * hh + 1] >> 8) & 3) << 2)
+                              | (((idx[sbn][2 * hh] >> 8) & 3) << 4) | (((idx[sbn][2 * hh + 1] >> 8) & 3) << 6));
+            mt[8 + w] = (uint8_t) (scnib[sa][hh] | (uint8_t) (scnib[sbn][hh] << 4));
+        }
+        memcpy(mt + 16, blk, 2);
+        mt[18] = (uint8_t) base;
+        for (int e = 0; e < 256; e++) { // self-check: rebuild the element from the normalized layout
+            const int sb = e >> 5, off = e & 31, hh = off >> 4, l = off >> 3, j = off & 7;
+            const int isb = sb & 1, p = sb >> 1, w = 2 * p + hh, lp = l - 2 * hh;
+            const int qpos = isb ? 2 + lp : lp; // qh bit pair: A0, A1, B0, B1
+            const uint8_t idxlow = o[8 * w + isb * 2 + lp];
+            const uint8_t * sg = o + 8 * w + 4 + 2 * isb;
+            const int sgn = sg[lp] & (1 << j);
+            const int full = idxlow | ((int) ((mt[w] >> (2 * qpos)) & 3) + base) << 8;
+            const uint64_t gv = grid[full];
+            const int gval = (int) (int8_t) ((gv >> (8 * j)) & 0xff);
+            const int ls = (mt[8 + w] >> (4 * isb)) & 0xf;
+            const float db = d * (0.5f + (float) ls) * 0.25f;
+            const float v = db * (float) gval * (sgn ? -1.f : 1.f);
+            if (memcmp(&v, &y[b * 256 + e], 4) != 0) return false;
+        }
+    }
+    return true;
+}
+
+// GGUF Q2_K row (84 B blocks: scales[16] (low nibble sc, high nibble m, per 16 weights) | qs[64] | fp16 d | fp16 dmin) -> the
+// native layout of rows_q2k: values 64 B per block (unit u' = 2p + hh at 8u': the A word then the B word, byte m bits 2j =
+// the 2-bit q of element 4j + m of the 16-weight half) and meta 20 B per block (scales[16] | d | dmin). Weight d sc q - dmin m.
+// Self-check against y (ggml's dequantization: dl q - ml, dl = d sc, ml = dmin m, both products exact in fp32).
+bool repack_q2k(const uint8_t * src, uint8_t * q, uint8_t * meta, int nb, const float * y) {
+    for (int b = 0; b < nb; b++) {
+        const uint8_t * blk = src + (size_t) b * 84, * sc = blk, * qs = blk + 16;
+        uint8_t * o = q + (size_t) b * 64, * mt = meta + (size_t) b * 20;
+        uint8_t q2[256];
+        for (int e = 0; e < 256; e++) q2[e] = (uint8_t) ((qs[32 * (e >> 7) + (e & 31)] >> (2 * ((e >> 5) & 3))) & 3);
+        memset(o, 0, 64);
+        for (int w = 0; w < 8; w++) { // unit 2p + hh
+            const int p = w >> 1, hh = w & 1;
+            for (int i = 0; i < 16; i++) {
+                const int ea = 64 * p + 16 * hh + i, eb = ea + 32, m = i & 3, j = i >> 2;
+                o[8 * w + m] |= (uint8_t) (q2[ea] << (2 * j));
+                o[8 * w + 4 + m] |= (uint8_t) (q2[eb] << (2 * j));
+            }
+        }
+        memcpy(mt, sc, 16);
+        memcpy(mt + 16, blk + 80, 4); // d, dmin
+        uint16_t db, dm;
+        memcpy(&db, blk + 80, 2);
+        memcpy(&dm, blk + 82, 2);
+        const float d = ggml_fp16_to_fp32(db), mn = ggml_fp16_to_fp32(dm);
+        for (int e = 0; e < 256; e++) {
+            const int p = e >> 6, r = e & 63, isb = r >> 5, hh = (r >> 4) & 1, i = r & 15, w = 2 * p + hh;
+            const int qv = (o[8 * w + 4 * isb + (i & 3)] >> (2 * (i >> 2))) & 3;
+            const uint8_t s = mt[4 * p + 2 * isb + hh];
+            const float v = (d * (float) (s & 0xf)) * (float) qv - mn * (float) (s >> 4);
+            if (memcmp(&v, &y[b * 256 + e], 4) != 0 && v != y[b * 256 + e]) return false;
         }
     }
     return true;
@@ -338,7 +571,7 @@ auto MKEngine::Impl::want(const std::string & name, int to) -> Src {
     s.nbytes = t.nbytes;
     const bool to_f32 = to == T_F32 && t.type != gguf::F32;
     const bool to_q4 = !to_f32 && req_q4 && requant_type(t.type);
-    const bool to_q6 = !to_f32 && !to_q4 && reenc3 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S);
+    const bool to_q6 = !to_f32 && !to_q4 && ((reenc3 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S)) || t.type == gguf::IQ1_M);
     // native IQ4_NL unless MK_IQ4NL_Q8; Q4_0 (outside the MTP block) always (the kernels do not read it)
     const bool to_q8 = !to_f32 && !to_q4 && ((t.type == gguf::IQ4_NL && getenv("MK_IQ4NL_Q8")) || t.type == gguf::Q4_0);
     if (!to_f32 && !to_q4 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
@@ -421,6 +654,75 @@ const float * MKEngine::Impl::up_f32(const std::string & name, size_t expect) {
     size_t n = t.nbytes / 4;
     if (expect && n != expect) throw std::runtime_error(name + " bad size");
     return dput<float>(t.data, n);
+}
+
+void MKEngine::Impl::qsa_params(ModelW & w) const {
+    auto blk = [](int i, const char * s) { return "blk." + std::to_string(i) + "." + s; };
+    auto gi = [&](const char * k) -> int {
+        const auto it = file.ints.find(std::string("qwen35.attention.indexer.") + k);
+        if (it == file.ints.end()) throw std::runtime_error(std::string("QSA model without qwen35.attention.indexer.") + k);
+        return (int) it->second;
+    };
+    const auto cr = file.iarrs.find("qwen35.attention.compress_ratios");
+    if (cr == file.iarrs.end() || cr->second.size() != (size_t) NLA)
+        throw std::runtime_error("QSA model without a qwen35.attention.compress_ratios of " + std::to_string(NLA) + " entries");
+    for (int i = 0; i < NLA; i++) {
+        const int r = cr->second[i];
+        const bool ix = i < NL && (i + 1) % 4 == 0 && file.tensors.count(blk(i, "indexer.q_proj.weight"));
+        if (ix ? r != 4 : r != 0)
+            throw std::runtime_error("QSA layer " + std::to_string(i) + ": compress ratio " + std::to_string(r) +
+                                     " (supported: 4 on attention layers with an indexer, 0 elsewhere)");
+    }
+    w.qsa_r = 4;
+    w.qsa_heads = gi("head_count");
+    w.qsa_dim = gi("key_length");
+    w.qsa_topk = gi("top_k");
+    if (w.qsa_dim != 128 || w.qsa_heads != 4 || w.qsa_topk % w.qsa_r)
+        throw std::runtime_error("QSA indexer head_count " + std::to_string(w.qsa_heads) + " key_length " + std::to_string(w.qsa_dim) +
+                                 " top_k " + std::to_string(w.qsa_topk) + ": only 4 x 128 with top_k a multiple of 4 is supported");
+}
+
+// One NVFP4 row of the checkpoint -> the T_NVF4 streams (see rows_nvf4): values 128 B per 256-block, meta 20 B (16 UE4M3 scale
+// bytes, fp32 tensor scale / 2). ref: the row's reference dequantization; false when the device-side decode (ue4m3 * gsh *
+// doubled code) would differ from it.
+static bool repack_nvf4(const gguf::Tensor & t, uint64_t r, uint8_t * q, uint8_t * mt, int nb, const float * ref) {
+    const uint64_t K = t.ne[0], G = K / 16;
+    const uint64_t sr = t.nv_rows ? (*t.nv_rows)[r] : r;
+    const float gsh = (1.0f / t.nv_gs) * 0.5f;
+    static const int C2[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+    bool ok = true;
+    for (int b = 0; b < nb; b++) {
+        uint8_t * o = q + (size_t) b * NV_BLK, * m = mt + (size_t) b * NV_META;
+        uint8_t sc[16];
+        const uint8_t * grp[16];
+        for (int g = 0; g < 16; g++) {
+            const uint64_t sg = t.nv_cols ? (*t.nv_cols)[(uint64_t) b * 16 + g] : (uint64_t) b * 16 + g;
+            sc[g] = t.nv_scale[sr * G + sg];
+            grp[g] = t.data + sr * (K / 2) + sg * 8;
+            m[g] = sc[g];
+        }
+        memcpy(m + 16, &gsh, 4);
+        auto nib = [&](int g, int j) -> unsigned { return j & 1 ? grp[g][j >> 1] >> 4 : grp[g][j >> 1] & 15; };
+        for (int p = 0; p < 4; p++)
+            for (int hh = 0; hh < 2; hh++)
+                for (int c = 0; c < 2; c++)
+                    for (int s = 0; s < 2; s++) { // s: 0 = A (group 4p + hh), 1 = B (group 4p + 2 + hh)
+                        const int g = 4 * p + 2 * s + hh;
+                        uint8_t * w = o + 16 * (2 * p + hh) + 8 * c + 4 * s;
+                        for (int mm = 0; mm < 4; mm++) w[mm] = (uint8_t) (nib(g, 8 * c + mm) | (nib(g, 8 * c + 4 + mm) << 4));
+                    }
+        // the device decode of every weight against the reference
+        for (int g = 0; g < 16; g++) {
+            const float sf = gguf::nv_e4m3(sc[g] & 0x7f) * gsh;
+            for (int j = 0; j < 16; j++) {
+                const unsigned n = nib(g, j);
+                const float v = sf * (float) ((n & 8) ? -C2[n & 7] : C2[n & 7]);
+                const float e = ref[(size_t) b * 256 + 16 * g + j];
+                if (std::fabs(v - e) > 1e-6f * std::fabs(e) + 1e-30f) ok = false;
+            }
+        }
+    }
+    return ok;
 }
 
 Mat MKEngine::Impl::up_mat(const std::string & name, int K, int N, int to) {
@@ -520,13 +822,14 @@ Mat MKEngine::Impl::up_mat(const std::string & name, int K, int N, int to) {
         if (wv_lay) wv_place(m, qd, qn, nullptr, 0, S);
         else
         m.w = dput<uint8_t>(qd, qn, &S);
-    } else if (t.type == gguf::Q3_K || t.type == gguf::IQ3_S) {
-        // native (rows_q3k / rows_iq3s, prefill TQ3K / TIQ3S): values 96 B per block + meta (Q3_K: the Q6_K meta
-        // stream, 18 B; IQ3_S: 16 B), checked bit for bit against ggml's dequantization of every row
-        const bool q3 = t.type == gguf::Q3_K;
-        m.type = q3 ? T_Q3K : T_IQ3S;
-        if (nb & 1) throw std::runtime_error(name + ": Q3_K / IQ3_S rows need an even number of 256-blocks");
-        const int mb = q3 ? Q6_META : IQ3S_META;
+    } else if (t.type == gguf::Q3_K || t.type == gguf::IQ3_S || t.type == gguf::IQ3_XXS) {
+        // native (rows_q3k / rows_iq3s / rows_iq3xxs, prefill TQ3K / TIQ3S / TIQ3XXS): values 96 B per block + meta
+        // (Q3_K: the Q6_K meta stream, 18 B; IQ3_S: 16 B; IQ3_XXS: 8 B), checked bit for bit against ggml's
+        // dequantization of every row
+        const bool q3 = t.type == gguf::Q3_K, xx = t.type == gguf::IQ3_XXS;
+        m.type = q3 ? T_Q3K : xx ? T_IQ3XXS : T_IQ3S;
+        if (nb & 1) throw std::runtime_error(name + ": Q3_K / IQ3_S / IQ3_XXS rows need an even number of 256-blocks");
+        const int mb = q3 ? Q6_META : xx ? IQ3XXS_META : IQ3S_META;
         m.rb = nb * Q3_BLK;
         m.nd = nb * mb / 2; // halves
         const auto t0 = std::chrono::steady_clock::now();
@@ -543,21 +846,104 @@ Mat MKEngine::Impl::up_mat(const std::string & name, int K, int N, int to) {
         uint8_t * qd = S.q.get(qn);
         uint8_t * md = S.m.get(mn);
         const auto * tr = ggml_get_type_traits((ggml_type) t.type);
+        const int bsz = xx ? 98 : 110; // ggml bytes per 256-block
         std::atomic<bool> exact{true};
         {
-            auto _ = lc.scope("repack Q3_K / IQ3_S native (+ check)");
+            auto _ = lc.scope("repack Q3_K / IQ3_S / IQ3_XXS native (+ check)");
             parallel_rows(N, [&](int64_t r) {
                 thread_local std::vector<float> f;
                 f.resize((size_t) K);
-                const uint8_t * src = t.data + (size_t) r * nb * 110;
+                const uint8_t * src = t.data + (size_t) r * nb * bsz;
                 tr->to_float(src, f.data(), K);
                 uint8_t * qo = qd + (size_t) r * m.rb;
                 uint8_t * mo = md + (size_t) r * nb * mb;
-                if (!(q3 ? repack_q3k(src, qo, mo, nb, f.data()) : repack_iq3s(src, qo, mo, nb, f.data(), grid))) exact = false;
+                if (q3 ? !repack_q3k(src, qo, mo, nb, f.data())
+                       : xx ? !repack_iq3xxs(src, qo, mo, nb, f.data(), grid)
+                           : !repack_iq3s(src, qo, mo, nb, f.data(), grid))
+                    exact = false;
             });
         }
-        if (!exact) throw std::runtime_error(name + ": native Q3_K / IQ3_S repack is not exact");
+        if (!exact) throw std::runtime_error(name + ": native Q3_K / IQ3_S / IQ3_XXS repack is not exact");
         if (wv_lay && wv_fd) wv_place(m, qd, qn, md, mn, S); // main-layer ffn_down: tile-major values and meta
+        else
+        {
+            m.w = dput<uint8_t>(qd, qn, &S);
+            m.d = reinterpret_cast<const __half *>(dput<uint8_t>(md, mn, &S));
+        }
+        n_nat++;
+        nat_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    } else if (t.type == gguf::IQ2_XXS || t.type == gguf::IQ2_XS || t.type == gguf::IQ2_S || t.type == gguf::Q2_K) {
+        // native (rows_iq2s / rows_q2k, prefill TIQ2S / TQ2K): values 64 B per block + 20 B meta, checked bit for bit
+        // against ggml's dequantization of every row
+        const bool q2 = t.type == gguf::Q2_K;
+        m.type = q2 ? T_Q2K : T_IQ2S;
+        if (nb & 1) throw std::runtime_error(name + ": IQ2 / Q2_K rows need an even number of 256-blocks");
+        constexpr int mb = 20;
+        m.rb = nb * 64;
+        m.nd = nb * mb / 2; // halves
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<uint64_t> grid;
+        if (!q2) {
+            grid = iq2_grid_host();
+            if (!iq2_grid_up) {
+                CK(mkl::set_g_iq2_grid(grid.data(), grid.size() * 8));
+                iq2_grid_up = true;
+            }
+        }
+        HSet & S = hset();
+        const size_t qn = (size_t) N * m.rb, mn = (size_t) N * nb * mb;
+        uint8_t * qd = S.q.get(qn);
+        uint8_t * md = S.m.get(mn);
+        const auto * tr = ggml_get_type_traits((ggml_type) t.type);
+        const int bsz = t.type == gguf::IQ2_XXS ? 66 : t.type == gguf::IQ2_XS ? 74 : t.type == gguf::IQ2_S ? 82 : 84;
+        std::atomic<bool> exact{true};
+        {
+            auto _ = lc.scope("repack IQ2 / Q2_K native (+ check)");
+            parallel_rows(N, [&](int64_t r) {
+                thread_local std::vector<float> f;
+                f.resize((size_t) K);
+                const uint8_t * src = t.data + (size_t) r * nb * bsz;
+                tr->to_float(src, f.data(), K);
+                uint8_t * qo = qd + (size_t) r * m.rb;
+                uint8_t * mo = md + (size_t) r * nb * mb;
+                if (q2 ? !repack_q2k(src, qo, mo, nb, f.data()) : !repack_iq2s((ggml_type) t.type, src, qo, mo, nb, f.data(), grid))
+                    exact = false;
+            });
+        }
+        if (!exact) throw std::runtime_error(name + ": native IQ2 / Q2_K repack is not exact");
+        if (wv_lay && wv_fd) wv_place(m, qd, qn, md, mn, S);
+        else
+        {
+            m.w = dput<uint8_t>(qd, qn, &S);
+            m.d = reinterpret_cast<const __half *>(dput<uint8_t>(md, mn, &S));
+        }
+        n_nat++;
+        nat_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    } else if (t.type == gguf::NVFP4) {
+        // native (rows_nvf4, WV<T_NVF4>, prefill TNVF4) straight from the safetensors checkpoint: values 128 B per block + 20 B
+        // meta; every row checked against nv_dequant_row (the reference dequantization of the checkpoint)
+        const gguf::Tensor & st = tget(name);
+        if (nb & 1) throw std::runtime_error(name + ": NVFP4 rows need an even number of 256-blocks");
+        m.type = T_NVF4;
+        m.rb = nb * NV_BLK;
+        m.nd = nb * NV_META / 2; // halves
+        const auto t0 = std::chrono::steady_clock::now();
+        HSet & S = hset();
+        const size_t qn = (size_t) N * m.rb, mn = (size_t) N * nb * NV_META;
+        uint8_t * qd = S.q.get(qn);
+        uint8_t * md = S.m.get(mn);
+        std::atomic<bool> exact{true};
+        {
+            auto _ = lc.scope("repack NVFP4 native (+ check)");
+            parallel_rows(N, [&](int64_t r) {
+                thread_local std::vector<float> f;
+                f.resize((size_t) K);
+                gguf::nv_dequant_row(st, (uint64_t) r, f.data());
+                if (!repack_nvf4(st, (uint64_t) r, qd + (size_t) r * m.rb, md + (size_t) r * nb * NV_META, nb, f.data())) exact = false;
+            });
+        }
+        if (!exact) throw std::runtime_error(name + ": native NVFP4 repack does not reproduce the checkpoint's dequantization");
+        if (wv_lay && wv_fd) wv_place(m, qd, qn, md, mn, S);
         else
         {
             m.w = dput<uint8_t>(qd, qn, &S);
@@ -807,6 +1193,8 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     if (ctx > ctx_limit())
         throw std::runtime_error("context of " + std::to_string(ctx) + " positions exceeds the model's context length (" +
                                  std::to_string(ctx_limit()) + ", qwen35.context_length)");
+    const char * dse = getenv("MK_DSPINE"); // DSpine drafter (dspine.cu): MTP off, the drafts come from its GGUF
+    const bool dsp_on = dse && dse[0];
     {
         // MTP source: the mtp argument (CLI --mtp FILE / --no-mtp), else MK_NO_MTP=1 / MK_MTP=FILE, else the model file's
         std::string mtp = mtp_;
@@ -814,10 +1202,11 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             if (getenv("MK_NO_MTP") && atoi(getenv("MK_NO_MTP")) != 0) mtp = "none";
             else if (getenv("MK_MTP") && getenv("MK_MTP")[0]) mtp = getenv("MK_MTP");
         }
+        if (dsp_on) mtp = "none";
         const bool file_mtp = file.tensors.count("blk." + std::to_string(NL) + ".nextn.eh_proj.weight") != 0;
         if (mtp == "none") {
             has_mtp = false;
-            fprintf(stderr, "[mk] MTP layer off (--no-mtp / MK_NO_MTP=1): plain decoding, depth 0\n");
+            if (!dsp_on) fprintf(stderr, "[mk] MTP layer off (--no-mtp / MK_NO_MTP=1): plain decoding, depth 0\n");
         } else if (!mtp.empty()) {
             mtpf.reset(new gguf::File(mtp));
             check_mtp_file(*mtpf, mtp);
@@ -830,8 +1219,11 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         if (!has_mtp) {
             mtp_desc = "none";
             kv_slots = N_ATT_SLOTS - 1;
-            if (ndraft > 0) fprintf(stderr, "[mk] n_draft %d -> 0 (no MTP layer)\n", ndraft);
-            ndraft = nd_avail = n_draft_max = n_draft_cap = 0;
+            if (dsp_on) n_draft_max = n_draft_cap = ndraft = std::min(ndraft, MAXD - 1); // (ndraft / nd_avail are zeroed at the end: the launches carry no MTP drafts)
+            else {
+                if (ndraft > 0) fprintf(stderr, "[mk] n_draft %d -> 0 (no MTP layer)\n", ndraft);
+                ndraft = nd_avail = n_draft_max = n_draft_cap = 0;
+            }
         }
     }
     // read-ahead of the tensor data from here on (loader.cuh Prefetch; MK_LOAD_IO threads, 0: off), 3 GiB ahead at most
@@ -913,6 +1305,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             case gguf::F16: return "F16";
             case gguf::Q4_0: return "Q4_0";
             case gguf::Q8_0: return "Q8_0";
+            case gguf::NVFP4: return "NVFP4";
             case gguf::Q3_K: return "Q3_K";
             case gguf::Q4_K: return "Q4_K";
             case gguf::Q5_K: return "Q5_K";
@@ -920,6 +1313,12 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             case gguf::IQ4_NL: return "IQ4_NL";
             case gguf::IQ3_S: return "IQ3_S";
             case gguf::IQ4_XS: return "IQ4_XS";
+            case gguf::IQ3_XXS: return "IQ3_XXS";
+            case gguf::Q2_K: return "Q2_K";
+            case gguf::IQ2_XXS: return "IQ2_XXS";
+            case gguf::IQ2_XS: return "IQ2_XS";
+            case gguf::IQ2_S: return "IQ2_S";
+            case gguf::IQ1_M: return "IQ1_M";
             case gguf::Q5_1: return "Q5_1";
             case gguf::BF16: return "BF16";
             default: return "type " + std::to_string(t);
@@ -934,7 +1333,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                                  " (see README: the GGUF)");
     };
     auto needq = [&](const std::string & name, int got) {
-        need(name, got, {T_Q4K, T_Q5K, T_Q5_1, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL, T_Q3K, T_IQ3S});
+        need(name, got, {T_Q4K, T_Q5K, T_Q5_1, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL, T_Q3K, T_IQ3S, T_IQ3XXS, T_IQ2S, T_Q2K, T_NVF4});
         if (!mk_built(got)) throw std::runtime_error(name + " is " + tname(got) + ": this build has no kernels for it (make MK_TYPES)");
     };
     if (const char * e = getenv("MK_MTP_Q4")) {
@@ -969,6 +1368,15 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             needq(blk(i, "attn_output.weight"), L.o.type);
             L.qn = up_f32(blk(i, "attn_q_norm.weight"), HD);
             L.kn = up_f32(blk(i, "attn_k_norm.weight"), HD);
+            if (!mtp && file.tensors.count(blk(i, "indexer.q_proj.weight"))) { // QSA: dense where the tensors are absent
+                if (hw.qsa_r == 0) qsa_params(hw);
+                const size_t IXH = hw.qsa_heads, IXD = hw.qsa_dim;
+                L.ix_q = up_f32(blk(i, "indexer.q_proj.weight"), IXH * IXD * D);
+                L.ix_k = up_f32(blk(i, "indexer.k_proj.weight"), IXD * D);
+                L.ix_qn = up_f32(blk(i, "indexer.q_norm.weight"), IXD);
+                L.ix_kn = up_f32(blk(i, "indexer.k_norm.weight"), IXD);
+                L.ix_kpre = up_f32(blk(i, "indexer.k_norm.pre_weight"), IXD);
+            }
         } else {
             L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV);
             L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD);
@@ -1056,7 +1464,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     {
         auto dp4a_need = [&](const std::string & name, const Mat & m, bool mtp) {
             const int t = m.type;
-            if (m.fm || t == T_Q3K || t == T_IQ3S || (mtp && (t == T_Q4K || t == T_IQ4X))) return;
+            if (m.fm || t == T_Q3K || t == T_IQ3S || t == T_IQ3XXS || t == T_IQ2S || t == T_Q2K || t == T_NVF4 || (mtp && (t == T_Q4K || t == T_IQ4X))) return;
             throw std::runtime_error(name + " is " + tname(t) + (mtp ? " in the MTP block" : " outside the wv layout") +
                                      ": this build's dp4a kernels do not read it");
         };
@@ -1081,9 +1489,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     }
     hw.onorm = up_f32("output_norm.weight", D);
     hw.head = up_mat("output.weight", D, VOCAB);
-    // Q8_0: some fine-tunes (~0.3 GB more than Q6_K); lm_head reads either type (Q8_0 in builds with its kernels)
-    if ((hw.head.type != T_Q6K && hw.head.type != T_Q8_0) || !mk_built(hw.head.type))
-        throw std::runtime_error("output.weight is " + tname(hw.head.type) + ", the kernel needs Q6_K or Q8_0 (see README: the GGUF)");
+    // Q8_0: some fine-tunes (~0.3 GB more than Q6_K); Q4_K: the low-bit QSA GGUFs; lm_head reads any of them (in builds with its kernels)
+    if ((hw.head.type != T_Q6K && hw.head.type != T_Q8_0 && hw.head.type != T_Q4K) || !mk_built(hw.head.type))
+        throw std::runtime_error("output.weight is " + tname(hw.head.type) + ", the kernel needs Q6_K, Q8_0 or Q4_K (see README: the GGUF)");
     mem_mark("weights: eh, norms, lm_head");
     hw.head_d = hw.head;
     hw.draft_ids = nullptr;
@@ -1118,7 +1526,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         dv_in.assign(VOCAB, 0);
         for (int t : ids) dv_in[t] = 1;
         fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
-        if (draft_q4) { // MK_DRAFT_Q4: the rows' Q4_K copy (row r = lm_head row ids[r], from the file's Q6_K or Q8_0)
+        if (draft_q4 && hw.head.type == T_Q4K) {
+            if (draft_q4_env) fprintf(stderr, "[mk] MK_DRAFT_Q4 ignored: lm_head is already Q4_K\n");
+        } else if (draft_q4) { // MK_DRAFT_Q4: the rows' Q4_K copy (row r = lm_head row ids[r], from the file's Q6_K or Q8_0)
             auto _ = lc.scope("draft head Q4_K copy (MK_DRAFT_Q4)");
             const auto t0 = lclk::now();
             const auto & t = tget("output.weight");
@@ -1146,10 +1556,16 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     {
         const auto & t = tget("token_embd.weight");
         // the embedding lookups dequantise each type (embed_prologue, the MTP M0 phases, pk_embed*, pk_mtp_in)
-        if (t.type != gguf::Q4_K && t.type != gguf::Q5_K && t.type != gguf::Q6_K && t.type != gguf::Q8_0)
-            throw std::runtime_error("token_embd.weight is " + tname((int) t.type) + ", the engine reads Q4_K, Q5_K, Q6_K or Q8_0 (see README: the GGUF)");
+        if (t.type != gguf::Q4_K && t.type != gguf::Q5_K && t.type != gguf::Q6_K && t.type != gguf::Q8_0 &&
+            t.type != gguf::IQ4_XS && t.type != gguf::IQ2_S)
+            throw std::runtime_error("token_embd.weight is " + tname((int) t.type) + ", the engine reads Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS or IQ2_S (see README: the GGUF)");
         if (!shape2(t.ne, D, VOCAB)) throw std::runtime_error("token_embd.weight bad shape");
         hw.embd_t = (int) t.type; // (gguf::Q4_K / Q5_K / Q6_K / Q8_0 == T_Q4K / T_Q5K / T_Q6K / T_Q8_0)
+        if (t.type == gguf::IQ2_S && !iq2_grid_up) { // (dequant_iq2s_e reads the union grid's IQ2_S part)
+            const auto g = iq2_grid_host();
+            CK(mkl::set_g_iq2_grid(g.data(), g.size() * 8));
+            iq2_grid_up = true;
+        }
         // mapped pinned host memory: a cycle reads only a few 2.8 KB rows over PCIe, saves 0.7 GB of VRAM
         auto _ = lc.scope("token_embd (pinned table)");
         if (!embd_dev) {
@@ -1521,6 +1937,10 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         if (rq_th.t.joinable()) rq_th.t.join(); // (an unconsumed MTP requant still reads the mapping)
         file.release();
         if (mtpf) mtpf->release();
+    }
+    if (dsp_on) {
+        dsp_init(dse);
+        ndraft = nd_avail = 0;
     }
     fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
 }

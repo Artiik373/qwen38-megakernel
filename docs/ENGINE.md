@@ -140,6 +140,8 @@ any of:
 | Q6_K, Q8_0 | re-laid-out at load (values unchanged) |
 | IQ4_XS | re-laid-out at load in pairs of 256-weight blocks, 272 B per pair (both block headers, then each block's index bytes in Q4_K order); 4-bit indices mapped to int8 weights with `__byte_perm` |
 | Q3_K, IQ3_S | re-laid-out at load (values + scales streams, 114 / 112 B per 256 weights); the GEMV and the prefill GEMM feed exactly the integers and scales of the Q6_K re-encode they replace (`MK_REENC3=1`): bit-identical results at ~0.54x the bytes |
+| IQ2_XXS, IQ2_XS, IQ2_S, Q2_K | re-laid-out at load into 64 B of value records per 256 weights plus 20 B of meta (IQ2_*: one shared 1792-entry grid, an 8-bit sign byte per 8 weights, 2-bit index highs, nibble scales, a per-type grid base; Q2_K: the 2-bit values, 16 scale / min bytes, `d`, `dmin`); the loader checks each row against ggml's dequantization. IQ2_* is one kernel type (`T_IQ2S`). IQ1_M is re-encoded exactly to Q6_K. Main-layer matrices are hybrid: ffn_down in the wv layout, the others row-major on the dp4a path. `token_embd` IQ2_S and `output` Q4_K are read natively. Not bit-identical to a Q6_K re-encode (Q2_K has no lossless one): the prefill fp16 GEMM and decode differ by rounding as the other offset types do. Unverified on hardware until the first run |
+| NVFP4 (safetensors) | `-m` takes a Hugging Face checkpoint directory (or its `model.safetensors`) of Qwen3_5ForCausalLM in compressed-tensors NVFP4 form: packed e2m1 values, one UE4M3 scale per 16 weights, one fp32 `weight_global_scale` per tensor. `safetensors.h` presents it as a qwen35 GGUF (names, shapes and metadata from `config.json`; norms + 1, `A_log` to `-exp`, the linear-attention V heads reordered by row / column-group maps, never copied). The loader re-lays the weights out into 128 B of values per 256 weights plus 20 B of meta (16 scale bytes, fp32 scale / 2; kernel type `T_NVF4`, signed doubled e2m1 ints, no min term) and checks every row against the reference dequantization. The BF16 embedding and `lm_head` become Q8_0 at load; `ssm_alpha` / `ssm_beta` become F32. Activations and the KV cache stay the engine's own int8 (W4A8; the checkpoint's `input_global_scale`, `k_scale` and `v_scale` are unused). The tokenizer is not in safetensors: put a vocab-only GGUF (no weights) at `<dir>/tokenizer.gguf` (`python llama.cpp/convert_hf_to_gguf.py <dir> --vocab-only --outfile <dir>/tokenizer.gguf`). The checkpoint has no MTP layer: depth 0, or `--mtp file.gguf` takes one from a GGUF of the model. Verified on an RTX 3090 with mnma_qwen3.8_27b_nvfp4 (coherent output, `-d 0` and `-d 7` ids identical); not bit-identical to the fp16 prefill GEMM, as the other offset types |
 | IQ4_NL | re-laid-out at load into 144-byte blocks of 256 weights (the eight fp16 scales, then the index bytes); bit-identical to the Q8_0 re-encode it replaces (`MK_IQ4NL_Q8=1`) at 0.53x the bytes |
 | Q5_1 | re-laid-out at load into 192-byte blocks of 256 weights, the same bytes per weight (the eight fp16 `d` / `m` pairs, then the high bits and the low nibbles in Q5_K's order); every weight `d q + m` exactly, read by the Q5_K code paths with `d` / `-m` as the sub-block scale / minimum. Input projections only (q / k / v, `attn_qkv`, `attn_gate`, FFN gate / up; rows of a multiple of 256 values): `attn_output`, `ssm_out`, `ffn_down` and `eh_proj` in Q5_1 are refused (one kernel instance less per decode width, for ptxas' memory). Seen in community Q5_K_M mixes (one `attn_v`) |
 
@@ -206,6 +208,19 @@ which every draft pass reads instead of the shared lm_head rows (0.69x the bytes
 vocabulary on the fly still come from lm_head. Greedy output and the sampled distribution are unchanged (the main head
 verifies); the policy key `dq4=0|1` switches it at run time. It adds ~2% to greedy decode on short prompts (the same
 cycles and accepted drafts) and nothing measurable at 38k and 101.6k.
+
+**DSpine drafter** (`dspine.h`, `dspine.cuh`, `dspine.cu`). `MK_DSPINE=FILE` / `--dspine FILE` replaces the MTP layer with the
+DSpine block drafter of Qwen3.8-27B (arXiv 2609.36173). The megakernel copies the residual stream after the target layers
+named in `dflash.target_layers` (minus 1) into a bf16 buffer (`dsp_cap`, after each such layer's last barrier); `pf_run`
+stages the same rows. After every committed row the drafter's `fc` fuses the 5 features, and each of its 5 layers writes
+K / V into a ring of 8192 positions (slot `p & 8191`, validated by a position tag). A cycle then runs one block of `nd + 1`
+rows (the anchor token, then mask tokens) with the target's embedding, the 5 layers with the code bridge
+(`dspine_read`, `dspine_gate`, `dspine_prev`, `dspine_write`), the target's output norm and `lm_head` on the mask rows (top
+16 each), and a lattice: the score of every candidate given each predecessor candidate, walked greedily. The drafts go into
+the control block like an n-gram continuation (`Ctl::dsmp` 0, verified as fixed drafts), so greedy and sampled output stay
+exact. The launches carry no MTP drafts (`Launch::ndraft` 0). The ring is emptied by `reset`, `park`, `unpark`, the side
+requests, and when a gap in the injected positions shows. The kernels are plain CUDA on stream 0 (no barriers). They were
+written without a build or a test run: check acceptance against `--no-mtp` before relying on it.
 
 Gate and up projections of different types (25 of the 65 layers of UD-Q4_K_XL) are read each in its own type over the
 shared activations in decode. In prefill one mixed-type fused GEMM computes both (warps 0-3 gate rows, warps 4-7 up

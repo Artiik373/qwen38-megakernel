@@ -178,6 +178,7 @@ size_t MKEngine::Impl::lane_bytes(int lctx) const { // (slots_open's device buff
 
 int MKEngine::Impl::slots_open(int n, int lctx) {
     if (!lanes.empty()) throw std::runtime_error("slots are open already");
+    if (dspine) throw std::runtime_error("slots (--agents): not supported with the DSpine drafter (MK_DSPINE / --dspine)");
     if (n < 1 || n > NSEQ) throw std::runtime_error("slots: 1 .. " + std::to_string(NSEQ));
     // (2+ lanes run batched passes of MAXT rows, two lanes always: embed_prologue skips the rows past a smaller grid)
     if (n >= 2 && nsm < mk_min_grid(MAXT))
@@ -401,11 +402,14 @@ std::string MKEngine::Impl::wide_why() const {
 
 #if MK_MAXD > 8
 std::string MKEngine::Impl::deep_why() const {
-    if (!hb.kvq8) return "the q8 KV cache (--kv q8)";
-    for (int w = 0; w < 2; w++)
-        for (int sl = 0; sl < std::min(kv_slots, N_ATT_SLOTS - 1); sl++)
-            if (hb.kvb[w][sl] != 8) return "8-bit K / V in every attention layer (no low-bit MK_KV preset)";
-    if (hb.kvwin > 0) return "no MK_KV_WIN rings";
+    if (!hb.kvq8) {
+        if (!dspine) return "the q8 KV cache (--kv q8)"; // (DSpine: the fp16 cache runs attn_core_t, two head-group passes)
+    } else {
+        for (int w = 0; w < 2; w++)
+            for (int sl = 0; sl < std::min(kv_slots, N_ATT_SLOTS - 1); sl++)
+                if (hb.kvb[w][sl] != 8) return "8-bit K / V in every attention layer (no low-bit MK_KV preset)";
+        if (hb.kvwin > 0) return "no MK_KV_WIN rings";
+    }
     for (int L = 0; L < NL; L++)
         if (!hw.L[L].attn && !(hw.L[L].qkv.fm && hw.L[L].gate.fm)) return "delta-net projections in the wv layout";
     if (nsm < mk_min_grid(MAXT)) return "a GPU with at least " + std::to_string(mk_min_grid(MAXT)) + " SMs";

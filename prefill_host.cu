@@ -72,6 +72,10 @@ void MKEngine::Impl::pf_init() {
     MK_IF(MK_TY_IQ4NL, mmh_attr<pf::TIQ4NL, false>();)
     MK_IF(MK_TY_Q3K, mmh_attr<pf::TQ3K, false>();)
     MK_IF(MK_TY_IQ3S, mmh_attr<pf::TIQ3S, false>();)
+    MK_IF(MK_TY_IQ3XXS, mmh_attr<pf::TIQ3XXS, false>();)
+    MK_IF(MK_TY_IQ2S, mmh_attr<pf::TIQ2S, false>();)
+    MK_IF(MK_TY_Q2K, mmh_attr<pf::TQ2K, false>();)
+    MK_IF(MK_TY_NVF4, mmh_attr<pf::TNVF4, false>();)
     MK_IF(MK_TY_Q4K, mmh_attr<pf::TQ4K, true>();)
     MK_IF(MK_TY_Q5K, mmh_attr<pf::TQ5K, true>();)
     mmh_attr<pf::TIQ4, true>();
@@ -87,6 +91,10 @@ void MKEngine::Impl::pf_init() {
     mmh_attr<pf::TQ6K, false, 1>();
     MK_IF(MK_TY_Q3K, mmh_attr<pf::TQ3K, false, 1>();)
     MK_IF(MK_TY_IQ3S, mmh_attr<pf::TIQ3S, false, 1>();)
+    MK_IF(MK_TY_IQ3XXS, mmh_attr<pf::TIQ3XXS, false, 1>();)
+    MK_IF(MK_TY_IQ2S, mmh_attr<pf::TIQ2S, false, 1>();)
+    MK_IF(MK_TY_Q2K, mmh_attr<pf::TQ2K, false, 1>();)
+    MK_IF(MK_TY_NVF4, mmh_attr<pf::TNVF4, false, 1>();)
     glu_mix_attr();
     if (const char * e = getenv("MK_PF_BN")) { // force one GEMM token tile (tuning / tests); 0 = by prompt size
         pf_bn_force = atoi(e);
@@ -340,6 +348,10 @@ void MKEngine::Impl::gemm(const Mat & m, int ntok, float * y, int ldy, int mode,
             case T_Q6K: mmh_launch<pf::TQ6K, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;
             MK_IF(MK_TY_Q3K, case T_Q3K: mmh_launch<pf::TQ3K, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;)
             MK_IF(MK_TY_IQ3S, case T_IQ3S: mmh_launch<pf::TIQ3S, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;)
+            MK_IF(MK_TY_IQ3XXS, case T_IQ3XXS: mmh_launch<pf::TIQ3XXS, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;)
+            MK_IF(MK_TY_IQ2S, case T_IQ2S: mmh_launch<pf::TIQ2S, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;)
+            MK_IF(MK_TY_Q2K, case T_Q2K: mmh_launch<pf::TQ2K, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;)
+            MK_IF(MK_TY_NVF4, case T_NVF4: mmh_launch<pf::TNVF4, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;)
             default: throw std::runtime_error("gemm: unsupported weight type in the wv layout");
         }
     }
@@ -353,6 +365,10 @@ void MKEngine::Impl::gemm(const Mat & m, int ntok, float * y, int ldy, int mode,
         MK_IF(MK_TY_IQ4NL, case T_IQ4NL: mmh_launch<pf::TIQ4NL, false>(nrt, W, X, ntok, O, nullptr, st); break;)
         MK_IF(MK_TY_Q3K, case T_Q3K: mmh_launch<pf::TQ3K, false>(nrt, W, X, ntok, O, nullptr, st); break;)
         MK_IF(MK_TY_IQ3S, case T_IQ3S: mmh_launch<pf::TIQ3S, false>(nrt, W, X, ntok, O, nullptr, st); break;)
+        MK_IF(MK_TY_IQ3XXS, case T_IQ3XXS: mmh_launch<pf::TIQ3XXS, false>(nrt, W, X, ntok, O, nullptr, st); break;)
+        MK_IF(MK_TY_IQ2S, case T_IQ2S: mmh_launch<pf::TIQ2S, false>(nrt, W, X, ntok, O, nullptr, st); break;)
+        MK_IF(MK_TY_Q2K, case T_Q2K: mmh_launch<pf::TQ2K, false>(nrt, W, X, ntok, O, nullptr, st); break;)
+        MK_IF(MK_TY_NVF4, case T_NVF4: mmh_launch<pf::TNVF4, false>(nrt, W, X, ntok, O, nullptr, st); break;)
         default: throw std::runtime_error("gemm: unsupported weight type");
     }
 }
@@ -529,6 +545,12 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
             } else if (hw.embd_t == T_Q8_0) {
                 if (img) mkl::pk_embed_img<T_Q8_0>(T);
                 else mkl::pk_embed<T_Q8_0>(T);
+            } else if (hw.embd_t == T_IQ4X) {
+                if (img) mkl::pk_embed_img<T_IQ4X>(T);
+                else mkl::pk_embed<T_IQ4X>(T);
+            } else if (hw.embd_t == T_IQ2S) {
+                if (img) mkl::pk_embed_img<T_IQ2S>(T);
+                else mkl::pk_embed<T_IQ2S>(T);
             } else {
                 if (img) mkl::pk_embed_img<T_Q4K>(T);
                 else mkl::pk_embed<T_Q4K>(T);
@@ -672,7 +694,9 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
             pf_time(glu_fused(W.fg, W.fu) ? "gemm_ffn_gu" : glu_mix_on && glu_mix(W.fg, W.fu, 0) ? "gemm_ffn_gum" : "gemm_ffn_gu2",
                     [&] { gemm_glu(W.fg, W.fu, T); });
             pf_time("gemm_ffn_down", [&] { gemm(W.fd, T, hp.x, D, pf::OUT_ADD, 0, hp.xh2); });
+            if (dspine && !pred && !sink) dsp_pf_stage(L, T); // (the drafter's features: the rows after the target layers it reads)
         }
+        if (dspine && !pred && !sink) dsp_pf_inject(n, T, n0 + N - dsp::WIN); // (only the last WIN prompt positions reach the drafter's window)
         wd_T = T;
         wd_mode = MODE_PREFILL;
         gap_mark(ci, 1);
@@ -732,6 +756,12 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
             } else if (hw.embd_t == T_Q8_0) {
                 if (img) mkl::pk_mtp_in<true, T_Q8_0>(T);
                 else mkl::pk_mtp_in<false, T_Q8_0>(T);
+            } else if (hw.embd_t == T_IQ4X) {
+                if (img) mkl::pk_mtp_in<true, T_IQ4X>(T);
+                else mkl::pk_mtp_in<false, T_IQ4X>(T);
+            } else if (hw.embd_t == T_IQ2S) {
+                if (img) mkl::pk_mtp_in<true, T_IQ2S>(T);
+                else mkl::pk_mtp_in<false, T_IQ2S>(T);
             } else {
                 if (img) mkl::pk_mtp_in<true, T_Q4K>(T);
                 else mkl::pk_mtp_in<false, T_Q4K>(T);

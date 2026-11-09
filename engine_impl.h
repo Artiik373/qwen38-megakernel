@@ -3,8 +3,10 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include "mk_shared.cuh"
 #include "mk_launch.h"
+#include "dspine.h"
 
 using namespace mk;
 
@@ -424,6 +426,7 @@ struct MKEngine::Impl {
     int n_nat = 0; // Q3_K / IQ3_S tensors repacked to their native layouts
     double nat_s = 0;
     bool iq3s_grid_up = false;
+    bool iq2_grid_up = false;
 
     // The MTP block's source: the model file; a second GGUF (MKEngine's mtp argument: --mtp FILE, MK_MTP=FILE),
     // whose blk.<NL>.* tensors replace the model file's (its token_embd / output copies are not used: the MTP block shares
@@ -433,6 +436,17 @@ struct MKEngine::Impl {
     bool has_mtp = true;
     std::string mtp_desc = "model"; // (state-file key) "model", "none" or the --mtp file's identity
     int kv_slots = N_ATT_SLOTS;     // KV slots allocated (N_ATT_SLOTS - 1 without the MTP block: its slot is the last)
+    // DSpine drafter (dspine.cu; MK_DSPINE=FILE, --dspine): replaces the MTP layer, null: off. The megakernel / pf_run feed it
+    // the target's features (dsp_cap_inject / dsp_pf_*), dsp_draft fills Ctl::tok[1 ..] with fixed drafts.
+    struct Dsp;
+    std::shared_ptr<Dsp> dspine;
+    void dsp_init(const std::string & path);
+    void dsp_invalidate();
+    void dsp_inject(const __nv_bfloat16 * feat, int pos0, int M);
+    int dsp_draft(int nd);
+    void dsp_pf_stage(int L, int T);
+    void dsp_pf_inject(int n, int T, int lo);
+    void dsp_cap_inject(int p0, int M);
     static bool is_mtp_name(const std::string & n);
     const gguf::File & src_of(const std::string & name) const { return mtpf && is_mtp_name(name) ? *mtpf : file; }
 
@@ -442,7 +456,9 @@ struct MKEngine::Impl {
     // MK_MTP_Q4 re-quantisation of one tensor's rows to Q4_K (rs_to bytes per row into out)
     static void requant_q4k(const gguf::Tensor & t, uint8_t * out);
     static bool requant_type(uint32_t t) {
-        return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0 || t == gguf::IQ4_NL;
+        return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0 || t == gguf::IQ4_NL ||
+               t == gguf::IQ3_XXS || t == gguf::IQ2_XXS || t == gguf::IQ2_XS || t == gguf::IQ2_S || t == gguf::Q2_K ||
+               t == gguf::IQ1_M;
     }
     // The MTP block's re-quantisation (~2.5 s of CPU on UD-Q4_K_XL) runs on a background thread from early in the load
     // (rq_start; MK_LOAD_RQBG=0: inline); want() takes its results. Same rows, same calls, same bytes.
@@ -481,6 +497,9 @@ struct MKEngine::Impl {
     }
 
     const float * up_f32(const std::string & name, size_t expect);
+    // QSA metadata (qwen35.attention.indexer.{head_count,key_length,top_k}, attention.compress_ratios): fills hw.qsa_*,
+    // refusing a layout the kernels do not cover (ratios other than 4 on the attention layers)
+    void qsa_params(ModelW & w) const;
 
     Mat up_mat(const std::string & name, int K, int N, int to = -1);
     std::vector<std::vector<uint8_t>> own_keep; // want()'s copies, until the uploads are done (freed after the load)

@@ -18,6 +18,7 @@
 #endif
 #include <vector>
 
+#include "gguf.h"
 #include "llama.h"
 #include "logit_stats.h"
 #include "qwen38_mk.h"
@@ -34,6 +35,8 @@ static void usage() {
             "                 [--kv f16|q8|auto]   (KV cache format; auto: q8_0 only when fp16 does not fit)\n"
             "                 [--mtp file.gguf | --no-mtp]   (the MTP draft layer from another GGUF of this model / none:\n"
             "                     plain decoding, depth 0; default: the model file's, if it has one; env MK_MTP, MK_NO_MTP=1)\n"
+            "                 [--dspine file.gguf]   (the DSpine drafter, e.g. Qwen3.8-27B-DSpine-b16-GGUF: replaces the MTP layer; -d up to 7\n"
+            "                     (MK_MAXD=16 build: 15); not with --agents; env MK_DSPINE)\n"
             "                 [--kld ref [--ref-out f] [--score-path prefill|decode|mixed]]   (KL divergence, perplexity and\n"
             "                     top-token agreement against a reference file of tools/llama_ref or of --ref-out)\n"
             "                 [--kld-images f]   (with --kld: the reference's image rows, tools/vision_ref --images-out)\n"
@@ -213,6 +216,7 @@ static int run(int argc, char ** argv) {
         else if (a == "--draft-vocab") draft_vocab = next();
         else if (a == "--mtp") mtp = next();
         else if (a == "--no-mtp") mtp = "none";
+        else if (a == "--dspine") setenv("MK_DSPINE", next().c_str(), 1); // DSpine drafter GGUF (replaces the MTP layer; read by the engine)
         else if (a == "--bench-phases") bench_phases = true;
         else if (a == "--score") score_file = next();
         else if (a == "--kld") kld_file = next();
@@ -269,13 +273,14 @@ static int run(int argc, char ** argv) {
 
     // the tokenizer (libllama, vocab only) loads on a thread alongside the engine (MK_VOCAB_SERIAL=1: before it)
     llama_model * lm = nullptr;
+    const std::string vocab_path = gguf::tokenizer_path(model); // (a safetensors checkpoint: its vocab-only tokenizer.gguf)
     double vocab_s = 0;
     auto load_vocab = [&] {
         const auto t_vocab = std::chrono::steady_clock::now();
         llama_backend_init();
         llama_model_params mp = llama_model_default_params();
         mp.vocab_only = true;
-        lm = llama_model_load_from_file(model.c_str(), mp);
+        lm = llama_model_load_from_file(vocab_path.c_str(), mp);
         vocab_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_vocab).count();
     };
     struct VJoin {
