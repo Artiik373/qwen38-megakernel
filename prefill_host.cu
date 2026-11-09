@@ -30,9 +30,15 @@ inline void a2_plan(int T, int n0, int slots, size_t part_floats, int & nfull, i
 
 void MKEngine::Impl::pf_init() {
     if (pf_ready) return;
-    // MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch is ~0.33 MB per token
+    // MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch ~0.25 MB per token (MK_EXACT, every gate / up fused)
     int cap = 2048;
     if (const char * e = getenv("MK_PF_CAP")) cap = std::max(128, std::min(2048, atoi(e) / 128 * 128));
+    // MK_EXACT checkpoints keep the window rings: ring_snap_rows runs after a whole chunk, which must not wrap a ring
+    if (ring_bytes_ck > 0 && cap > hb.kvrc) {
+        fprintf(stderr, "[mk] MK_PF_CAP %d -> %d: MK_EXACT checkpoints keep the KV window rings, %d rows (MK_KV_WIN=%d), and a "
+                        "prefill chunk must not wrap them\n", cap, hb.kvrc / 128 * 128, hb.kvrc, hb.kvwin);
+        cap = hb.kvrc / 128 * 128;
+    }
     hp.cap = cap;
     mem_mark("before prefill scratch");
     hp.x = dalloc<float>((size_t) cap * D);
@@ -40,13 +46,15 @@ void MKEngine::Impl::pf_init() {
     hp.rs = dalloc<float>(cap);
     hp.xh = dalloc<__half>((size_t) cap * 2 * D); // GEMM inputs: K = D, VD (attention / delta-net out) or 2 D (MTP eh)
     hp.xh2 = dalloc<__half>((size_t) cap * FF);
-    hp.y0 = dalloc<float>((size_t) cap * FF);
+    bool all_fused = true;
+    for (int L = 0; L < NL; L++) all_fused &= glu_fused(hw.L[L].fg, hw.L[L].fu) || (glu_mix_on && glu_mix(hw.L[L].fg, hw.L[L].fu, 0));
+    // y0: [cap][FF] for the two-GEMM gate / up path (gate's output); every pair fused: QG, the most its other users need
+    y0_floats = (size_t) cap * (all_fused ? QG : FF);
+    hp.y0 = dalloc<float>(y0_floats);
     // y1: [cap][FF] for the two-GEMM gate / up path (up's fp32 output) and as a2_plan's tail-split partials (non-exact
     // mode: its capacity bounds the split count, i.e. the numerics, so it stays FF there). In MK_EXACT mode with every
     // gate / up pair fused (same-type or V2 mixed), y1's other users need VD floats per token (DeltaNet z; attention
     // k / v, 2 KVD; EXA partials, whose split is numerically free): 45 KB less per token. MK_PF_Y1=1: always FF.
-    bool all_fused = true;
-    for (int L = 0; L < NL; L++) all_fused &= glu_fused(hw.L[L].fg, hw.L[L].fu) || (glu_mix_on && glu_mix(hw.L[L].fg, hw.L[L].fu, 0));
     const bool y1full = getenv("MK_PF_Y1") && atoi(getenv("MK_PF_Y1")) == 1;
     y1_floats = (size_t) cap * (exact && all_fused && !y1full ? VD : FF);
     hp.y1 = dalloc<float>(y1_floats);
@@ -132,8 +140,9 @@ void MKEngine::Impl::pf_init() {
     }
     // MK_PFX (bits; a set bit keeps the old path): 1 pf_fork off, 2 pk_dn_scan (no pk_dn_tri / pk_dn_scan4), 4 pk_ab
     // after the DN in-projection join (not before it), 8 attention k on pf_s2 and v on pf_s3 next to q (not k then q on
-    // stream 0, v on pf_s2), 16 pk_ab (not pk_ab2)
+    // stream 0, v on pf_s2), 16 pk_ab (not pk_ab2), 64 pk_attn8 (not pk_attn9)
     if (const char * e = getenv("MK_PFX")) pfx_bits = atoi(e);
+    mkl::pk_attn_old = pfx_bits & 64 ? 1 : 0;
     pf_fork = !(pfx_bits & 1);
 #if MK_PF_INFCHK
     pf_fork = false; // (chk_set's site / layer are stream-ordered on stream 0)
@@ -231,6 +240,7 @@ void MKEngine::Impl::attn(int T, int n, int slot, int r0) {
             mkl::pk_attn8<false, true, true, 5, 5>(grid, T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
         else if (hb.kvb[0][slot] != 8)
             mkl::pk_attn8<false, true, true>(grid, T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
+        else if (hb.kvb[1][slot] == 8) mkl::pk_attn8<false, false, true, 0, 8>(grid, T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
         else mkl::pk_attn8<false, false, true>(grid, T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
         if (N > p.nfull) mkl::pk_attn8_combx(N - p.nfull, T, n, p.nfull, p.S, ex_segt, p.h, r0, pt.first, pt.second, p.nA);
         return;
@@ -253,6 +263,7 @@ void MKEngine::Impl::attn(int T, int n, int slot, int r0) {
             if (kv_k6v5(slot)) mkl::pk_attn8<false, true, false, 6, 5>(grid, T, n, slot, nfull, S, hp.y1, r0);
             else if (kv_k5v5(slot)) mkl::pk_attn8<false, true, false, 5, 5>(grid, T, n, slot, nfull, S, hp.y1, r0);
             else if (kl) mkl::pk_attn8<false, true>(grid, T, n, slot, nfull, S, hp.y1, r0);
+            else if (hb.kvb[1][slot] == 8) mkl::pk_attn8<false, false, false, 0, 8>(grid, T, n, slot, nfull, S, hp.y1, r0);
             else mkl::pk_attn8<false, false>(grid, T, n, slot, nfull, S, hp.y1, r0);
         } else if (s8 && attn_s8 == 2) {
             if (kl) mkl::pk_attn8<true, true>(grid, T, n, slot, nfull, S, hp.y1, r0);
@@ -300,28 +311,28 @@ void MKEngine::Impl::chk_mat(const Mat & m) { // a GEMM's site and layer, from i
 
 void MKEngine::Impl::chk_report(int npos) {
     static const char * const nm[pf::CHK_SITES] = {"attn_q", "attn_k", "attn_v", "attn_o", "dn_qkv", "dn_gate", "dn_out", "ffn_gate",
-                                                  "ffn_up", "ffn_down", "mtp_eh", "head", "in norm_quant", "in dn_out",
-                                                  "in mtp_in", "in attn_gate", "in silu*up"};
+                                                  "ffn_up", "ffn_down", "mtp_eh", "head", "in norm_quant", "in dn_out", "in mtp_in",
+                                                  "in attn_gate", "in silu*up", "dn_scan S", "dn_scan K S", "dn_scan U", "dn_scan U d"};
     constexpr int NL_ = pf::CHK_LAYERS, NS = pf::CHK_SITES;
     std::vector<unsigned long long> c((size_t) NL_ * NS * 2);
     CK(mkl::get_chk_cnt(c.data(), c.size() * sizeof(unsigned long long)));
-    unsigned long long t[2][2] = {{0, 0}, {0, 0}}; // [GEMM | input][kind]
+    unsigned long long t[3][2] = {{0, 0}, {0, 0}, {0, 0}}; // [GEMM | input | DeltaNet scan operand][kind]
     for (int l = 0; l < NL_; l++)
         for (int s = 0; s < NS; s++)
-            for (int k = 0; k < 2; k++) t[s >= pf::CHK_IN_NORM][k] += c[((size_t) l * NS + s) * 2 + k];
+            for (int k = 0; k < 2; k++) t[(s >= pf::CHK_IN_NORM) + (s >= pf::CHK_DN_S)][k] += c[((size_t) l * NS + s) * 2 + k];
     fprintf(stderr, "[mk] MK_PF_INFCHK prefill of %d positions: GEMM fp16 partial sums inf/NaN %llu, non-finite GEMM outputs %llu;"
-                    " fp16 GEMM inputs clamped (|v| > 65504) %llu, NaN (stored as -65504) %llu\n", npos, t[0][0], t[0][1], t[1][0], t[1][1]);
+                    " fp16 GEMM inputs clamped (|v| > 65504) %llu, NaN (stored as -65504) %llu; DeltaNet scan fp16 operands |v| > 65504"
+                    " (not clamped: inf from 65520) %llu, NaN %llu\n", npos, t[0][0], t[0][1], t[1][0], t[1][1], t[2][0], t[2][1]);
     for (int s = 0; s < NS; s++) {
         unsigned long long a[2] = {0, 0};
         std::string where;
         for (int l = 0; l < NL_; l++) {
             const unsigned long long x = c[((size_t) l * NS + s) * 2], y = c[((size_t) l * NS + s) * 2 + 1];
-            a[0] += x;
-            a[1] += y;
+            a[0] += x, a[1] += y;
             if ((x || y) && where.size() < 120) where += " L" + std::to_string(l) + ":" + std::to_string(x) + "/" + std::to_string(y);
         }
         if (a[0] || a[1])
-            fprintf(stderr, "[mk]   %-14s %s %llu, %s %llu  (layer:counts%s)\n", nm[s], s < pf::CHK_IN_NORM ? "partials" : "clamped", a[0],
+            fprintf(stderr, "[mk]   %-14s %s %llu, %s %llu  (layer:counts%s)\n", nm[s], s < pf::CHK_IN_NORM ? "partials" : "> 65504", a[0],
                     s < pf::CHK_IN_NORM ? "outputs" : "NaN", a[1], where.c_str());
     }
     std::fill(c.begin(), c.end(), 0ull);
@@ -708,7 +719,7 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
 #endif
             pf_norm_quant(hp.x, hw.onorm, T);
             std::vector<float> rows;
-            const int tile = std::min(128, cap * FF / VOCAB); // logits rows that fit in y0
+            const int tile = (int) std::min<size_t>(128, y0_floats / VOCAB); // logits rows that fit in y0
             for (int s = 0; s < T; s += tile) {
                 const int nt = std::min(tile, T - s);
                 const int lo = std::max(s, first - n); // rows from lo on are at positions >= first

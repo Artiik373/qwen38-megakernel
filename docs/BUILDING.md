@@ -197,35 +197,48 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 - **Every GPU check in one run:** `scripts/gate.sh -m <gguf> --record <dir>` on a build you trust keeps its outputs in
   `<dir>` as a reference; `scripts/gate.sh -m <gguf> --ref <dir>` on the next build runs the same checks and requires
   every output to equal the reference's (`make gate MK_MODEL=<gguf> GATE_ARGS="--ref <dir>"` builds first). It runs
-  `make check`, the exactness checks below, MK_EXACT=1 with a prefill cap below two staging slots, sampled CLI runs at
+  `make check`, the exactness checks below, MK_EXACT=1 with a prefill cap below two staging slots on q8_0, D and F, sampled CLI runs at
   0 and 7 drafts (with a presence penalty and a draft-chain policy), the four bench prompts' greedy ids at 0, 4 and 7
   drafts, parallel slots against solo runs (`bench/slots_bench.py`: 4 and 2 slots, the MTP window, a slot prefilled
-  between the others' steps) and their sampled outputs, the C API checks (`scripts/capi_checks.py`: errors, roll-backs
-  and out-of-memory kept inside the free VRAM), and with `--kld-ref <file>` the KL report against llama.cpp;
+  between the others' steps) and their sampled outputs, the C API checks (`scripts/capi_checks.py`: errors, roll-backs,
+  out-of-memory kept inside the free VRAM, the state after a resume, a branch, a park and a side request, bitwise
+  against a fresh prefill on q8_0, D, F and with `MK_KV_WIN=1024`, a step right after a restore from a park or a side
+  request refused until a prefill, and an `MK_EXACT` slot's prompt fed in short chunks keeping its checkpoint), and
+  with `--kld-ref <file>` the KL report against llama.cpp, q8_0, D and F;
   `--model2 <gguf>` adds a second model. Each check prints ok / FAIL / skip (the C API leg skips when none of its cases
   can run); the exit status is 1 if one failed, 2 for bad arguments, a stale build or an `--out` that holds a recorded
   reference. A reference is kept only if all its own checks passed, and holds for the GPU, driver, model files and
   `MK_*` environment it was recorded with (the manifest names them, `MK_MODEL` and `MK_API_KEY` aside): another model
   is refused, another environment is a FAIL, and a check the reference did not run is a skip with a NOTE. Linux or
-  WSL2, the GPU to itself, about 16 minutes on an RTX 3090.
+  WSL2, the GPU to itself, about 75 minutes on an RTX 3090, most of it the exactness checks. Not in it: the sampled
+  distribution tests ([BENCHMARKS.md](BENCHMARKS.md#speculation): one-off runs), a prefill stopped because its client
+  left, and Windows against Linux (below).
 - **Kernels without a model:** `make check` builds and runs the benches' self-checks. `bench/wvgemm_bench check` tests
   its own tensor-core verify kernel (a counterpart of `wv.cuh`, not the engine's code) for bit-identical output at
   every token count, and it and the engine's dp4a GEMVs (copied from `mk_shared.cuh` and `qwen38_mk.cu` by
   `bench/wv_extract.py` first) against fp64 within error bounds (rms 1e-5 and max 1e-4 of the rows' rms; |wv - dp4a|
   at most 1e-4; a NaN fails). `bench/dattn_bench` with `TINV=1` tests its own, older copies of the decode attention
-  kernels (up to 5 tokens) for bit-identical output across variants and token counts, at 4 and 5 tokens. Either exits
-  1 on a failure.
+  kernels (up to 5 tokens) for bit-identical output across variants and token counts, at 4 and 5 tokens.
+  `bench/mmq_bench check` tests the engine's own prefill GEMM kernels (`prefill_gemm.cuh`, on random data in the engine's
+  layouts) against a scalar fp64 reference (relative error at most 3e-3), and tile sizes bit for bit.
+  `bench/attn_bench` tests the engine's prefill attention kernel (`prefill_attn.cuh`, on random data in the engine's KV
+  layouts, past the q8 window) bit for bit against the one it replaced, `pk_attn8`. Each exits 1 on a failure.
 - **Server tests:** `python -m pytest -q tests` runs without a GPU, against fake engines (the CI runs it on Python 3.10,
-  3.11 and 3.12).
+  3.11 and 3.12). It and the GGUF parser's check are all the CI runs: nothing there touches a GPU.
 - **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed and randomly corrupted files under
-  AddressSanitizer and UBSan (CPU only, Linux).
+  AddressSanitizer and UBSan (CPU only, Linux; the CI runs it as the `gguf-fuzz` job).
 - **Exactness:** `python3 scripts/exactness.py -m <gguf>` (or `make exactness MK_MODEL=<gguf>`; Windows:
   `python scripts\exactness.py -m <gguf>`) checks the README's [exact output](../README.md#exact-output) claims on the
   GPU: greedy ids identical at 0, 4 and 7 drafts and without the MTP
-  layer, the exact-reuse state digest and ids independent of the prefill chunk size, and a warm server's follow-up,
-  edited and sampled replies equal to a fresh server's (a check whose runs drafted nothing or reused nothing fails: it
-  would prove nothing). It needs the GPU to itself (11 model loads), prints PASS / FAIL per check, exits 1 on a failure
-  and writes every result to `exactness-out/exactness.json`.
+  layer, over up to 2,048 tokens at no drafts and 7, and under five draft policies; the exact-reuse state digest and ids
+  independent of the prefill chunk size; a warm server's follow-up, edited and sampled replies equal to a fresh server's,
+  at 32k and at ~100k with the launchers' settings; parked conversations, a side request and resumed sessions equal to a
+  fresh server's; a follow-up at ~255k on preset F; and with `--agents 1` a prompt fed in slot prefill chunks of 100
+  tokens getting the greedy reply it gets fed whole. Each per-cache check runs on q8_0 and on presets D and F
+  (`--presets`), past their 8-bit window. A check whose runs drafted nothing, reused nothing, stopped short of 1,000
+  tokens or never parked fails: it would prove nothing. It needs the GPU to itself (about 55 minutes on an RTX 3090;
+  `--legs` narrows it), prints PASS / FAIL per check, exits 1 on a failure and writes every result to
+  `exactness-out/exactness.json`.
 - **Accuracy against llama.cpp:** `tools/llama_ref` writes a reference file, and
   `./qwen38_mk -m <gguf> --kld <ref> --score-path mixed --kv q8` scores the engine against it
   ([BENCHMARKS.md](BENCHMARKS.md#against-llamacpp) has the full recipe and the expected numbers).
@@ -246,7 +259,8 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   `mk_launch.h`, `qwen38_mk.h` (the API), `gguf.h`: shared ([ENGINE.md](ENGINE.md#files) has what each file holds)
 - `capi.cpp`: the C API of `libqwen38mk.so` / `qwen38mk.dll` (and the keep-warm thread)
 - `main.cu`: the `qwen38_mk` CLI; `logit_stats.h`: the accuracy comparison shared by the CLI and the tools
-- `server/mk_server.py`: the HTTP server
+- `server/mk_server.py`: the HTTP server's entry point; the other `server/mk_*.py`: the rest of it
+  ([ENGINE.md](ENGINE.md#files) has what each file holds)
 - `scripts/serve.sh`, `scripts/serve.bat`: the launchers (Linux / WSL2, Windows)
 - `Makefile`; `build.ps1`, `compat_win32.h` / `.cpp`, `vision/win32.h` / `.cpp`: the Windows build and its POSIX / Win32
   shims (compiled only on Windows)

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""GPU checks of the C API: engine errors and their roll-backs, penalties, policies (scripts/gate.sh runs them).
+"""GPU checks of the C API: engine errors and their roll-backs, penalties, policies, the state digest after a reuse
+(scripts/gate.sh runs them).
 usage: capi_checks.py <libqwen38mk.so> <model.gguf> <draft_vocab> [case ...]
 
 It runs the given cases (default: every case), each in its own process, and prints one verdict each: PASS, FAIL, or
@@ -24,7 +25,8 @@ import sys
 import tempfile
 
 LIB, MODEL, DV = sys.argv[1:4]
-CASES = ("penalty", "slots_dup", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy", "model_values")
+CASES = ("penalty", "slots_dup", "slot_ck", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy",
+         "model_values", "digest_q8", "digest_D", "digest_F", "digest_W1024", "park_step")
 PROMPT = b"<|im_start|>user\nWrite a short poem about a lighthouse.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 vp, ip = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
 SKIP_RC = 77  # a case's exit code for SKIP (automake's convention)
@@ -282,6 +284,43 @@ def case_slots_dup(L):
     ok &= check(len(slot_seq(L, h, 0)) == fed, "the refused mixed step fed no prompt chunk")
     ok &= check(L.mk_slot_prefill(h, 0, 1 << 30) == 0, "slot 0: its prompt still prefills", L)
     ok &= check(slot_steps(L, h, [0, 1, 2, 3], 2), "slots 0-3: 2 more batched steps", L)
+    L.mk_free(h)
+    return ok
+
+
+def slot_ids(L, h, slot, k):
+    """the next k tokens slot emits alone (None: a step failed or its context is full)"""
+    sa, out, cnt, got = (ctypes.c_int * 1)(slot), (ctypes.c_int * 16)(), (ctypes.c_int * 1)(), []
+    while len(got) < k:
+        if L.mk_slots_step(h, sa, 1, out, 16, cnt) != 0 or cnt[0] <= 0:
+            return None
+        got += out[:cnt[0]]
+    return got[:k]
+
+
+def case_slot_ck(L):
+    # MK_EXACT: a slot prompt fed in chunks whose last chunk would be <= 32 tokens past a grid point (it used to save no
+    # checkpoint, so a repeat of the prompt reused nothing): the chunk before it takes them, which changes no row
+    os.environ["MK_EXACT"] = "1"
+    h = new(L)
+    if not check(bool(h), "engine", L):
+        return False
+    text = reuse_text(20)
+    buf = (ctypes.c_int * 4096)()
+    n = L.mk_tokenize(h, text, len(text), buf, 4096)
+    ok = check(n >= 100, f"the prompt has {n} >= 100 tokens", L)
+    toks = (ctypes.c_int * 100)(*buf[:100])
+    ok &= check(L.mk_slots_open2(h, 2, 4096, 0) > 0, "slots_open 2 x 4096", L)
+    ok &= check(L.mk_slot_begin2(h, 0, toks, 100, 0.0, 1.0, 20, 0.0, 1, 0, 0) == 0, "slot 0: begin 100 tokens", L)
+    left = [L.mk_slot_prefill(h, 0, 32) for _ in range(3)]
+    ok &= check(left == [68, 36, 0], f"slot 0 fed with budget 32: {left} left after each call (68, 36, 0: the third "
+                                     "chunk takes the 4 tokens past 96)", L)
+    ok &= check(begin(L, h, 1, toks, 100), "slot 1: begin + the whole prompt in one call", L)
+    got = [slot_ids(L, h, s, 16) for s in (0, 1)]
+    ok &= check(got[0] is not None and got[0] == got[1], f"chunked and whole: the same 16 greedy ids ({got[0]} / {got[1]})", L)
+    for s in (0, 1):
+        r = L.mk_slot_begin2(h, s, toks, 100, 0.0, 1.0, 20, 0.0, 1, 0, 0)
+        ok &= check(r == 96, f"slot {s}: the prompt again resumes at its checkpoint at 96 (reused {r})", L)
     L.mk_free(h)
     return ok
 
@@ -559,6 +598,284 @@ def case_policy(L):
     ok &= check(bool(h), "without it the engine starts", L)
     if h:
         L.mk_free(h)
+    return ok
+
+
+def case_park_step(L):
+    # mk_step right after mk_unpark / mk_side_end with drafts the last cycle accepted not yet in the DeltaNet state: the
+    # device holds another sequence's replay rows, so the step is refused until a prefill, which then continues the
+    # conversation exactly as without the park (qwen38_mk.h, park)
+    L.mk_store_budget.argtypes = [vp, ctypes.c_longlong]
+    L.mk_set_sampling.argtypes = [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_ulonglong]
+    L.mk_park.argtypes = [vp, ctypes.c_int]
+    L.mk_unpark.argtypes = [vp, ctypes.c_int]
+    L.mk_reset.argtypes = [vp]
+    L.mk_side_begin.argtypes = [vp]
+    L.mk_side_end.argtypes = [vp]
+    L.mk_committed.argtypes = [vp]
+    L.mk_sequence.argtypes = [vp, ip, ctypes.c_int]
+    h = new(L)
+    if not check(bool(h), "engine", L):
+        return False
+    L.mk_store_budget(h, 2 * GiB)
+    L.mk_set_sampling(h, 0.0, 1.0, 0, 0.0, 0)
+    out = (ctypes.c_int * 16)()
+
+    def tok(text):
+        buf = (ctypes.c_int * (len(text) + 16))()
+        n = L.mk_tokenize(h, text, len(text), buf, len(text) + 16)
+        assert n > 0, err(L)
+        return list(buf[:n])
+
+    def feed(toks):
+        first = L.mk_prefill(h, (ctypes.c_int * len(toks))(*toks), len(toks))
+        assert first >= 0, err(L)
+        return first
+
+    def decode(first, n=48):
+        got = [first]
+        while len(got) < n:
+            k = L.mk_step(h, out, 16)
+            assert k > 0, err(L)
+            got += list(out[:k])
+        return got[:n]
+
+    def pending():  # accepted drafts the next step replays from the DeltaNet ring (position - committed)
+        return L.mk_sequence(h, None, 0) - 1 - L.mk_committed(h)
+
+    toks, _ = ids(L, h)
+    feed(list(toks))
+    for _ in range(32):
+        assert L.mk_step(h, out, 16) > 0, err(L)
+        if pending() > 0:
+            break
+    if pending() <= 0:
+        skip("no decode cycle accepted a draft in 32 steps (no MTP layer?): nothing pending to test")
+        L.mk_free(h)
+        return None
+    note(f"{pending()} accepted drafts pending")
+    pids = [L.mk_park(h, 0), L.mk_park(h, 0)]
+    if not check(min(pids) > 0, f"parked twice (ids {pids})", L):
+        L.mk_free(h)
+        return False
+    more = tok(b"<|im_end|>\n<|im_start|>user\nNow one about the sea.<|im_end|>\n<|im_start|>assistant\n")
+    other = tok(b"<|im_start|>user\nName three rivers.<|im_end|>\n<|im_start|>assistant\n")
+    want = decode(feed(more))  # (the conversation continued without a park)
+    L.mk_reset(h)
+    decode(feed(other), 16)
+    ok = check(L.mk_unpark(h, pids[0]) == 0, "another conversation ran, the parked one is back", L)
+    ok &= check(L.mk_step(h, out, 16) < 0 and "prefill first" in err(L), "mk_step right away: refused", L)
+    ok &= check(decode(feed(more)) == want, "after a prefill: the 48 greedy ids of the conversation never parked")
+    ok &= check(L.mk_unpark(h, pids[1]) == 0 and L.mk_side_begin(h) == 0, "back again, kept aside for a side request", L)
+    decode(feed(other), 16)
+    ok &= check(L.mk_side_end(h) == 1, "the side request ran, the conversation is back", L)
+    ok &= check(L.mk_step(h, out, 16) < 0 and "prefill first" in err(L), "mk_step right away: refused", L)
+    ok &= check(decode(feed(more)) == want, "after a prefill: the 48 greedy ids of the conversation never parked")
+    L.mk_free(h)
+    return ok
+
+
+def reuse_text(functions):
+    lines = ["Explain what each of these functions computes.", "", "```python"]
+    for i in range(1, functions + 1):
+        lines += [f"def step_{i}(x, y):", f"    return (x * {i} + y) % {997 + i}", ""]
+    return "\n".join(lines + ["```"]).encode()
+
+
+def digest_reuse(L, env):
+    """Exact reuse in the sequence state itself: every K / V row, window-ring row and DeltaNet / conv state after a resume at
+    a checkpoint, a resume after a branch, a park and restore and a side request, bitwise against a fresh prefill of the
+    same tokens, and the next 64 greedy ids."""
+    os.environ.update({"MK_EXACT": "1", "MK_CK_SLOTS": "8", **env})
+    L.mk_prefill_cks.argtypes = [vp, ip, ctypes.c_int, ip, ctypes.c_int, ctypes.c_int]
+    L.mk_state_digest.argtypes = [vp, ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int]
+    L.mk_checkpoints.argtypes = [vp, ip, ctypes.c_int]
+    L.mk_rewind_to.argtypes = [vp, ctypes.c_int]
+    L.mk_reset.argtypes = [vp]
+    L.mk_set_sampling.argtypes = [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_ulonglong]
+    L.mk_store_budget.argtypes = [vp, ctypes.c_longlong]
+    L.mk_park.argtypes = [vp, ctypes.c_int]
+    L.mk_unpark.argtypes = [vp, ctypes.c_int]
+    L.mk_side_begin.argtypes = [vp]
+    L.mk_side_end.argtypes = [vp]
+    L.mk_kv_sizes.argtypes = [vp] + [ctypes.POINTER(ctypes.c_longlong)] * 4
+    h = new(L, 32768)
+    if not check(bool(h), "the engine starts", L):
+        return False
+    sizes = [ctypes.c_longlong() for _ in range(4)]
+    L.mk_kv_sizes(h, *[ctypes.byref(x) for x in sizes])
+    if env and not check(sizes[1].value > 0, "the preset took effect: the window rings exist"):
+        return False
+    L.mk_store_budget(h, 8 * GiB)
+    L.mk_set_sampling(h, 0.0, 1.0, 0, 0.0, 0)
+
+    def tok(text):
+        buf = (ctypes.c_int * (len(text) + 16))()
+        n = L.mk_tokenize(h, text, len(text), buf, len(text) + 16)
+        assert n > 0, err(L)
+        return list(buf[:n])
+
+    def feed(toks, cks=()):
+        arr = (ctypes.c_int * len(toks))(*toks)
+        ca = (ctypes.c_int * max(len(cks), 1))(*cks)
+        first = L.mk_prefill_cks(h, arr, len(toks), ca, len(cks), -1)
+        assert first >= 0, err(L)
+        return first
+
+    def digest():
+        n = L.mk_state_digest(h, None, 0)
+        assert n > 0, err(L)
+        a = (ctypes.c_ulonglong * n)()
+        L.mk_state_digest(h, a, n)
+        return list(a)
+
+    def decode(first, n=64):
+        out, got = (ctypes.c_int * 16)(), [first]
+        for _ in range(n):
+            if len(got) >= n:
+                break
+            k = L.mk_step(h, out, 16)
+            assert k >= 0, err(L)
+            got += list(out[:k])
+        return got[:n]
+
+    def resume(toks, at_most):
+        """back to the last checkpoint at or before at_most, the rest of toks again: the position"""
+        n = L.mk_checkpoints(h, None, 0)
+        a = (ctypes.c_int * max(n, 1))()
+        L.mk_checkpoints(h, a, n)
+        ck = max([c for c in a[:n] if 0 < c <= at_most], default=0)
+        assert ck and L.mk_rewind_to(h, ck) == 0, f"no checkpoint at or before {at_most}: {list(a[:n])} ({err(L)})"
+        return ck, feed(toks[ck:])
+
+    toks = tok(reuse_text(400))
+    N = len(toks)
+    grid = list(range(1024, N, 1024))
+    note(f"{N} tokens, checkpoints asked at every 1024, rings {sizes[1].value / MiB:.0f} MiB")
+    ok = check(N > 4096, "the prompt is past the window")
+    first = feed(toks, grid)
+    fresh, ids0 = digest(), decode(first)
+    ck, first = resume(toks, N - 1)
+    ok &= check(digest() == fresh, f"after decoding, a resume at {ck} and the rest again: state bitwise equal to the fresh prefill")
+    ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    M = N - 900  # a branch: the same prompt up to M, then other tokens
+    other = toks[:M] + tok(reuse_text(40))[:900]
+    ck, first = resume(other, M)
+    branched = digest()
+    decode(first)
+    ck2, first = resume(toks, M)
+    ok &= check(digest() == fresh, f"back from a branch at {M} by the checkpoint at {ck2}: state bitwise equal to the fresh prefill")
+    ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    L.mk_reset(h)
+    feed(other, grid)
+    ok &= check(digest() == branched, f"the branch resumed at {ck}: state bitwise equal to its own fresh prefill")
+    L.mk_reset(h)
+    first = feed(toks, grid)
+    ok &= check(digest() == fresh, "a second fresh prefill: state bitwise equal to the first")
+    pid = L.mk_park(h, 2)
+    if not check(pid > 0, f"parked (id {pid})", L):
+        L.mk_free(h)
+        return False
+    L.mk_reset(h)
+    decode(feed(tok(reuse_text(60))))
+    if not check(L.mk_unpark(h, pid) >= 0, "restored", L):
+        L.mk_free(h)
+        return False
+    ok &= check(digest() == fresh, "parked, another conversation run, restored: state bitwise equal to the fresh prefill")
+    ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    L.mk_reset(h)
+    first = feed(toks, grid)
+    if not check(L.mk_side_begin(h) == 0, "the conversation is kept aside", L):
+        L.mk_free(h)
+        return False
+    decode(feed(tok(reuse_text(60))))
+    ok &= check(L.mk_side_end(h) == 1, "a side request ran and the conversation is back", L)
+    ok &= check(digest() == fresh, "after the side request: state bitwise equal to the fresh prefill")
+    ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    L.mk_free(h)
+    return ok
+
+
+def case_digest_q8(L):
+    return digest_reuse(L, {})
+
+
+def case_digest_D(L):
+    return digest_reuse(L, {"MK_KV": "K*=6,V*=5", "MK_KV_WIN": "2048"})
+
+
+def case_digest_F(L):
+    return digest_reuse(L, {"MK_KV": "K*=5r,V*=5", "MK_KV_WIN": "2048"})
+
+
+def case_digest_W1024(L):
+    """MK_EXACT with MK_KV_WIN=1024: window rings of 1952 rows, shorter than the default prefill chunk (2048), which the
+    engine then caps at 1920. Resumes at checkpoints inside a chunk (1024: its window starts at 0; 3072), each bitwise
+    against the fresh prefill: a checkpoint's ring rows of a chunk longer than the ring held other positions' rows."""
+    os.environ.update({"MK_EXACT": "1", "MK_CK_SLOTS": "8", "MK_KV": "K*=6,V*=5", "MK_KV_WIN": "1024"})
+    os.environ.pop("MK_PF_CAP", None)
+    L.mk_prefill_cks.argtypes = [vp, ip, ctypes.c_int, ip, ctypes.c_int, ctypes.c_int]
+    L.mk_state_digest.argtypes = [vp, ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int]
+    L.mk_checkpoints.argtypes = [vp, ip, ctypes.c_int]
+    L.mk_rewind_to.argtypes = [vp, ctypes.c_int]
+    L.mk_set_sampling.argtypes = [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_ulonglong]
+    L.mk_kv_sizes.argtypes = [vp] + [ctypes.POINTER(ctypes.c_longlong)] * 4
+    h = new(L, 32768)
+    if not check(bool(h), "the engine starts", L):
+        return False
+    sizes = [ctypes.c_longlong() for _ in range(4)]
+    L.mk_kv_sizes(h, *[ctypes.byref(x) for x in sizes])
+    if not check(sizes[1].value > 0, "the preset took effect: the window rings exist"):
+        L.mk_free(h)
+        return False
+    L.mk_set_sampling(h, 0.0, 1.0, 0, 0.0, 0)
+    text = reuse_text(400)
+    buf = (ctypes.c_int * (len(text) + 16))()
+    N = L.mk_tokenize(h, text, len(text), buf, len(text) + 16)
+    assert N > 0, err(L)
+    toks = list(buf[:N])
+
+    def feed(t, cks=()):
+        arr = (ctypes.c_int * len(t))(*t)
+        ca = (ctypes.c_int * max(len(cks), 1))(*cks)
+        first = L.mk_prefill_cks(h, arr, len(t), ca, len(cks), -1)
+        assert first >= 0, err(L)
+        return first
+
+    def digest():
+        n = L.mk_state_digest(h, None, 0)
+        assert n > 0, err(L)
+        a = (ctypes.c_ulonglong * n)()
+        L.mk_state_digest(h, a, n)
+        return list(a)
+
+    def decode(first, n=64):
+        out, got = (ctypes.c_int * 16)(), [first]
+        for _ in range(n):
+            if len(got) >= n:
+                break
+            k = L.mk_step(h, out, 16)
+            assert k >= 0, err(L)
+            got += list(out[:k])
+        return got[:n]
+
+    def checkpoints():
+        n = L.mk_checkpoints(h, None, 0)
+        a = (ctypes.c_int * max(n, 1))()
+        L.mk_checkpoints(h, a, n)
+        return list(a[:n])
+
+    ok = check(N > 4096, f"the prompt ({N} tokens) is past two prefill chunks")
+    first = feed(toks, (1024, 3072))
+    fresh, ids0 = digest(), decode(first)
+    for P in (3072, 1024):  # (the later one first: a rewind keeps the checkpoints before it)
+        if not check(P in checkpoints() and L.mk_rewind_to(h, P) == 0, f"back to the checkpoint at {P}", L):
+            L.mk_free(h)
+            return False
+        first = feed(toks[P:])
+        ok &= check(digest() == fresh, f"a resume at {P} and the rest again: state bitwise equal to the fresh prefill")
+        ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    L.mk_free(h)
     return ok
 
 

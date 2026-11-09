@@ -367,11 +367,15 @@ static const char * const kPhName[PH_COUNT] = {
 // MK_PROF_DUMP: one launch's raw stamps, times in ns (56-bit globaltimer, wrap-safe like prof_collect): per barrier its
 // phase, end (after the launch start), duration, fill mark and every block's arrival (after the phase start; -1: none,
 // barriers >= 1024 keep no arrivals). MK_PROF_DUMP_N = k > 1: launches MK_PROF_DUMP .. + k - 1, each to MK_PROF_DUMP_FILE.<n>
-// (a phase's minimum over several launches filters the occasional whole-GPU pause)
+// (a phase's minimum over several launches filters the occasional whole-GPU pause). %p in MK_PROF_DUMP_FILE becomes the
+// process id: Nsight Compute's application replay runs the program once per pass, and each pass keeps its own stamps
 static void prof_dump(const std::vector<unsigned long long> & pr, long n, int T, int nsm, bool multi) {
     const unsigned long long M = (1ull << 56) - 1;
     const char * env = getenv("MK_PROF_DUMP_FILE");
-    const std::string ps = env ? (multi ? std::string(env) + "." + std::to_string(n) : std::string(env)) : std::string();
+    std::string ps = env ? env : "";
+    const std::string pid = std::to_string((long) getpid());
+    for (size_t i = ps.find("%p"); i != std::string::npos; i = ps.find("%p", i + pid.size())) ps.replace(i, 2, pid);
+    if (env && multi) ps += "." + std::to_string(n);
     const char * path = env ? ps.c_str() : nullptr;
     FILE * f = path ? fopen(path, "w") : stderr;
     if (!f) {
@@ -700,6 +704,7 @@ void MKEngine::Impl::reset() {
     memset(&hctl, 0, sizeof(hctl));
     CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
     CK(cudaMemset(hb.cnt, 0, 16));
+    stale_replay = stale_pcnt = false;
 }
 
 
@@ -707,6 +712,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
                    const std::string & mtp)
     : p_(nullptr), n_draft_(n_draft) {
     if (n_draft < 0 || n_draft > MAXD - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXD - 1) + "]");
+    if (ctx < 1) throw std::runtime_error("context of " + std::to_string(ctx) + " positions (-c): expected at least 1");
     if (mkl::abi_sig() != mk_abi_sig())
         throw std::runtime_error("engine build: the device object (qwen38_mk.cu) was compiled with other settings than the host files: rebuild both");
     p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode, mtp);
@@ -844,7 +850,8 @@ void MKEngine::set_n_draft(int n) {
     }
     if (n < 0 || n > p_->n_draft_cap)
         throw std::runtime_error("set_n_draft: 0 .. " + std::to_string(p_->n_draft_cap) + " (the engine's construction depth)");
-    p_->n_draft_max = p_->ndraft = p_->nd_avail = n;
+    p_->n_draft_max = p_->ndraft = n;
+    p_->nd_avail = std::min(p_->nd_avail, n); // (the drafts the last launch made, not more: tok[] / dq past them are stale)
     n_draft_ = n;
 }
 
@@ -1111,6 +1118,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
     }
     p_->all_acc = true;
     p_->last_acc = p_->nd_avail;
+    p_->stale_replay = p_->stale_pcnt = false;
     CK(cudaGetLastError());
 #if MK_SPEC_LOG
     p_->slog_drafts();
@@ -1327,6 +1335,11 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
             nd_avail = ngk;
         }
     }
+    // (after book_set: kvgb is read for accepted drafts not folded in, dq to verify sampled drafts, pcnt for penalties)
+    if ((stale_replay && (c.dn_c < c.n || (nd_avail > 0 && c.dsmp && smp_temp > 0.f))) ||
+        (stale_pcnt && (pen_pres != 0.f || pen_freq != 0.f)))
+        throw std::runtime_error("step: the sequence was brought back (unpark / side_end) without the state this "
+                                 "step reads (DeltaNet replay rows, the drafts' q', penalty counts): prefill first");
     // verify the previous launch's drafts, minus any that would put this launch's rows across an
     // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
     // T >= 6 runs as one MAXT-row pass (padding rows): the whole n + 1 .. n + MAXT must lie in one partition, else at most 5
@@ -1334,9 +1347,18 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
 #if MK_MAXD > 8
     if (T > MAXT && pol.tier > 0.f && !dspine) { // the deep pass only when drafts MAXT.. are worth it (Policy::tier; not for DSpine: no MTP confidences)
         float cp = 1.f, e = 0.f;
-        for (int k = 0; k < T - 1; k++) {
-            cp *= c.dconf[k];
-            if (k >= MAXT - 1) e += cp;
+        if (c.dsmp && smp_temp > 0.f) {
+            // sampled drafts, sampled verify: dconf[k >= MAXT] (pass k is fed draft k) and the draft count follow
+            // draft MAXT's own value, and verifying drafts MAXT.. by them biases the output (as chain=2's drop gates:
+            // launch). Only what was fixed before draft MAXT was drawn: dconf[0 .. MAXT - 1], the last repeated up to
+            // the drafting launch's depth
+            for (int k = 0; k < MAXT; k++) cp *= c.dconf[k];
+            for (int k = MAXT - 1; k < ndraft; k++, cp *= c.dconf[MAXT - 1]) e += cp;
+        } else {
+            for (int k = 0; k < T - 1; k++) {
+                cp *= c.dconf[k];
+                if (k >= MAXT - 1) e += cp;
+            }
         }
         if (e < pol.tier) T = MAXT;
     }
@@ -1360,6 +1382,7 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
     const int n_old = c.n;
     launch(MODE_DECODE, T, 0);
     ctl_fetch(c);
+    stale_replay = false; // (this launch wrote the replay rows and q' the next one reads)
     if (dspine) { // rows 0 .. n_acc of this launch are committed: their features go into the drafter's ring, then the next block
         static const bool dprof = getenv("MK_DSPINE_TIME") != nullptr; // acceptance per draft position, every 50 cycles
         if (dprof) {

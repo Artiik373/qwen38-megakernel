@@ -2,9 +2,9 @@
 import base64
 import contextlib
 import http.client
-import importlib.util
 import io
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -15,16 +15,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from server_modules import load as _load_mk_server
+
 ROOT = Path(__file__).resolve().parent.parent
-
-
-def _load_mk_server():
-    path = ROOT / "server" / "mk_server.py"
-    spec = importlib.util.spec_from_file_location("mk_server_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 class MegakernelServerParsingTests(unittest.TestCase):
@@ -263,8 +256,12 @@ class MegakernelVisionTests(unittest.TestCase):
         text, media = self._media([img, img])
         self.assertEqual((text, len(media)), (m + m, 2))
         self.assertEqual(media[0][:4], bytes([0x89, 0x50, 0x4E, 0x47]))  # (the decoded data: URL)
-        # a message without images keeps its parts
-        self.assertIsInstance(self._media([{"type": "text", "text": "a"}])[0], list)
+        # a message without images is flattened the same way: its text parts joined by newlines, not run together
+        self.assertEqual(self._media([{"type": "text", "text": "a"}])[0], "a")
+        self.assertEqual(self._media([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])[0], "a\nb")
+        self.assertEqual(self._media([{"type": "text", "text": ""}, {"text": "b"}, {"type": "text", "text": "c"}])[0],
+                         "b\nc")
+        self.assertEqual(self._media([])[0], "")
 
     def test_remote_image_urls_are_rejected(self) -> None:
         with self.assertRaises(self.mk.BadRequest):
@@ -1218,6 +1215,18 @@ class AnthropicTests(_HttpCase):
                          self.THINK)
         self.assertEqual(o["content"], [{"type": "thinking", "thinking": "Hmm.", "signature": ""}, {"type": "text", "text": "Four"}])
 
+    def test_thinking_budget_is_noted_as_not_enforced(self) -> None:
+        def keys(thinking):
+            notes = []
+            self.mk.anthropic_to_chat({"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], "thinking": thinking},
+                                      notes)
+            return [k for k, _ in notes]
+        self.assertEqual(keys({"type": "enabled", "budget_tokens": 1024}), ["anthropic-thinking-budget"])
+        self.assertEqual(keys({"type": "adaptive", "budget_tokens": 1024}), ["anthropic-thinking-budget"])
+        self.assertEqual(keys({"type": "enabled"}), [])
+        self.assertEqual(keys({"type": "disabled", "budget_tokens": 1024}), [])
+        self.assertEqual(keys(None), [])
+
     def test_streaming_events(self) -> None:
         base = {"model": "claude-x", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], "stream": True}
         _, ev = self._msg(_ScriptEngine(["\n", "Hmm", ".\n", "</think>", "\n\nLet me look.\n\n"]
@@ -1527,6 +1536,16 @@ class ChatTemplateOptionTests(_HttpCase):
         self.assertEqual((code, [c.args for c in calls]), (None, [("file", str(d / "ok.jinja"))]), err)
         self.assertIn("chat template: " + str(d / "ok.jinja"), err)
         self.assertEqual(self._main()[0:3:2], (None, []))  # (no option: the GGUF's, nothing read)
+
+    def test_agents_keep_one_checkpoint_slot_for_the_engines_own_sequence(self) -> None:
+        # (its 1024 positions run the warm-up only; each slot has a pool of its own, MK_SLOT_CK)
+        keys = ("MK_CK_SLOTS", "MK_PF_CAP", "MK_EXACT")
+        clean = {k: v for k, v in os.environ.items() if k not in keys}
+        for argv, preset, want in ((("--agents", "2"), None, "1"), (("--parallel", "2"), None, "1"),
+                                   (("--agents", "2"), "4", "4"), ((), None, None)):
+            with mock.patch.dict(os.environ, {**clean, **({"MK_CK_SLOTS": preset} if preset else {})}, clear=True):
+                code, err, _ = self._main(*argv)
+                self.assertEqual((code, os.environ.get("MK_CK_SLOTS")), (None, want), (argv, preset, err))
 
 
 # === con: the console (log lines with request numbers, the live status line) ===

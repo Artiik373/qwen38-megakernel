@@ -327,6 +327,7 @@ int mk_slots_open2(void * hp, int n, int ctx, int seg_tokens) {
 int mk_slots_open(void * hp, int n, int ctx) { return mk_slots_open2(hp, n, ctx, 0); }
 
 // slot <- the prompt (temp 0: greedy), reusing what it can: returns the reused count (or -1); mk_slot_prefill feeds the rest
+// (MK_EXACT: a bit-exact follow-up needs two calls, see MKEngine::slot_begin in qwen38_mk.h)
 int mk_slot_begin2(void * hp, int slot, const int * toks, int n, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
                    int share_len, int pin) {
     try {
@@ -684,7 +685,9 @@ void mk_kv_sizes(void * hp, long long * per_token, long long * rings, long long 
 int mk_side_begin(void * hp) {
     return guarded(hp, [](MKEngine * e) { return e->side_begin() ? 0 : 1; });
 }
-// 1 the kept sequence is back, 0 it was dropped (the store ran full; the engine is reset), -1 error (dropped too)
+// 1 the kept sequence is back, 0 it was dropped (the store ran full; the engine is reset), -1 error (dropped too).
+// Then (as after mk_side_unpark, mk_unpark) continue with a prefill: mk_step right away only where qwen38_mk.h
+// says (park)
 int mk_side_end(void * hp) {
     return guarded(hp, [](MKEngine * e) { return e->side_end(); });
 }
@@ -719,7 +722,8 @@ int mk_park(void * hp, int max_checkpoints) {
         return id < 0 ? -3 : id;
     });
 }
-// the engine becomes parked conversation id (entry freed): 0, or -1 (no such entry / error)
+// the engine becomes parked conversation id (entry freed): 0, or -1 (no such entry / error); then a prefill
+// (mk_side_end)
 int mk_unpark(void * hp, int id) {
     return guarded(hp, [&](MKEngine * e) {
         if (e->unpark(id)) return 0;
