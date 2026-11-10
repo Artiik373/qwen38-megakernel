@@ -5681,7 +5681,7 @@ __device__ __noinline__ void sample_targets_ol(int mode, int top_k, float temp, 
 // priority (the weight loads' evict_first lines go first). ib / nib: the block's index among the call's idle blocks /
 // their count. Hints only.
 __device__ __forceinline__ void attn_idle_pf(const Mat & m, int ib, int nib) {
-    if (!m.fm) return;
+    if (!m.fm || ait_type(m.type)) return;
     constexpr int NP = D / 16 * WV_S;
 #if MK_L2_TUNE
     const int nsb = m.K >> 8, ch = nsb / WV_S, ub = wv_ubytes(m.type), lpu = min(((ch - 1) * ub + 127) / 128, cL2.attn);
@@ -7169,7 +7169,6 @@ __global__ void kw_warm(const unsigned * stop, unsigned long long ns, int spin) 
 
 } // namespace
 
-#include "dspine.cuh"
 namespace dsp {
 cudaError_t set_capture(__nv_bfloat16 * buf, const int * lay, int n) {
     cudaError_t e = cudaMemcpyToSymbol(::g_dsp_f, &buf, sizeof buf);

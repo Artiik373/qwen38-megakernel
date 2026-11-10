@@ -24,6 +24,7 @@
 #if defined(__has_include)
 #if __has_include("mk_build_info.h")
 #include "mk_build_info.h"
+#include "vocab_only.h"
 #endif
 #endif
 #ifndef MK_BUILD_COMMIT
@@ -271,7 +272,7 @@ void * mk_new_mtp(const char * model, int ctx, int n_draft, const char * draft_v
         llama_model_params mp = llama_model_default_params();
         mp.vocab_only = true;
         h = new Handle;
-        h->lm = llama_model_load_from_file(gguf::tokenizer_path(model).c_str(), mp);
+        h->lm = llama_model_load_from_file(gguf::vocab_path(gguf::tokenizer_path(model)).c_str(), mp);
         if (!h->lm) throw std::runtime_error("failed to load the vocabulary");
         h->vocab = llama_model_get_vocab(h->lm);
         h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode, mtp ? mtp : "");

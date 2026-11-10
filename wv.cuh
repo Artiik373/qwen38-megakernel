@@ -620,8 +620,10 @@ struct WvXS {
     const float4 * md;
     const float2 * mx;
     const float4 * mx4; // q6 fills: per (j, n, tq) the bits of MAGIC - 32 qsum of (token a, chunk 0), (b, 0), (a, 1), (b, 1)
+    const __half * xr = nullptr; // AI+ matrices (ait_wv.cuh): the block's rotated fp16 activations, indexed by absolute K
 };
 template <int NG> struct WvAcc { float v[NG][4]; };
+#include "ait_wv.cuh"
 // a tile's running sums carried across the K sub-chunk fills of a batched pass wider than MAXT rows (wv_tile_st): a, and
 // v1 the FM Q6_K k16 form's chunk-1 sums; finished once after the last sub-chunk (wv_st_fin), so every token's fmaf chain
 // is the whole-K tile's: the same bits as a solo launch
@@ -642,7 +644,7 @@ __host__ __device__ constexpr int wv_smem() {
 // min2: mx = the MIN 2 accumulator inputs (bits of MAGIC - 32 qsum) instead of dx qsum (the matrix is an offset type)
 // q6 (q32 fills): also the per-chunk qsum table mx4 of the FM Q6_K tiles' m16n8k16 form
 template <int T, bool X16, int US>
-__device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * sxo = nullptr, bool min2 = false, bool q6 = false) {
+__device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * sxo = nullptr, bool min2 = false, bool q6 = false, const AitSet ait = AitSet()) {
     using C = WvCfg<T, X16>;
     constexpr int LDU = US + 2;
     static_assert(wv_smem<US, T, X16>() <= SM_MISC, "wv activations");
@@ -739,7 +741,9 @@ __device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * 
         sxo->xm = xm;
         sxo->U = LDU;
     }
-    return WvXS{reinterpret_cast<const int8_t *>(xa), reinterpret_cast<const int8_t *>(xb), LDU * 16, md, mx, mx4};
+    const __half * xr = nullptr;
+    if (ait.n > 0) { ait_rot_fill(q, T, u0, US, ait); xr = ait_xr(); } // (ends with a __syncthreads)
+    return WvXS{reinterpret_cast<const int8_t *>(xa), reinterpret_cast<const int8_t *>(xb), LDU * 16, md, mx, mx4, xr};
 }
 
 // wv_fill's view (the same addresses) rebuilt from its token stride ldu = US + 2 units, for the out-of-line wv_tile: a
@@ -978,6 +982,7 @@ __device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile(const Mat m, int tile, 
 template <int T, bool X16>
 __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
     const int ldu = xs.ld / 16;
+    if (ait_type(m.type)) return ait_tile<T, X16>(m, tile, sb0, nsb, xs);
     if constexpr (!X16) // FM Q6_K in the q32 phases (m16n8k16 form; the phase's fill was q6)
         if (m.type == T_Q6K) return wv_tile<T_Q6K, T, false>(m, tile, sb0, nsb, ldu);
     if constexpr (X16) { // ffn_down: the offset types too
@@ -1013,12 +1018,29 @@ __host__ __device__ constexpr int wv_ubytes(int t) {
                       : 16 * wv_bs(t);
 }
 __device__ __forceinline__ void pf_l2n(const void * p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
+// AI+ (ait_wv.cuh): the 256-K super-block sb of 16-row tile `tile` to L2, one 128-B line per lane. AIT5_U: its two 128-K
+// units (1312 B each). AIT3 / AIT4: the 1024 k-byte half chunk the super-block reads (both 16-row tiles of the 32-row group)
+__device__ __forceinline__ void ait_pf(const Mat & m, int tile, int sb) {
+    const int lane = threadIdx.x & 31;
+    const uint8_t * p;
+    int bytes;
+    if (m.type == T_AIT5U) {
+        p = m.w + ((int64_t) tile * (m.K / 128) + 2 * sb) * ai5d_unit_bytes(5);
+        bytes = 2 * ai5d_unit_bytes(5);
+    } else {
+        const int k = m.type == T_AIT3 ? 3 : 4;
+        p = m.w + ((int64_t) (tile >> 1) * (m.K / 512) + (sb >> 1)) * aitd_chunk_bytes(k) + (int64_t) (sb & 1) * 1024 * k;
+        bytes = 1024 * k;
+    }
+    if (128 * lane < bytes) pf_l2n(p + 128 * lane);
+}
 // Phase top: the warp's first weight unit (tile, sb) of m to L2, one 128-B line per lane (the whole unit, <= 32 lines),
 // issued before the activation fill: the fill reads only L2-resident activations, so DRAM idled through it (~2.5-7 us at
 // T8, ~12 us at T16) and the weight stream started cold after it. ~3-4 MB per phase (one unit per warp; normal priority:
 // the weight loads' evict_first lines go first). part / nparts: that share of the unit only (attn_kv_rh's row halves).
 // Addresses stay inside the tile's own units.
 __device__ __forceinline__ void wv_pf_unit(const Mat & m, int tile, int sb, int part = 0, int nparts = 1) {
+    if (ait_type(m.type)) { ait_pf(m, tile, sb); return; }
     const int lane = threadIdx.x & 31, ub = wv_ubytes(m.type), pb = ub / nparts;
     if (128 * lane >= pb) return;
     const size_t nsb = (size_t) (m.K >> 8), off = ((size_t) tile * nsb + sb) * ub + part * pb + 128 * lane;
@@ -1162,7 +1184,7 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
         }
         // (published by wv_fill's barrier)
     }
-    const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.qkv.type == T_Q6K || W.gate.type == T_Q6K);
+    const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.qkv.type == T_Q6K || W.gate.type == T_Q6K, ait_set(W.qkv, W.gate));
     const float * s_rs = misc(nullptr);
     float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
     const int n_ab = AB_SPLIT * 2 * NVH;
@@ -1329,7 +1351,7 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
         const int j = i0 - (w == 0 ? 0 : w == 1 ? nq : nq + nkk), ns = w == 0 ? 1 : w == 1 ? sk : sv;
         wv_pf_unit(w == 0 ? W.q : w == 1 ? W.k : W.v, j / ns, 0, j - j / ns * ns, ns);
     }
-    const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.q.type == T_Q6K || W.k.type == T_Q6K || W.v.type == T_Q6K);
+    const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.q.type == T_Q6K || W.k.type == T_Q6K || W.v.type == T_Q6K, ait_set(W.q, W.k, W.v));
     const float * s_rs = misc(nullptr);
     int lo = 0;
     if (!W.q.fm) {
@@ -1471,7 +1493,7 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
     }
     const bool gw = W.fg.fm, uw = W.fu.fm;
     if (t0 + (NW - 1 - warp) < t1 && (gw || uw)) wv_pf_unit(gw ? W.fg : W.fu, t0 + (NW - 1 - warp), 0); // (its first pair)
-    const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.fg.type == T_Q6K || W.fu.type == T_Q6K);
+    const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.fg.type == T_Q6K || W.fu.type == T_Q6K, ait_set(W.fg, W.fu));
     const float * s_rs = misc(nullptr);
     for (int j = t0 + (NW - 1 - warp); j < t1; j += NW) {
         float act[T];
@@ -1548,7 +1570,7 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
     const int t0 = NTILE * ch.bi / ch.G, t1 = NTILE * (ch.bi + 1) / ch.G;
     if (t0 + (NW - 1 - warp) < t1) wv_pf_unit(Wm, t0 + (NW - 1 - warp), CH * kc); // (its first tile; during the C1 wait)
     if (role & 2) c1_wait(kc); // (C1: ffn_down after ffn_gu_wv's c1 dealing, no grid barrier: this chunk's tiles of in)
-    const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false, nullptr, X16 && wv_min2(Wm.type), !X16 && Wm.type == T_Q6K);
+    const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false, nullptr, X16 && wv_min2(Wm.type), !X16 && Wm.type == T_Q6K, ait_set(Wm));
     unsigned * cnt = cB.wvcnt + (role & 1) * (D / 32); // (role bit 1: the C1 wait above)
     float * x = cB.x;
     for (int tile = t0 + (NW - 1 - warp); tile < t1; tile += NW) {
@@ -1914,6 +1936,17 @@ __device__ __noinline__ WvSt<T, false> wv_tile_st6(const Mat m, int tile, int sb
 // out of the calls, which then carry only the 8 sums of st.a)
 template <int T, bool X16, bool Q6>
 __device__ __forceinline__ void wv_tile_any_st(const Mat & m, int tile, int sb0, int nsb, int us, WvSt<T, X16> & st) {
+    if (ait_type(m.type)) { // AI+: the block's rotated scratch (ait_rot_fill of this sub-chunk's range) is indexed by absolute K
+        WvXS axs{};
+        axs.xr = ait_xr();
+        const WvAcc<WvCfg<T, X16>::NG> r = ait_tile<T, X16>(m, tile, sb0, nsb, axs);
+        const bool own = !X16 || (threadIdx.x & 3) < 2; // (X16: wv_st_fin adds the xor-2 lane; the tq >= 2 lanes hold nothing)
+#pragma unroll
+        for (int n = 0; n < WvCfg<T, X16>::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) st.a.v[n][c] += own ? r.v[n][c] : 0.f;
+        return;
+    }
     if constexpr (Q6 && !X16)
         if (m.type == T_Q6K) {
             st = wv_tile_st6<T>(m, tile, sb0, nsb, us, st);
@@ -2079,6 +2112,7 @@ __device__ __forceinline__ LaneT<8> rows16_dp_x8(const Mat & m, int j, int grp) 
 // phases fill once). Normal L2 priority: the lines are read once, within microseconds
 template <bool X16>
 __device__ __forceinline__ void wv_pf_next(const Mat & m, int tile, int sb) {
+    if (ait_type(m.type)) { ait_pf(m, tile, sb); return; }
     const int lane = threadIdx.x & 31;
 #if MK_L2_TUNE
     if (lane >= cL2.ck) return;
@@ -2123,6 +2157,7 @@ __device__ __noinline__ void attn_proj_ck(const LayerW & W) {
         const int s0 = NSB * c / NCH, s1 = NSB * (c + 1) / NCH;
         if (have && c > 0) wv_pf_next<false>(m, lt, s0);
         wv_fill_ck<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, q6);
+        if (ait_type(W.q.type) || ait_type(W.k.type) || ait_type(W.v.type)) ait_rot_fill(cB.qn, T, 8 * s0, 8 * (s1 - s0), ait_set(W.q, W.k, W.v));
         if (have) {
 #if MK_TY_Q8_0
             if (ns > 1) st.a = attn_kv_rh_st<T>(m, lt, rh, s0, s1 - s0, US, st.a);
@@ -2276,6 +2311,7 @@ __device__ __noinline__ void dn_proj_ck(const LayerW & W, int dl, RowTab rt) {
         const int s0 = NSB * c / NCH, s1 = NSB * (c + 1) / NCH;
         if (have) wv_pf_next<false>(m, lt, s0);
         wv_fill_ck<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, q6);
+        if (ait_type(W.qkv.type) || ait_type(W.gate.type)) ait_rot_fill(cB.qn, T, 8 * s0, 8 * (s1 - s0), ait_set(W.qkv, W.gate));
         if (have) wv_tile_any_st<T, false, true>(m, lt, s0, s1 - s0, US, st);
     }
     if (have) {
@@ -2322,6 +2358,7 @@ __device__ __noinline__ WvGU<WvCfg<T, false>::NG> ffn_gu_ck_sums(const LayerW & 
         if (uw) wv_pf_next<false>(W.fu, j, s0);
         if constexpr (Q6) wv_fill_ck_inl<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, true);
         else wv_fill_ck<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, false, c == 0);
+        if (ait_type(W.fg.type) || ait_type(W.fu.type)) ait_rot_fill(cB.qn, T, 8 * s0, 8 * (s1 - s0), ait_set(W.fg, W.fu));
         if (gw) wv_tile_any_st<T, false, Q6>(W.fg, j, s0, s1 - s0, US, sg);
         if (uw) wv_tile_any_st<T, false, Q6>(W.fu, j, s0, s1 - s0, US, su);
     }
@@ -2492,6 +2529,7 @@ __device__ __noinline__ void wv_ck_x16(const Mat & m, const QBuf & in, int tile,
             wv_fill_ck_inl<T, true, US>(in, 8 * (CH * kc + s0), 8 * (s1 - s0), wv_min2(TYPE), false);
         else
             wv_fill_ck<T, true, US>(in, 8 * (CH * kc + s0), 8 * (s1 - s0), wv_min2(TYPE), false);
+        if (ait_type(m.type)) ait_rot_fill(in, T, 8 * (CH * kc + s0), 8 * (s1 - s0), ait_set(m));
         if (have) {
             const WvXS xs = wv_xs_ck<T, true>(US);
             if constexpr (TYPE == T_Q6K) {
@@ -2506,8 +2544,25 @@ __device__ __noinline__ void wv_ck_x16(const Mat & m, const QBuf & in, int tile,
     resid_ck_part<T, true>(wv_st_fin<T, true, true>(st, TYPE), tile, kc);
     resid_ck_last<T>(tile, wnext, role);
 }
+// AI+ (ait_wv.cuh) ffn_down / out in the sub-chunk form: the rotated fill of each sub-chunk, ait_tile sums carried in st
+template <int T, int K>
+__device__ __noinline__ void wv_ck_x16_ait(const Mat & m, const QBuf & in, int tile, int kc, bool have, const float * wnext, int role) {
+    constexpr int NSB = K / 256, CH = NSB / WV_S, CSB = wv_csb<T, true, CH>(), NCH = (CH + CSB - 1) / CSB, US = 8 * CSB;
+    WvSt<T, true> st;
+    wv_st_zero<T, true>(st);
+#pragma unroll 1
+    for (int c = 0; c < NCH; c++) {
+        const int s0 = CH * c / NCH, s1 = CH * (c + 1) / NCH;
+        ait_rot_fill(in, T, 8 * (CH * kc + s0), 8 * (s1 - s0), ait_set(m));
+        if (have) wv_tile_any_st<T, true, true>(m, tile, CH * kc + s0, s1 - s0, US, st);
+    }
+    if (!have) return;
+    resid_ck_part<T, true>(wv_st_fin<T, true, true>(st, m.type), tile, kc);
+    resid_ck_last<T>(tile, wnext, role);
+}
 template <int T, int K>
 __device__ __forceinline__ void wv_ck_x16_any(const Mat & m, const QBuf & in, int tile, int kc, bool have, const float * wnext, int role) {
+    if (ait_type(m.type)) { wv_ck_x16_ait<T, K>(m, in, tile, kc, have, wnext, role); return; }
     switch (m.type) {
         case T_Q6K: wv_ck_x16<T_Q6K, T, K>(m, in, tile, kc, have, wnext, role); return;
         MK_IF(MK_TY_Q3K, case T_Q3K: wv_ck_x16<T_Q3K, T, K>(m, in, tile, kc, have, wnext, role); return;)
@@ -2552,6 +2607,7 @@ __device__ __noinline__ void resid_wv_ck(const Mat & Wm, const QBuf & in, const 
             const int s0 = CH * c / NCH, s1 = CH * (c + 1) / NCH;
             if (have && c > 0) wv_pf_next<false>(Wm, tile, CH * kc + s0);
             wv_fill_ck<T, false, US>(in, 8 * (CH * kc + s0), 8 * (s1 - s0), false, q6);
+            if (ait_type(Wm.type)) ait_rot_fill(in, T, 8 * (CH * kc + s0), 8 * (s1 - s0), ait_set(Wm));
             if (have) wv_tile_any_st<T, false, true>(Wm, tile, CH * kc + s0, s1 - s0, US, st);
         }
         if (!have) return;

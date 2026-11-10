@@ -461,7 +461,7 @@ struct MKEngine::Impl {
     // MK_MTP_Q4 re-quantisation of one tensor's rows to Q4_K (rs_to bytes per row into out)
     static void requant_q4k(const gguf::Tensor & t, uint8_t * out);
     static bool requant_type(uint32_t t) {
-        return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0 || t == gguf::IQ4_NL ||
+        return t == gguf::Q5_0 || t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0 || t == gguf::IQ4_NL ||
                t == gguf::IQ3_XXS || t == gguf::IQ2_XXS || t == gguf::IQ2_XS || t == gguf::IQ2_S || t == gguf::Q2_K ||
                t == gguf::IQ1_M;
     }

@@ -5,6 +5,7 @@
 // MK_DSPINE=FILE (the CLI's --dspine) turns it on; the MTP layer is then off. Not built or run on a GPU when written.
 
 #include "engine_impl.h"
+#include "dspine.cuh" // (the drafter's kernels: this TU, not the megakernel's, so tuning them rebuilds in seconds)
 #include <chrono>
 
 struct MKEngine::Impl::Dsp {

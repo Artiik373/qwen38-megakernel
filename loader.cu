@@ -90,6 +90,22 @@ void reencode_q40_q80(const uint8_t * src, uint8_t * out, int64_t K) {
     }
 }
 
+// Q5_0 row (22 B blocks: fp16 d | u32 qh | 16 bytes, element j = low nibble of byte j + bit j of qh << 4, element j + 16 =
+// high nibble + bit j + 16 of qh << 4; value d * (q - 16)) -> Q8_0 with the same d and q - 16 (the MTP block's tensors)
+void reencode_q50_q80(const uint8_t * src, uint8_t * out, int64_t K) {
+    for (int64_t b = 0; b < K / 32; b++) {
+        const uint8_t * s = src + b * 22;
+        uint8_t * o = out + b * 34;
+        uint32_t qh;
+        memcpy(&qh, s + 2, 4);
+        memcpy(o, s, 2);
+        for (int j = 0; j < 16; j++) {
+            o[2 + j] = (uint8_t) (int8_t) (((s[6 + j] & 0xf) | (((qh >> j) & 1) << 4)) - 16);
+            o[2 + j + 16] = (uint8_t) (int8_t) (((s[6 + j] >> 4) | (((qh >> (j + 16)) & 1) << 4)) - 16);
+        }
+    }
+}
+
 // GGUF IQ4_XS blocks (136 B: fp16 d, u16 scales_h, u8 scales_l[4], u8 qs[128]) -> the layout rows_iq4x and the
 // prefill GEMM read: pairs of blocks in 272 B (16-byte aligned, no padding): the two 8-byte GGUF headers, then
 // each block's 128 index bytes in Q4_K order (see rows_iq4x). nblocks must be even.
@@ -568,7 +584,7 @@ auto MKEngine::Impl::want(const std::string & name, int to) -> Src {
     const bool to_q4 = !to_f32 && req_q4 && requant_type(t.type);
     const bool to_q6 = !to_f32 && !to_q4 && ((reenc3 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S)) || t.type == gguf::IQ1_M);
     // native IQ4_NL unless MK_IQ4NL_Q8; Q4_0 (outside the MTP block) always (the kernels do not read it)
-    const bool to_q8 = !to_f32 && !to_q4 && ((t.type == gguf::IQ4_NL && getenv("MK_IQ4NL_Q8")) || t.type == gguf::Q4_0);
+    const bool to_q8 = !to_f32 && !to_q4 && ((t.type == gguf::IQ4_NL && getenv("MK_IQ4NL_Q8")) || t.type == gguf::Q4_0 || t.type == gguf::Q5_0);
     if (!to_f32 && !to_q4 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
     const ggml_type from = (ggml_type) t.type;
     const ggml_type dst = to_f32 ? GGML_TYPE_F32 : to_q4 ? GGML_TYPE_Q4_K : to_q6 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
@@ -606,6 +622,7 @@ auto MKEngine::Impl::want(const std::string & name, int to) -> Src {
         }
         if (to_q6) reencode_q6k(t.type, src, f.data(), out, K);
         else if (t.type == gguf::Q4_0) reencode_q40_q80(src, out, K);
+        else if (t.type == gguf::Q5_0) reencode_q50_q80(src, out, K);
         else reencode_iq4nl_q80(src, out, K);
         g.resize((size_t) K);
         tr_dst->to_float(out, g.data(), K);
@@ -1011,6 +1028,24 @@ Mat MKEngine::Impl::up_mat(const std::string & name, int K, int N, int to) {
             m.w = dput<uint8_t>(qd, qn, &S);
             m.d = (const __half *) dput<uint16_t>(md, mn / 2, &S);
         }
+    } else if (t.type == gguf::AIT3 || t.type == gguf::AIT4 || t.type == gguf::AIT5_U) {
+        // llamAmpere AI+: the bytes as stored (ait_dec.cuh). Tile types also get the compact column scales (K halves).
+        const bool tile = t.type != gguf::AIT5_U;
+        if (tile ? (K % 1024 || N % 32 || N < 1024) : (K % 128 || N % 16))
+            throw std::runtime_error(name + ": AI+ shape " + std::to_string(K) + " x " + std::to_string(N) + " is not supported");
+        m.rb = (int) gguf::type_row_bytes(t.type, K);
+        m.w = dput<uint8_t>(t.data, t.nbytes);
+        if (tile) {
+            const int k = t.type == gguf::AIT3 ? 3 : 4;
+            const size_t cb = 32 * (64 * (size_t) k + 2);
+            own_keep.emplace_back((size_t) K * 2); // (the upload reads it later: it lives in own_keep until the load ends)
+            uint16_t * cs = reinterpret_cast<uint16_t *>(own_keep.back().data());
+            for (int kc = 0; kc < K; kc++)
+                memcpy(&cs[kc], t.data + (((size_t) ((kc & 511) >> 4) * (K / 512) + (kc >> 9)) * cb + 2048 * (size_t) k + 32 + 2 * (kc & 15)), 2);
+            m.d = (const __half *) dput<uint16_t>(cs, (size_t) K);
+        }
+        m.fm = 1; // read through wv_tile_any (ait_wv.cuh)
+        keep(t);
     } else {
         throw std::runtime_error(name + ": unsupported quant type " + std::to_string(t.type));
     }
@@ -1353,7 +1388,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                                  " (see README: the GGUF)");
     };
     auto needq = [&](const std::string & name, int got) {
-        need(name, got, {T_Q4K, T_Q5K, T_Q5_1, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL, T_Q3K, T_IQ3S, T_IQ3XXS, T_IQ2S, T_Q2K, T_NVF4});
+        need(name, got, {T_Q4K, T_Q5K, T_Q5_1, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL, T_Q3K, T_IQ3S, T_IQ3XXS, T_IQ2S, T_Q2K, T_NVF4, T_AIT3, T_AIT4, T_AIT5U});
         if (!mk_built(got)) throw std::runtime_error(name + " is " + tname(got) + ": this build has no kernels for it (make MK_TYPES)");
     };
     if (const char * e = getenv("MK_MTP_Q4")) {
@@ -1897,6 +1932,15 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     hb.cnt = dalloc<unsigned>(4);
     hb.ctl = dalloc<Ctl>(1);
     hb.wvpart = dalloc<float>((size_t) WV_S * RMAX * D);
+    {
+        bool any_ait = false;
+        for (int i = 0; i < (has_mtp ? NLA : NL); i++) {
+            const LayerW & L = hw.L[i];
+            for (const Mat * m : {&L.q, &L.k, &L.v, &L.o, &L.qkv, &L.gate, &L.sout, &L.fg, &L.fu, &L.fd})
+                any_ait = any_ait || m->type == T_AIT3 || m->type == T_AIT4 || m->type == T_AIT5U;
+        }
+        hb.xrot = any_ait ? dalloc<__half>((size_t) nsm * MAXD * FF) : nullptr;
+    }
     hb.wvcnt = dalloc<unsigned>(2 * (D / 32), DA_INIT0); // (starts at 0; the last arrival of each use resets it)
     profiling = getenv("MK_PROFILE") != nullptr;
     hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;

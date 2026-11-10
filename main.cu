@@ -22,6 +22,7 @@
 #include "llama.h"
 #include "logit_stats.h"
 #include "qwen38_mk.h"
+#include "vocab_only.h"
 
 static void usage() {
     fprintf(stderr,
@@ -273,7 +274,7 @@ static int run(int argc, char ** argv) {
 
     // the tokenizer (libllama, vocab only) loads on a thread alongside the engine (MK_VOCAB_SERIAL=1: before it)
     llama_model * lm = nullptr;
-    const std::string vocab_path = gguf::tokenizer_path(model); // (a safetensors checkpoint: its vocab-only tokenizer.gguf)
+    const std::string vocab_path = gguf::vocab_path(gguf::tokenizer_path(model)); // (a safetensors checkpoint: its vocab-only tokenizer.gguf)
     double vocab_s = 0;
     auto load_vocab = [&] {
         const auto t_vocab = std::chrono::steady_clock::now();

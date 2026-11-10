@@ -1,5 +1,6 @@
 // MKEngine::Impl: the batched prefill's host side (chunks, the GEMM / attention launches, checkpoints on the way).
 
+#include "ait_prefill.h"
 #include "engine_impl.h"
 
 namespace {
@@ -46,6 +47,14 @@ void MKEngine::Impl::pf_init() {
     hp.rs = dalloc<float>(cap);
     hp.xh = dalloc<__half>((size_t) cap * 2 * D); // GEMM inputs: K = D, VD (attention / delta-net out) or 2 D (MTP eh)
     hp.xh2 = dalloc<__half>((size_t) cap * FF);
+    {
+        bool any_ait = false;
+        for (int L = 0; L < NL; L++)
+            for (const Mat * m : {&hw.L[L].q, &hw.L[L].k, &hw.L[L].v, &hw.L[L].o, &hw.L[L].qkv, &hw.L[L].gate, &hw.L[L].sout, &hw.L[L].fg,
+                                  &hw.L[L].fu, &hw.L[L].fd})
+                any_ait = any_ait || m->type == T_AIT3 || m->type == T_AIT4 || m->type == T_AIT5U;
+        hp.xrot = any_ait ? dalloc<__half>((size_t) 3 * AIT_PF_PIECE * FF) : nullptr;
+    }
     bool all_fused = true;
     for (int L = 0; L < NL; L++) all_fused &= glu_fused(hw.L[L].fg, hw.L[L].fu) || (glu_mix_on && glu_mix(hw.L[L].fg, hw.L[L].fu, 0));
     // y0: [cap][FF] for the two-GEMM gate / up path (gate's output); every pair fused: QG, the most its other users need
@@ -340,6 +349,12 @@ void MKEngine::Impl::chk_report(int npos) {
 }
 #endif
 void MKEngine::Impl::gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0, const __half * xin, cudaStream_t st) {
+    if (m.type == T_AIT3 || m.type == T_AIT4 || m.type == T_AIT5U) { // AI+ (ait_prefill.cu): its own rotate + decode GEMM
+        const int si = st != 0 && st == pf_s2 ? 1 : st != 0 && st == pf_s3 ? 2 : 0; // (one rotated scratch per prefill stream)
+        ait_prefill_gemm(m.w, m.d, m.type, m.K, m.N, (xin ? xin : hp.xh) + (size_t) t0 * m.K, ntok, hp.xrot + (size_t) si * AIT_PF_PIECE * FF, y,
+                         ldy, mode == pf::OUT_ADD, st);
+        return;
+    }
     pf_shape_check(m, pf::BM);
 #if MK_PF_INFCHK
     chk_mat(m);

@@ -92,10 +92,10 @@ if (& $want "engine") {
     }
     # the device code and its launchers; ptxas register / spill report for every phase function goes to ptxas.log (as with make)
     Build-Cu "qwen38_mk.cu" @("mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "prefill.cuh",
-                              "prefill_gemm.cuh", "prefill_attn.cuh", "wv.cuh", "wv_dev.cuh", "dspine.h", "dspine.cuh") "ptxas.log"
+                              "prefill_gemm.cuh", "prefill_attn.cuh", "wv.cuh", "wv_dev.cuh", "dspine.h", "ait_wv.cuh", "ait_core.cuh", "ait_dec.cuh") "ptxas.log"
     # the host side, same flags (the shared definitions must agree)
-    $hostSrc = @("engine.cu", "ck_pool.cu", "loader.cu", "prefill_host.cu", "state_files.cu", "host_store.cu", "lanes.cu", "dspine.cu")
-    $hostHdr = @("engine_impl.h", "mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "loader.cuh", "wv_host.cuh", "dspine.h")
+    $hostSrc = @("engine.cu", "ck_pool.cu", "loader.cu", "prefill_host.cu", "ait_prefill.cu", "state_files.cu", "host_store.cu", "lanes.cu", "dspine.cu")
+    $hostHdr = @("engine_impl.h", "mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "loader.cuh", "wv_host.cuh", "dspine.h", "dspine.cuh", "ait_prefill.h", "ait_core.cuh", "ait_wv.cuh", "ait_dec.cuh")
     foreach ($s in $hostSrc) { Build-Cu $s $hostHdr "" }
     $engineObj = @("build_win\qwen38_mk.obj") + ($hostSrc | ForEach-Object { "build_win\" + [IO.Path]::GetFileNameWithoutExtension($_) + ".obj" })
     Write-Def "capi.cpp" "mk_" "qwen38mk.dll" "build_win\qwen38mk.def"

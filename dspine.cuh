@@ -66,6 +66,179 @@ __device__ __forceinline__ float block_sum(float v, float * red) {
     return s;
 }
 
+// ---- Q4_K on tensor cores: Y[m][n] (+)= sum_k W[n][k] X[m][k], m < 16 (one grid.y step), K a multiple of 256 ----
+// A warp owns 8 weight rows (the MMA's n) and all 16 X rows (its m): the X fragments are loaded once per 8 weight rows
+// (the scalar kernel loaded them once per weight row: it was bound by those loads, 26 ms per draft). Operands are fp16 (the
+// dequantised weight rounds once, the sums are fp32). The k index inside an MMA is arbitrary as long as A and B agree: lane
+// t of a row's 4 lanes takes the 4 consecutive weights of its own bytes (8 bytes of a 64-group per lane: word w, nibble nib),
+// so every weight load is one aligned uint2 and the X fragment is two float4.
+__device__ __forceinline__ unsigned pk2(float a, float b) {
+    const __half2 h = __floats2half2_rn(a, b);
+    return *reinterpret_cast<const unsigned *>(&h);
+}
+__device__ __forceinline__ void mma_f16(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// the 4 warps' K slices of the same 8 rows: summed by warp 0 (C: rows g8 / g8 + 8 of X, columns 2t, 2t + 1 = weight rows n0 + 2t, + 1)
+__device__ __forceinline__ void tc_reduce_store(const float (&acc)[4], int ks, int lane, int g8, int t, int n0, int N, int Mc, float * Y, int ldy, int add) {
+    __shared__ float red[4][32][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) red[ks][lane][i] = acc[i];
+    __syncthreads();
+    if (ks != 0) return;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float v = red[0][lane][i] + red[1][lane][i] + red[2][lane][i] + red[3][lane][i];
+        const int m = g8 + 8 * (i >> 1), n = n0 + 2 * t + (i & 1);
+        if (m < Mc && n < N) Y[(size_t) m * ldy + n] = add ? Y[(size_t) m * ldy + n] + v : v;
+    }
+}
+__global__ void __launch_bounds__(128) k_gemm_q4k_tc(const uint8_t * __restrict__ W, size_t rb, int K, int N, const float * __restrict__ X,
+                                                     int ldx, float * __restrict__ Y, int ldy, int M, int add) {
+    const int lane = threadIdx.x & 31, g8 = lane >> 2, t = lane & 3, ks = threadIdx.x >> 5; // ks: the warp's K slice
+    const int n0 = blockIdx.x * 8;
+    if (n0 >= N) return; // (the whole block: uniform before the barrier below)
+    const int m0 = blockIdx.y * 16, Mc = min(16, M - m0);
+    X += (size_t) m0 * ldx;
+    Y += (size_t) m0 * ldy;
+    const uint8_t * row = W + (size_t) min(n0 + g8, N - 1) * rb; // this lane's weight row (rows past N: a valid row, never stored)
+    const float * const x0 = X + (size_t) g8 * ldx + 8 * t;       // X rows g8 and g8 + 8 (rows >= Mc read as 0)
+    const float * const x1 = X + (size_t) (g8 + 8) * ldx + 8 * t;
+    const bool v0 = g8 < Mc, v1 = g8 + 8 < Mc;
+    const int nb = K >> 8;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    uint4 h, hn;
+    uint2 q[4], qn[4];
+    auto ld = [&](int b, uint4 & hv, uint2(&qv)[4]) {
+        const uint8_t * bp = row + (size_t) 144 * b;
+        hv = *reinterpret_cast<const uint4 *>(bp); // d, dmin, 12 scale bytes
+#pragma unroll
+        for (int j = 0; j < 4; j++) qv[j] = *reinterpret_cast<const uint2 *>(bp + 16 + 32 * j + 8 * t);
+    };
+    const int bs = ks * nb / 4, be = (ks + 1) * nb / 4; // this warp's blocks of the row's K
+    if (bs < be) ld(bs, h, q);
+    for (int b = bs; b < be; b++) {
+        if (b + 1 < be) ld(b + 1, hn, qn);
+        const float d = __half2float(__ushort_as_half((unsigned short) (h.x & 65535u)));
+        const float dm = __half2float(__ushort_as_half((unsigned short) (h.x >> 16)));
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float am[2], bm[2]; // lo / hi nibble: d * scale, dmin * min (ggml get_scale_min_k4 of index 2j, 2j + 1)
+#pragma unroll
+            for (int nib = 0; nib < 2; nib++) {
+                const int id = 2 * j + nib, sh = 8 * (id & 3);
+                const uint32_t s0 = h.y >> sh, s1 = h.z >> sh, s2 = h.w >> sh;
+                float sc, mn;
+                if (id < 4) {
+                    sc = (float) (s0 & 63);
+                    mn = (float) (s1 & 63);
+                } else {
+                    sc = (float) ((s2 & 15) | (((s0 >> 6) & 3) << 4));
+                    mn = (float) (((s2 >> 4) & 15) | (((s1 >> 6) & 3) << 4));
+                }
+                am[nib] = d * sc;
+                bm[nib] = dm * mn;
+            }
+#pragma unroll
+            for (int w = 0; w < 2; w++) {
+                const uint32_t wd = w ? q[j].y : q[j].x;
+#pragma unroll
+                for (int nib = 0; nib < 2; nib++) {
+                    const int k = b * 256 + 64 * j + 4 * w + 32 * nib; // + 8t in x0 / x1
+                    const float4 xa = v0 ? *reinterpret_cast<const float4 *>(x0 + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+                    const float4 xb = v1 ? *reinterpret_cast<const float4 *>(x1 + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+                    const unsigned a[4] = {pk2(xa.x, xa.y), pk2(xb.x, xb.y), pk2(xa.z, xa.w), pk2(xb.z, xb.w)};
+                    float v[4];
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        const uint32_t by = (wd >> (8 * i)) & 255u;
+                        v[i] = am[nib] * (float) (nib ? by >> 4 : by & 15u) - bm[nib];
+                    }
+                    mma_f16(acc, a, pk2(v[0], v[1]), pk2(v[2], v[3]));
+                }
+            }
+        }
+        h = hn;
+#pragma unroll
+        for (int j = 0; j < 4; j++) q[j] = qn[j];
+    }
+    tc_reduce_store(acc, ks, lane, g8, t, n0, N, Mc, Y, ldy, add);
+}
+
+// ---- Q6_K / BF16 on tensor cores: the same skeleton and k permutation as k_gemm_q4k_tc ----
+// BF16: K a multiple of 64, rows 16-byte aligned (a lane loads 8 weights at a time). Q6_K: K a multiple of 256 (210-byte blocks: 2-byte loads).
+template <int TY>
+__global__ void __launch_bounds__(128) k_gemm_tc2(const uint8_t * __restrict__ W, size_t rb, int K, int N, const float * __restrict__ X,
+                                                  int ldx, float * __restrict__ Y, int ldy, int M, int add) {
+    const int lane = threadIdx.x & 31, g8 = lane >> 2, t = lane & 3, ks = threadIdx.x >> 5;
+    const int n0 = blockIdx.x * 8;
+    if (n0 >= N) return;
+    const int m0 = blockIdx.y * 16, Mc = min(16, M - m0);
+    X += (size_t) m0 * ldx;
+    Y += (size_t) m0 * ldy;
+    const uint8_t * row = W + (size_t) min(n0 + g8, N - 1) * rb;
+    const float * const x0 = X + (size_t) g8 * ldx;
+    const float * const x1 = X + (size_t) (g8 + 8) * ldx;
+    const bool v0 = g8 < Mc, v1 = g8 + 8 < Mc;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    // one MMA: this lane's 4 weights w are at k + 8t .. + 3 of the row
+    auto mma4 = [&](int k, float w0, float w1, float w2, float w3) {
+        const float4 xa = v0 ? *reinterpret_cast<const float4 *>(x0 + k + 8 * t) : make_float4(0.f, 0.f, 0.f, 0.f);
+        const float4 xb = v1 ? *reinterpret_cast<const float4 *>(x1 + k + 8 * t) : make_float4(0.f, 0.f, 0.f, 0.f);
+        const unsigned a[4] = {pk2(xa.x, xa.y), pk2(xb.x, xb.y), pk2(xa.z, xa.w), pk2(xb.z, xb.w)};
+        mma_f16(acc, a, pk2(w0, w1), pk2(w2, w3));
+    };
+    if constexpr (TY == TY_BF16) {
+        const int nc = K >> 6, cs = ks * nc / 4, ce = (ks + 1) * nc / 4;
+        for (int c = cs; c < ce; c++) {
+            const int k = c * 64;
+            const uint4 u[2] = {*reinterpret_cast<const uint4 *>(row + 2 * (k + 8 * t)), *reinterpret_cast<const uint4 *>(row + 2 * (k + 32 + 8 * t))};
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const unsigned wd[4] = {u[i].x, u[i].y, u[i].z, u[i].w};
+#pragma unroll
+                for (int w = 0; w < 2; w++)
+                    mma4(k + 32 * i + 4 * w, __uint_as_float(wd[2 * w] << 16), __uint_as_float(wd[2 * w] & 0xffff0000u),
+                         __uint_as_float(wd[2 * w + 1] << 16), __uint_as_float(wd[2 * w + 1] & 0xffff0000u));
+            }
+        }
+    } else { // TY_Q6K
+        const int nb = K >> 8, bs = ks * nb / 4, be = (ks + 1) * nb / 4;
+        for (int b = bs; b < be; b++) {
+            const uint8_t * bp = row + (size_t) 210 * b;
+            const float d = hf(bp + 208);
+#pragma unroll 1
+            for (int h = 0; h < 2; h++) {
+                uint16_t ql[2][4], qh[4]; // ql[0]: bytes 8t.. of ql[64h ..], ql[1]: of ql[64h + 32 ..], qh: of qh[32h ..]
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    ql[0][i] = *reinterpret_cast<const uint16_t *>(bp + 64 * h + 8 * t + 2 * i);
+                    ql[1][i] = *reinterpret_cast<const uint16_t *>(bp + 64 * h + 32 + 8 * t + 2 * i);
+                    qh[i] = *reinterpret_cast<const uint16_t *>(bp + 128 + 32 * h + 8 * t + 2 * i);
+                }
+#pragma unroll
+                for (int gi = 0; gi < 4; gi++) {
+                    const float ds = d * (float) reinterpret_cast<const int8_t *>(bp + 192)[8 * h + 2 * gi + (t >> 1)];
+#pragma unroll
+                    for (int w = 0; w < 2; w++) {
+                        float v[4];
+#pragma unroll
+                        for (int i = 0; i < 4; i++) {
+                            const int e = 4 * w + i, sh = 8 * (e & 1);
+                            const int lo = (ql[gi & 1][e >> 1] >> sh) & 255, hb = (qh[e >> 1] >> sh) & 255;
+                            v[i] = ds * (float) (((gi < 2 ? lo & 15 : lo >> 4) | (((hb >> (2 * gi)) & 3) << 4)) - 32);
+                        }
+                        mma4(256 * b + 128 * h + 32 * gi + 4 * w, v[0], v[1], v[2], v[3]);
+                    }
+                }
+            }
+        }
+    }
+    tc_reduce_store(acc, ks, lane, g8, t, n0, N, Mc, Y, ldy, add);
+}
+
 // ---- Y[m][n] (+)= sum_k W[n][k] X[m][k], m < M (16 rows per grid.y step) ----
 template <int TY>
 __global__ void __launch_bounds__(256) k_gemm(const uint8_t * __restrict__ W, size_t rb, int K, int N, const float * __restrict__ X,
@@ -81,7 +254,6 @@ __global__ void __launch_bounds__(256) k_gemm(const uint8_t * __restrict__ W, si
     for (int i = 0; i < 16; i++) acc[i] = 0.f;
     if constexpr (TY == TY_Q4K) {
         const int j = lane >> 3, c = lane & 7; // 64-value group j, 4 bytes c of its 32
-#pragma unroll 4 // (the weight loads of 4 blocks are issued before their FMAs: the loop was latency-bound)
         for (int b = 0; b < (K >> 8); b++) {
             const uint8_t * bp = row + 144 * b;
             int s1, m1, s2, m2;
@@ -108,7 +280,6 @@ __global__ void __launch_bounds__(256) k_gemm(const uint8_t * __restrict__ W, si
         }
     } else if constexpr (TY == TY_Q6K) {
         const int h = lane >> 4, c = lane & 15; // half h of the block, values l = 2c, 2c + 1 of its 32
-#pragma unroll 4 // (the weight loads of 4 blocks are issued before their FMAs: the loop was latency-bound)
         for (int b = 0; b < (K >> 8); b++) {
             const uint8_t * bp = row + 210 * b;
             const float d = hf(bp + 208);
@@ -162,6 +333,20 @@ __global__ void __launch_bounds__(256) k_gemm(const uint8_t * __restrict__ W, si
 }
 
 void gemm(const Mat & w, const float * X, int ldx, float * Y, int ldy, int M, bool add, cudaStream_t st) {
+    const bool al = ldx % 4 == 0 && ((uintptr_t) X & 15) == 0;
+    const dim3 gt((w.N + 7) / 8, (M + 15) / 16);
+    if (w.type == TY_Q4K && w.K % 256 == 0 && w.rb % 16 == 0 && al && ((uintptr_t) w.w & 15) == 0) {
+        k_gemm_q4k_tc<<<gt, 128, 0, st>>>(w.w, w.rb, w.K, w.N, X, ldx, Y, ldy, M, add);
+        return;
+    }
+    if (w.type == TY_Q6K && w.K % 256 == 0 && al) {
+        k_gemm_tc2<TY_Q6K><<<gt, 128, 0, st>>>(w.w, w.rb, w.K, w.N, X, ldx, Y, ldy, M, add);
+        return;
+    }
+    if (w.type == TY_BF16 && w.K % 64 == 0 && w.rb % 16 == 0 && al && ((uintptr_t) w.w & 15) == 0) {
+        k_gemm_tc2<TY_BF16><<<gt, 128, 0, st>>>(w.w, w.rb, w.K, w.N, X, ldx, Y, ldy, M, add);
+        return;
+    }
     const dim3 g((w.N + 7) / 8, (M + 15) / 16);
     switch (w.type) {
         case TY_Q4K: k_gemm<TY_Q4K><<<g, 256, 0, st>>>(w.w, w.rb, w.K, w.N, X, ldx, Y, ldy, M, add); break;

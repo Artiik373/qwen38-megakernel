@@ -514,3 +514,30 @@ use a high-resolution waitable timer, since a plain sleep ends at the next timer
   `vision/vit_ref.py` - the fp64 reference
 - `tools/vision_ref.cpp` - llama.cpp's distributions for an image prompt + the image rows it fed (`--kld-images`)
 - `bench/` - benchmarks ([BENCHMARKS.md](BENCHMARKS.md#reproducing)); `tests/` - server tests (no GPU needed)
+
+## AI+ weights (llamAmpere AI4 files)
+
+GGUF types 111 (AIT3), 112 (AIT4) and 114 (AIT5_U) are read in their file bytes. `ait_dec.cuh` has the decoders
+(bit-exact against llamAmpere); `ait_core.cuh` / `ait_wv.cuh` the fp16 tensor-core tile (`ait_acc`).
+
+- Decode passes (`ait_wv.cuh`): each block rotates its activations (sign flip, FWHT256, /16) from the int8 activation
+  buffer into a private fp16 scratch (`Bufs::xrot`); the tile decodes the weights, multiplies the column scale (AIT3 /
+  AIT4) and folds the row scale. The K sub-chunk passes (`_ck`) and the L2 prefetch (`ait_pf`) handle AI+ too. The int8
+  step is the engine's normal activation quantisation, so AI+ adds one fp16 rounding only.
+  Decode (since the int8 rewrite): `ait_rot_fill` rotates the activations, folds the per-matrix column scale and quantises them
+  to int8 per (token, 256 K) into up to 3 slots of the block scratch (`AitSet`, `AitHdr`); `ait_acc_q` decodes the trellis
+  levels to int8 (`aq_dec_tile` / `aq_dec_u`: dp4a with 0x40 per byte, PRMT pack) and uses `mma.m16n8k32.s8`. The weight
+  loads use `ld.global.ca` (`aq_ld*`): the build has `-dlcm=cg`, and plain loads then miss L1, which cost 2x. Measured on an
+  RTX 3090, AI4 27B: 22 ms per token plain (45 tok/s); `-d 7 --draft-vocab draft_vocab_56k.bin` 96 tok/s on prose, 120 tok/s
+  on code; prefill 1650 tok/s (int8 `ait_gemm_q`; `MK_AIT_FP16=1` selects the old fp16 path). Debug macros: `AIT_NOROT`,
+  `AIT_NOACC`, `AIT_PFG`, `AIT_PFD` (all off by default).
+- Prefill (`ait_prefill.cu`): `ait_quant_rows` rotates the activations, folds the column scale and quantises them to int8 per (token, 256 K); `ait_gemm_q` decodes the trellis levels to int8 (dp4a byte sum, exact) and runs `mma.m16n8k32.s8` with the row scale and the activation scale applied per 256 K (AIT5_U: per 128 K) in fp32. Standalone error 0.6-0.7 % of max output.
+- Prefill (`ait_prefill.cu`): rotates the fp16 GEMM input (un-permuting hperm) and runs a 16-row x 64-token fp16 tensor-core
+  GEMM per warp, in pieces of 512 tokens (`Bufs`-like scratch `hp.xrot`, one per prefill stream).
+  Decode speed (a decode-shaped kernel, T=1, 3090): 500-750 GB/s of weights for AIT3 / AIT4 / AIT5_U (before the decoder rewrite: 150-350). The rewrite: rate as a template constant, one 16-byte load for the 4 interleaved tiles, dp4a byte sum, levels built as exact fp16 (0x6400 | level + 128, minus 1152) and AIT5_U pairs from one 64-bit window. Prefill GEMM at T=512: 24-26 TFLOPS. A shared-memory staged GEMM variant was slower (6-9 TFLOPS) and was removed.
+- MTP block: its Q5_0 tensors follow the normal MTP policy (re-quantised to Q4_K, `requant_type`). Q5_0 in the main layers
+  (not in AI4 files) is re-encoded to Q8_0 exactly.
+
+Build with `Q8_0` in `MK_TYPES` (the AI4 file has Q8_0 tensors). Tests: `ait_tile` and `ait_prefill_gemm` against the
+llamAmpere reference on real tensors (rel err 2e-4 for AIT3 / AIT4, 2e-7 for AIT5_U). The persistent kernel itself has
+not run end to end yet.

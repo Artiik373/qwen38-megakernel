@@ -40,7 +40,8 @@ namespace gguf {
 
 enum GType : uint32_t {
     F32 = 0, F16 = 1, Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14,
-    IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, IQ1_M = 29, BF16 = 30, NVFP4 = 40
+    IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, IQ1_M = 29, BF16 = 30, NVFP4 = 40,
+    AIT3 = 111, AIT4 = 112, AIT5_U = 114 // llamAmpere AI+ (ait_dec.cuh): AIT3 / AIT4 tile layout, AIT5_U unit layout
 };
 
 struct Tensor {
@@ -80,6 +81,9 @@ inline uint64_t type_row_bytes(uint32_t type, uint64_t n) {
         case IQ2_S: return n / 256 * 82;
         case IQ1_M: return n / 256 * 56;
         case IQ4_NL: return n / 32 * 18;
+        case AIT3: return n / 512 * 194;   // 32 rows x 512 K chunks of 32 (64 k + 2) bytes: the total is exact, the rows interleave
+        case AIT4: return n / 512 * 258;
+        case AIT5_U: return n / 128 * 82;
         case NVFP4: return n / 2; // values only: the UE4M3 group scales are a second array (Tensor::nv_scale)
         default: throw std::runtime_error("unsupported ggml type " + std::to_string(type));
     }
@@ -92,6 +96,8 @@ inline uint64_t type_block(uint32_t type) {
         case Q4_0: case Q4_1: case Q5_0: case Q5_1: case Q8_0: case IQ4_NL: return 32;
         case Q4_K: case Q5_K: case Q6_K: case Q3_K: case IQ3_S: case IQ4_XS: case Q2_K: case IQ2_XXS: case IQ2_XS: case IQ3_XXS:
         case IQ2_S: case IQ1_M: case NVFP4: return 256;
+        case AIT3: case AIT4: return 512;
+        case AIT5_U: return 128;
         default: return 0;
     }
 }

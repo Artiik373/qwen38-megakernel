@@ -281,7 +281,9 @@ constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN_MAX ? SM_MISC + 2048 : SM_ATT
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
 
 enum { T_F32 = 0, T_Q5_1 = 7, T_Q8_0 = 8, T_Q2K = 10, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ3XXS = 18, T_IQ4NL = 20,
-       T_IQ3S = 21, T_IQ2S = 22, T_IQ4X = 23, T_NVF4 = 40 };
+       T_IQ3S = 21, T_IQ2S = 22, T_IQ4X = 23, T_NVF4 = 40, T_AIT3 = 111, T_AIT4 = 112, T_AIT5U = 114 };
+// T_AIT3 / T_AIT4 / T_AIT5U: llamAmpere AI+ (ait_dec.cuh): the GGUF bytes as stored (Mat::w), Mat::d = the compact fp16
+// column scales of a tile type (K halves); never fm, read by the ait_* phases (always built, no MK_TYPES entry)
 // T_NVF4: NVFP4 (e2m1 values, UE4M3 scale per 16 weights, one fp32 scale per tensor), read from a safetensors checkpoint
 // T_IQ2S is the kernel type of IQ2_XXS / IQ2_XS / IQ2_S (one layout, loader.cu); IQ1_M is re-encoded to Q6_K at load
 // Matrix weight types the kernels are built for (Makefile MK_TYPES, e.g. "Q4_K Q5_K Q6_K IQ4_XS Q5_1": shorter ptxas, less
@@ -347,7 +349,8 @@ __host__ __device__ constexpr bool mk_built(int t) {
     return (t == T_Q4K && MK_TY_Q4K) || (t == T_Q5K && MK_TY_Q5K) || (t == T_Q6K && MK_TY_Q6K) || (t == T_Q8_0 && MK_TY_Q8_0) ||
            (t == T_IQ4X && MK_TY_IQ4XS) || (t == T_IQ4NL && MK_TY_IQ4NL) || (t == T_Q3K && MK_TY_Q3K) ||
            (t == T_IQ3S && MK_TY_IQ3S) || (t == T_Q5_1 && MK_TY_Q5_1) || (t == T_Q2K && MK_TY_Q2K) ||
-           (t == T_IQ3XXS && MK_TY_IQ3XXS) || (t == T_IQ2S && MK_TY_IQ2S) || (t == T_NVF4 && MK_TY_NVF4);
+           (t == T_IQ3XXS && MK_TY_IQ3XXS) || (t == T_IQ2S && MK_TY_IQ2S) || (t == T_NVF4 && MK_TY_NVF4) || t == T_AIT3 ||
+           t == T_AIT4 || t == T_AIT5U;
 }
 #define MK_IF_0(...)
 #define MK_IF_1(...) __VA_ARGS__
@@ -480,6 +483,7 @@ struct Bufs {
     int mtp_win; // MK_MTP_WIN > 0: the MTP block's decode attention sees the last mtp_win positions only (drafts only)
     int mtp_kvc; // K / V-only MTP catch-up rows (mtp_kv_pass) on (default), 0 with env MK_MTP_KVC=0
     float * wvpart;  // wv split-K partial sums [WV_S][MAXT][D] (resid_wv)
+    __half * xrot;   // AI+ (ait_wv.cuh): per block MAXD rows x FF halves of rotated activations (null without AI+ matrices)
     unsigned * wvcnt; // [2][D / 32] arrivals per 32-row group (out, ffn_down); the last arrival resets it to 0
     // runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
     int k1;          // K1, MK_K1 (default 1): dn_proj_wv deals the alpha / beta items to the warps without a qkv / z tile
@@ -627,6 +631,7 @@ struct PBufs {
     float * rs;   // [cap] RMS scale of the last normed input
     __half * xh;  // [cap][FF] fp16 GEMM input, elements of each 16-group in pf::hperm order
     __half * xh2; // [cap][FF] fp16 silu(gate) * up (ffn_down input), same order
+    __half * xrot; // AI+ prefill (ait_prefill.cu): 3 x AIT_PF_PIECE rows of FF rotated halves, one per prefill stream (null without AI+)
     float * y0;   // [cap][FF]  qkv | q+gate | ffn gate | logits ([cap][QG] when every gate / up pair is fused)
     float * y1;   // [cap][FF]  z | k,v | ffn up
     float * y2;   // [cap][VD]  delta-net / attention output

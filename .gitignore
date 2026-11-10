@@ -46,3 +46,14 @@ dist/
 exactness-out/
 # scripts/gate.sh's default output
 gate-out/
+.venv/
+*.sqlite
+*.nsys-rep
+dsp*.txt
+dsp*.err
+base*.txt
+mtp7.*
+build_*.log
+/qa*.jsonl
+/qa*.json
+/scores*.json
