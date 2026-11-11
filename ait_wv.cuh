@@ -279,11 +279,7 @@ __device__ __noinline__ void ait_rot_fill(const QBuf & q, int T, int u0, int US,
         AitHdr * const h = reinterpret_cast<AitHdr *>(base);
         h->d[0] = ts.d[0]; h->d[1] = ts.d[1]; h->d[2] = ts.d[2]; h->n = ts.n;
     }
-#ifdef AIT_NOROT
-    for (int job = warp; job < 0; job += NW) {
-#else
     for (int job = warp; job < T * nb; job += NW) {
-#endif
         const int t = job / nb, b = job - t * nb;
         const int e0 = 32 * u0 + 256 * b + 8 * lane; // 8 consecutive elements: one 16-chunk half
         const int c = e0 >> 4, byte = e0 & 15;
@@ -334,12 +330,6 @@ __device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> ait_tile(const Mat m, int tile,
     constexpr int NG = WvCfg<T, X16>::NG;
     const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
     float tot[NGM][4];
-#ifdef AIT_NOACC
-#pragma unroll
-    for (int n = 0; n < NGM; n++)
-#pragma unroll
-        for (int c = 0; c < 4; c++) tot[n][c] = (float) (sb0 + nsb + tile);
-#else
     {
         const AitHdr * const hh = reinterpret_cast<const AitHdr *>(ait_xr());
         const __half * const dk = m.type == T_AIT5U ? nullptr : m.d;
@@ -350,7 +340,6 @@ __device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> ait_tile(const Mat m, int tile,
         const int8_t * const xq = ait_xq(hh, slot);
         ait_acc_q<NGM>(AitMat{m.w, m.d, m.type, m.K}, tile, sb0, nsb, xq, ait_sa(hh, slot), tot);
     }
-#endif
     WvAcc<NG> out;
     if constexpr (!X16) {
 #pragma unroll

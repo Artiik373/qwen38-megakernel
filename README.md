@@ -1,5 +1,30 @@
 # qwen38-megakernel
 
+## Fork changes (over upstream `1ecb507`)
+
+**2026-11-11: AI+ prefill GEMM**
+- `ait_gemm_q`: 16 token groups per block (128 tokens), weight words and row scales loaded one group ahead, L1 prefetch for AIT5_U units (`AQ_PF5`).
+- Measured on this RTX 3090, AI4 27B, `MK_KV='K*=6,V*=5'`: 6.6k-token prompt 1616 -> 1730-1750 tok/s; 39k-token prompt 1352 -> 1482 tok/s.  93.6k-token prompt 1133 -> 1188 tok/s (attention is the larger share there). State digest identical to the old build.
+- Not changed: `pk_attn9` (latency-bound: 168 regs x 384 threads, 1 block/SM, issue slots 42% busy). Plain decode did not change.
+
+**2026-11-10: AI+ int8 path**
+- Runs llamAmpere AI4 GGUFs: AI+ weights on int8 tensor cores (dp4a), int8 decode and prefill (`MK_AIT_FP16=1` = old fp16 prefill).
+- Weight loads use `ld.global.ca` (the build's `-dlcm=cg` bypassed L1): ~2x kernel speed.
+- RTX 3090, AI4 27B, `MK_KV='K*=6,V*=5'`: decode 45 tok/s plain, 85 with `-d 7`, 96 prose / 120 code with `--draft-vocab`; prefill 1645 tok/s.
+
+**2026-11-09: DSpine, NVFP4, low-bit**
+- DSpine drafter (`--dspine FILE`).
+- NVFP4 safetensors checkpoints load directly (`-m <dir>`, kernel type `NVF4`): exact repack check, W4A8.
+- fp16 wide attention; loader and prefill GEMM support for more weight types.
+
+**2026-10-29 to 10-30**
+- Native Q5_1 weights (input projections); BF16 `ssm_alpha` / `ssm_beta`; Q5_K `token_embd`.
+- `MK_TYPES` build subset; wv weight L2 prefetch (`MK_WPF`); byte-balanced DeltaNet dealing (`MK_K9`).
+- n-gram drafts (policy `ng`); default draft vocab `draft_vocab_56k.bin`.
+- Server and launchers: `--temp` / `--top-p` / `--top-k` / `--min-p` set the sampling defaults.
+
+Not verified: int8-activation quality (KLD), NVFP4 speed and quality on this build, DSpine with AI4.
+
 **Qwen3.8-27B on a single 24 GB GPU, decoding 1.8-2x faster than llama.cpp.**
 
 A CUDA engine and server built for one model. On an RTX 3090 it decodes 166 tok/s on short prompts and 116 tok/s with

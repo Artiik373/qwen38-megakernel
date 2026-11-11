@@ -127,118 +127,184 @@ __device__ __forceinline__ void aq_cp16(void * smem, const void * gmem) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((uint32_t) __cvta_generic_to_shared(smem)), "l"(gmem));
 }
 
-constexpr int AQ_SMEM = 2 * AQ_SLICE + 2 * AQ_TOK * 4;
-
-// KT: 3 / 4 (AIT3 / AIT4 tile types), 5 (AIT5_U). Block (bx, by) = 8 tiles of 16 rows x 128 tokens; 1-D grid, token blocks fastest
-// (the weights of a row group are read by the concurrently running token blocks).
-template <int KT>
-__global__ void __launch_bounds__(256, 1) ait_gemm_q(AitMat m, int ntile, const int8_t * __restrict__ XQ, const float * __restrict__ SA, int ntok, int ntokpad,
+#ifndef AQ_TPW
+#define AQ_TPW 1 // 16-row tiles per warp (each B fragment from shared memory feeds that many MMAs)
+#endif
+#ifndef AQ_NTG
+#define AQ_NTG 16 // 8-token groups per block (block tokens = 8 * AQ_NTG), all in each warp's registers
+#endif
+#ifndef AQ_PF5
+#define AQ_PF5 2 // AIT5_U: 128-K units ahead whose weights are prefetched to L1
+#endif
+#ifndef AQ_MINB
+#define AQ_MINB 1 // blocks per SM the register budget is set for
+#endif
+constexpr int AQ_BT = 8 * AQ_NTG;
+constexpr int AQ_SMEM_USE = 2 * AQ_BT * 256 + 2 * AQ_BT * 4;
+static_assert(AQ_TOK % AQ_BT == 0, "token padding");
+// KT: 3 / 4 (AIT3 / AIT4 tile types), 5 (AIT5_U). Block (bx, by) = 8 * TPW tiles of 16 rows x (128 / TPW) tokens; 1-D grid, token
+// blocks fastest (the weights of a row group are read by the concurrently running token blocks).
+template <int KT, int TPW>
+__global__ void __launch_bounds__(256, AQ_MINB) ait_gemm_q(AitMat m, int ntile, const int8_t * __restrict__ XQ, const float * __restrict__ SA, int ntok, int ntokpad,
                                                      float * __restrict__ y, int ldy, int add) {
+    constexpr int BT = AQ_BT, NTG = AQ_NTG, SLICE = BT * 256;
     extern __shared__ __align__(16) uint8_t aq_sm[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3, tid = threadIdx.x;
-    const int nby = ntokpad / AQ_TOK, by = blockIdx.x % nby, bx = blockIdx.x / nby;
-    const int tile = bx * 8 + warp, t0 = by * AQ_TOK;
-    const bool live = tile < ntile;
+    const int nby = ntokpad / BT, by = blockIdx.x % nby, bx = blockIdx.x / nby;
+    const int tile0 = (bx * 8 + warp) * TPW, t0 = by * BT;
     const int K = m.K, NS = K >> 8, ntg = ntokpad >> 3;
-    float * const sS = reinterpret_cast<float *>(aq_sm + 2 * AQ_SLICE); // [2][128]
+    float * const sS = reinterpret_cast<float *>(aq_sm + 2 * SLICE); // [2][BT]
     auto issue = [&](int s, int buf) {
         const uint8_t * src = reinterpret_cast<const uint8_t *>(XQ) + ((int64_t) s * ntg + (t0 >> 3)) * 2048;
 #pragma unroll
-        for (int i = 0; i < AQ_SLICE / 16 / 256; i++) aq_cp16(aq_sm + buf * AQ_SLICE + (tid + 256 * i) * 16, src + (tid + 256 * i) * 16);
-        if (tid < AQ_TOK / 4) aq_cp16(sS + buf * AQ_TOK + 4 * tid, SA + (int64_t) s * ntokpad + t0 + 4 * tid);
+        for (int i = 0; i < SLICE / 16 / 256; i++) aq_cp16(aq_sm + buf * SLICE + (tid + 256 * i) * 16, src + (tid + 256 * i) * 16);
+        if (tid < BT / 4) aq_cp16(sS + buf * BT + 4 * tid, SA + (int64_t) s * ntokpad + t0 + 4 * tid);
         asm volatile("cp.async.commit_group;");
     };
-    float tot[16][4];
+    float tot[TPW][NTG][4];
+    int c[TPW][NTG][4];
 #pragma unroll
-    for (int n = 0; n < 16; n++) tot[n][0] = tot[n][1] = tot[n][2] = tot[n][3] = 0.f;
-    int c[16][4];
-    // lane constants of the weight stream
-    const int S = K / 512, rt = tile >> 1, u = tile & 1;
+    for (int j = 0; j < TPW; j++)
+#pragma unroll
+        for (int n = 0; n < NTG; n++) tot[j][n][0] = tot[j][n][1] = tot[j][n][2] = tot[j][n][3] = 0.f;
+#pragma unroll
+    for (int j = 0; j < TPW; j++)
+#pragma unroll
+        for (int n = 0; n < NTG; n++) c[j][n][0] = c[j][n][1] = c[j][n][2] = c[j][n][3] = 0;
+    // lane constants of the weight stream (tile = tile0 + j)
+    const int S = K / 512;
     const int64_t cb = aitd_chunk_bytes(KT == 5 ? 4 : KT);
-    const int wpos = (8 * lane + 4 * u) * (KT == 5 ? 4 : KT), wi = wpos >> 5, wsh = wpos & 31, wi1 = wi + 1 == 8 * KT ? 0 : wi + 1;
-    const uint8_t * const sbase5 = m.w + (int64_t) tile * (K / 128) * ai5d_unit_bytes(5);
+    int rt[TPW], u[TPW], wi[TPW], wsh[TPW], wi1[TPW];
+    bool live[TPW];
+    const uint8_t * sbase5[TPW];
+#pragma unroll
+    for (int j = 0; j < TPW; j++) {
+        const int tile = tile0 + j;
+        live[j] = tile < ntile;
+        rt[j] = tile >> 1;
+        u[j] = tile & 1;
+        const int wpos = (8 * lane + 4 * u[j]) * (KT == 5 ? 4 : KT);
+        wi[j] = wpos >> 5;
+        wsh[j] = wpos & 31;
+        wi1[j] = wi[j] + 1 == 8 * KT ? 0 : wi[j] + 1;
+        sbase5[j] = m.w + (int64_t) tile * (K / 128) * ai5d_unit_bytes(5);
+    }
     const Ai5Pos pa = ai5d_pos(8 * g + 2 * tq), pb = ai5d_pos(8 * g + 2 * tq + 64);
-
-    auto flush = [&](const float r0, const float r1, const float * ss) {
+    auto flush = [&](int j, const float r0, const float r1, const float * ss) {
 #pragma unroll
-        for (int n = 0; n < 16; n++) {
+        for (int n = 0; n < NTG; n++) {
             const float2 sa = *reinterpret_cast<const float2 *>(ss + 8 * n + 2 * tq);
-            tot[n][0] += (float) c[n][0] * (r0 * sa.x); tot[n][1] += (float) c[n][1] * (r0 * sa.y);
-            tot[n][2] += (float) c[n][2] * (r1 * sa.x); tot[n][3] += (float) c[n][3] * (r1 * sa.y);
-            c[n][0] = c[n][1] = c[n][2] = c[n][3] = 0;
+            tot[j][n][0] += (float) c[j][n][0] * (r0 * sa.x); tot[j][n][1] += (float) c[j][n][1] * (r0 * sa.y);
+            tot[j][n][2] += (float) c[j][n][2] * (r1 * sa.x); tot[j][n][3] += (float) c[j][n][3] * (r1 * sa.y);
+            c[j][n][0] = c[j][n][1] = c[j][n][2] = c[j][n][3] = 0;
         }
     };
-    auto mmas = [&](const uint8_t * sb, int G, const uint32_t (&a)[4]) {
+    auto mmas = [&](const uint8_t * sb, int G, const uint32_t (&a)[TPW][4]) {
 #pragma unroll
-        for (int n = 0; n < 16; n++) {
+        for (int n = 0; n < NTG; n++) {
             const uint2 b = *reinterpret_cast<const uint2 *>(sb + (n * 8 + G) * 256 + lane * 8);
-            aq_mma(c[n], a, b.x, b.y);
+#pragma unroll
+            for (int j = 0; j < TPW; j++) aq_mma(c[j][n], a[j], b.x, b.y);
         }
     };
-#pragma unroll
-    for (int n = 0; n < 16; n++) c[n][0] = c[n][1] = c[n][2] = c[n][3] = 0;
-
     issue(0, 0);
-    float r0 = 0.f, r1 = 0.f;
+    float r0[TPW], r1[TPW];
+    uint4 lo4[TPW], hi4[TPW];
+#pragma unroll
+    for (int j = 0; j < TPW; j++) {
+        r0[j] = r1[j] = 0.f;
+        lo4[j] = hi4[j] = make_uint4(0, 0, 0, 0);
+        if constexpr (KT != 5) {
+            if (live[j]) {
+                const uint8_t * chunk = m.w + (int64_t) rt[j] * S * cb;
+                lo4[j] = *reinterpret_cast<const uint4 *>(chunk + 16 * wi[j]);
+                hi4[j] = *reinterpret_cast<const uint4 *>(chunk + 16 * wi1[j]);
+                const uint8_t * sc = m.w + ((int64_t) rt[j] * S + u[j]) * cb + 2048 * (int64_t) KT;
+                r0[j] = __half2float(*reinterpret_cast<const __half *>(sc + 2 * g)) * (1.f / 64.f);
+                r1[j] = __half2float(*reinterpret_cast<const __half *>(sc + 2 * (g + 8))) * (1.f / 64.f);
+            }
+        }
+    }
     for (int s = 0; s < NS; s++) {
         asm volatile("cp.async.wait_group 0;");
         __syncthreads();
         if (s + 1 < NS) issue(s + 1, (s + 1) & 1);
-        const uint8_t * sb = aq_sm + (s & 1) * AQ_SLICE;
-        const float * ss = sS + (s & 1) * AQ_TOK;
-        if (live) {
-            if constexpr (KT != 5) {
-                const uint8_t * chunk = m.w + ((int64_t) rt * S + (s >> 1)) * cb + (int64_t) (s & 1) * 8 * 128 * KT;
-                if ((s & 3) == 0) {
-                    const uint8_t * sc = m.w + ((int64_t) rt * S + 2 * (s >> 2) + u) * cb + 2048 * (int64_t) KT;
-                    r0 = __half2float(*reinterpret_cast<const __half *>(sc + 2 * g)) * (1.f / 64.f);
-                    r1 = __half2float(*reinterpret_cast<const __half *>(sc + 2 * (g + 8))) * (1.f / 64.f);
-                }
-                uint4 lo4 = *reinterpret_cast<const uint4 *>(chunk + 16 * wi), hi4 = *reinterpret_cast<const uint4 *>(chunk + 16 * wi1);
+        const uint8_t * sb = aq_sm + (s & 1) * SLICE;
+        const float * ss = sS + (s & 1) * BT;
+        if constexpr (KT != 5) {
 #pragma unroll
-                for (int G = 0; G < 8; G++) {
-                    uint32_t a[4];
-                    aq_dec_tile<KT>(lo4, hi4, wsh, a);
-                    if (G < 7) {
-                        const uint8_t * grp = chunk + (int64_t) (G + 1) * 128 * KT;
-                        lo4 = *reinterpret_cast<const uint4 *>(grp + 16 * wi);
-                        hi4 = *reinterpret_cast<const uint4 *>(grp + 16 * wi1);
+            for (int G = 0; G < 8; G++) {
+                uint32_t a[TPW][4];
+#pragma unroll
+                for (int j = 0; j < TPW; j++) {
+                    if (!live[j]) { a[j][0] = a[j][1] = a[j][2] = a[j][3] = 0; continue; }
+                    aq_dec_tile<KT>(lo4[j], hi4[j], wsh[j], a[j]);
+                    // the next group's words (the next slice's first group after the last one: loaded before the barrier)
+                    const int sn = G < 7 ? s : s + 1, Gn = G < 7 ? G + 1 : 0;
+                    if (sn < NS) {
+                        const uint8_t * grp = m.w + ((int64_t) rt[j] * S + (sn >> 1)) * cb + (int64_t) (sn & 1) * 8 * 128 * KT + (int64_t) Gn * 128 * KT;
+                        lo4[j] = *reinterpret_cast<const uint4 *>(grp + 16 * wi[j]);
+                        hi4[j] = *reinterpret_cast<const uint4 *>(grp + 16 * wi1[j]);
                     }
-                    mmas(sb, G, a);
                 }
-                flush(r0, r1, ss);
-            } else {
+                mmas(sb, G, a);
+            }
 #pragma unroll
-                for (int hh = 0; hh < 2; hh++) {
-                    const uint8_t * blk = sbase5 + (int64_t) (2 * s + hh) * ai5d_unit_bytes(5);
-                    const uint32_t * tw = reinterpret_cast<const uint32_t *>(blk + 32);
-                    r0 = __half2float(reinterpret_cast<const __half *>(blk)[g]);
-                    r1 = __half2float(reinterpret_cast<const __half *>(blk)[g + 8]);
+            for (int j = 0; j < TPW; j++) flush(j, r0[j], r1[j], ss);
 #pragma unroll
-                    for (int G = 0; G < 4; G++) {
-                        uint32_t a[4];
-                        aq_dec_u(tw, G, pa, pb, a);
-                        mmas(sb, hh * 4 + G, a);
+            for (int j = 0; j < TPW; j++) { // (the scales of the next slice: read here, off the next barrier's critical path)
+                if (live[j] && s + 1 < NS && ((s + 1) & 3) == 0) {
+                    const int sn = s + 1;
+                    const uint8_t * sc = m.w + ((int64_t) rt[j] * S + 2 * (sn >> 2) + u[j]) * cb + 2048 * (int64_t) KT;
+                    r0[j] = __half2float(*reinterpret_cast<const __half *>(sc + 2 * g)) * (1.f / 64.f);
+                    r1[j] = __half2float(*reinterpret_cast<const __half *>(sc + 2 * (g + 8))) * (1.f / 64.f);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int hh = 0; hh < 2; hh++) {
+                const uint32_t * tw[TPW];
+#pragma unroll
+                for (int j = 0; j < TPW; j++) {
+                    if (AQ_PF5 > 0 && live[j] && lane < (ai5d_unit_bytes(5) + 127) / 128 && 2 * s + hh + AQ_PF5 < 2 * NS)
+                        asm volatile("prefetch.global.L1 [%0];" ::"l"(sbase5[j] + (int64_t) (2 * s + hh + AQ_PF5) * ai5d_unit_bytes(5) + 128 * lane));
+                    const uint8_t * blk = sbase5[j] + (int64_t) (2 * s + hh) * ai5d_unit_bytes(5);
+                    tw[j] = reinterpret_cast<const uint32_t *>(blk + 32);
+                    r0[j] = __half2float(reinterpret_cast<const __half *>(blk)[g]);
+                    r1[j] = __half2float(reinterpret_cast<const __half *>(blk)[g + 8]);
+                }
+#pragma unroll
+                for (int G = 0; G < 4; G++) {
+                    uint32_t a[TPW][4];
+#pragma unroll
+                    for (int j = 0; j < TPW; j++) {
+                        if (!live[j]) { a[j][0] = a[j][1] = a[j][2] = a[j][3] = 0; continue; }
+                        aq_dec_u(tw[j], G, pa, pb, a[j]);
                     }
-                    flush(r0, r1, ss); // (the row scale changes per 128-K unit)
+                    mmas(sb, hh * 4 + G, a);
                 }
+#pragma unroll
+                for (int j = 0; j < TPW; j++) flush(j, r0[j], r1[j], ss); // (the row scale changes per 128-K unit)
             }
         }
     }
-    if (!live) return;
 #pragma unroll
-    for (int n = 0; n < 16; n++)
+    for (int j = 0; j < TPW; j++) {
+        if (!live[j]) continue;
+        const int tile = tile0 + j;
 #pragma unroll
-        for (int cc = 0; cc < 4; cc++) {
-            const int tok = t0 + 8 * n + 2 * tq + (cc & 1);
-            const int row = 16 * tile + g + 8 * (cc >> 1);
-            if (tok < ntok) {
-                float * p = y + (int64_t) tok * ldy + row;
-                *p = add ? *p + tot[n][cc] : tot[n][cc];
+        for (int n = 0; n < NTG; n++)
+#pragma unroll
+            for (int cc = 0; cc < 4; cc++) {
+                const int tok = t0 + 8 * n + 2 * tq + (cc & 1);
+                const int row = 16 * tile + g + 8 * (cc >> 1);
+                if (tok < ntok) {
+                    float * p = y + (int64_t) tok * ldy + row;
+                    *p = add ? *p + tot[j][n][cc] : tot[j][n][cc];
+                }
             }
-        }
+    }
 }
-
 } // namespace
 
 // y[tok * ldy + row] (+)= sum_k W[row][k] x[tok * K + k], tokens 0 .. ntok - 1, in pieces of AIT_PF_PIECE tokens.
@@ -251,9 +317,9 @@ void ait_prefill_gemm(const void * w, const void * cs, int type, int K, int N, c
     if (!fp16) { // int8 tensor cores (ait_gemm_q); MK_AIT_FP16=1: the fp16 path below
         static bool attr = false;
         if (!attr) {
-            cudaFuncSetAttribute(ait_gemm_q<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, AQ_SMEM);
-            cudaFuncSetAttribute(ait_gemm_q<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, AQ_SMEM);
-            cudaFuncSetAttribute(ait_gemm_q<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, AQ_SMEM);
+            cudaFuncSetAttribute(ait_gemm_q<3, AQ_TPW>, cudaFuncAttributeMaxDynamicSharedMemorySize, AQ_SMEM_USE);
+            cudaFuncSetAttribute(ait_gemm_q<4, AQ_TPW>, cudaFuncAttributeMaxDynamicSharedMemorySize, AQ_SMEM_USE);
+            cudaFuncSetAttribute(ait_gemm_q<5, AQ_TPW>, cudaFuncAttributeMaxDynamicSharedMemorySize, AQ_SMEM_USE);
             attr = true;
         }
         for (int p0 = 0; p0 < ntok; p0 += AIT_PF_PIECE) {
@@ -263,11 +329,11 @@ void ait_prefill_gemm(const void * w, const void * cs, int type, int K, int N, c
             float * sa = reinterpret_cast<float *>(static_cast<uint8_t *>(xrot) + (((size_t) npad * K + 255) & ~(size_t) 255));
             const int jobs = (npad * (K >> 8) + 7) / 8;
             ait_quant_rows<<<jobs > 4096 ? 4096 : jobs, 256, 0, st>>>(static_cast<const __half *>(x) + (int64_t) p0 * K, static_cast<const __half *>(cs), K, n, npad, xq, sa);
-            const int nblk = ((ntile + 7) / 8) * (npad / AQ_TOK);
+            const int nblk = ((ntile + 8 * AQ_TPW - 1) / (8 * AQ_TPW)) * (npad / AQ_BT);
             float * yy = y + (int64_t) p0 * ldy;
-            if (type == T_AIT3) ait_gemm_q<3><<<nblk, 256, AQ_SMEM, st>>>(m, ntile, xq, sa, n, npad, yy, ldy, add ? 1 : 0);
-            else if (type == T_AIT4) ait_gemm_q<4><<<nblk, 256, AQ_SMEM, st>>>(m, ntile, xq, sa, n, npad, yy, ldy, add ? 1 : 0);
-            else ait_gemm_q<5><<<nblk, 256, AQ_SMEM, st>>>(m, ntile, xq, sa, n, npad, yy, ldy, add ? 1 : 0);
+            if (type == T_AIT3) ait_gemm_q<3, AQ_TPW><<<nblk, 256, AQ_SMEM_USE, st>>>(m, ntile, xq, sa, n, npad, yy, ldy, add ? 1 : 0);
+            else if (type == T_AIT4) ait_gemm_q<4, AQ_TPW><<<nblk, 256, AQ_SMEM_USE, st>>>(m, ntile, xq, sa, n, npad, yy, ldy, add ? 1 : 0);
+            else ait_gemm_q<5, AQ_TPW><<<nblk, 256, AQ_SMEM_USE, st>>>(m, ntile, xq, sa, n, npad, yy, ldy, add ? 1 : 0);
         }
         return;
     }
